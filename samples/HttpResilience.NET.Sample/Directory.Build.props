@@ -1,0 +1,12 @@
+<Project>
+  <!-- This project is a standalone consumer sample. Remove the SourceLink package
+       injected by the root Directory.Build.props — it is only needed for library projects. -->
+  <!-- <PropertyGroup>
+    <PublishRepositoryUrl>false</PublishRepositoryUrl>
+    <IncludeSymbols>false</IncludeSymbols>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Remove="Microsoft.SourceLink.GitHub" />
+  </ItemGroup> -->
+</Project>
