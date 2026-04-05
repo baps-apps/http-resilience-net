@@ -74,11 +74,6 @@ internal sealed class HttpResilienceMeteringEnricher : MeteringEnricher
             dependencyName = GetDependencyNameFromResponse(response);
         }
 
-        if (dependencyName is null && context.TelemetryEvent.Arguments is IHttpPolicyEventArguments policyArgs)
-        {
-            dependencyName = GetDependencyNameFromRequest(policyArgs);
-        }
-
         // Fall back to pipeline name if nothing HTTP-specific is available.
         dependencyName ??= GetTagValue(context, "pipeline.name");
 
@@ -91,17 +86,6 @@ internal sealed class HttpResilienceMeteringEnricher : MeteringEnricher
     private static string? GetDependencyNameFromResponse(HttpResponseMessage response)
     {
         var request = response.RequestMessage;
-        if (request?.RequestUri is null)
-        {
-            return null;
-        }
-
-        return BuildDependencyName(request.RequestUri);
-    }
-
-    private static string? GetDependencyNameFromRequest(IHttpPolicyEventArguments policyArgs)
-    {
-        var request = policyArgs.Request;
         if (request?.RequestUri is null)
         {
             return null;
@@ -130,10 +114,5 @@ internal sealed class HttpResilienceMeteringEnricher : MeteringEnricher
         return null;
     }
 
-    // Minimal interface to allow extracting HttpRequestMessage when Polly exposes HTTP-specific arguments.
-    internal interface IHttpPolicyEventArguments
-    {
-        HttpRequestMessage? Request { get; }
-    }
 }
 
