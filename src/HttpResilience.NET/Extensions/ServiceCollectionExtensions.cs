@@ -2,6 +2,7 @@ using System.Net;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Fallback;
@@ -400,24 +401,31 @@ public static class ServiceCollectionExtensions
 
     private static void AddHandlersInOrder(IHttpClientBuilder builder, HttpResilienceOptions options, int timeout, List<string> order, IHttpFallbackHandler? fallbackHandler)
     {
-        // When RateLimiter is in the order list, we add it as a separate handler; do not also configure it inside Standard.
         bool rateLimiterInOrder = order.Exists(s => string.Equals(s, PipelineStrategyNames.RateLimiter, StringComparison.OrdinalIgnoreCase));
+        string clientName = builder.Name;
 
-        // Add handlers innermost-first (reverse of order list). First element of order = outermost.
         for (int i = order.Count - 1; i >= 0; i--)
         {
             var name = order[i];
             if (string.IsNullOrWhiteSpace(name)) continue;
             if (string.Equals(name, PipelineStrategyNames.Standard, StringComparison.OrdinalIgnoreCase))
             {
-                var resilienceBuilder = builder.AddStandardResilienceHandler(HttpStandardResilienceHandlerConfig.Create(options, timeout, builder.Services, rateLimiterHandledExternally: rateLimiterInOrder));
+                var resilienceBuilder = builder.AddStandardResilienceHandler().Configure((resilienceOptions, serviceProvider) =>
+                {
+                    var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
+                    HttpStandardResilienceHandlerConfig.Create(options, timeout, builder.Services, rateLimiterHandledExternally: rateLimiterInOrder, logger: logger, clientName: clientName)(resilienceOptions);
+                });
                 if (IsPipelineSelectionByAuthority(options))
                     resilienceBuilder.SelectPipelineByAuthority();
                 continue;
             }
             if (string.Equals(name, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase))
             {
-                var hedgingBuilder = builder.AddStandardHedgingHandler().Configure(HttpStandardHedgingHandlerConfig.Create(options, timeout));
+                var hedgingBuilder = builder.AddStandardHedgingHandler().Configure((resilienceOptions, serviceProvider) =>
+                {
+                    var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
+                    HttpStandardHedgingHandlerConfig.Create(options, timeout, logger: logger, clientName: clientName)(resilienceOptions);
+                });
                 if (IsPipelineSelectionByAuthority(options))
                     hedgingBuilder.SelectPipelineByAuthority();
                 continue;
@@ -459,7 +467,10 @@ public static class ServiceCollectionExtensions
     {
         var only5xx = fallback.OnlyOn5xx;
         var body = fallback.ResponseBody;
-        builder.AddResilienceHandler("fallback", resilienceBuilder =>
+        string clientName = builder.Name;
+        builder.AddResilienceHandler("fallback", (resilienceBuilder, context) =>
+        {
+            var logger = context.ServiceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
             resilienceBuilder.AddFallback(new FallbackStrategyOptions<HttpResponseMessage>
             {
                 ShouldHandle = only5xx
@@ -469,16 +480,26 @@ public static class ServiceCollectionExtensions
                     : new PredicateBuilder<HttpResponseMessage>()
                         .Handle<HttpRequestException>()
                         .HandleResult(r => !r.IsSuccessStatusCode),
-                FallbackAction = args => ExecuteFallbackAsync(customHandler, args, fallback.StatusCode, body)
-            }));
+                FallbackAction = args => ExecuteFallbackAsync(customHandler, args, fallback.StatusCode, body, logger, clientName)
+            });
+        });
     }
 
     private static async ValueTask<Outcome<HttpResponseMessage>> ExecuteFallbackAsync(
         IHttpFallbackHandler? customHandler,
         FallbackActionArguments<HttpResponseMessage> args,
         int statusCode,
-        string? body)
+        string? body,
+        ILogger? logger,
+        string clientName)
     {
+        if (logger is not null)
+        {
+            HttpResilienceLogging.FallbackActivated(logger, clientName,
+                (int?)args.Outcome.Result?.StatusCode,
+                args.Outcome.Exception?.GetType().Name);
+        }
+
         if (customHandler is not null)
         {
             var context = new HttpFallbackContext(args.Outcome);
@@ -489,7 +510,6 @@ public static class ServiceCollectionExtensions
         var response = new HttpResponseMessage((HttpStatusCode)statusCode);
         if (!string.IsNullOrEmpty(body))
             response.Content = new StringContent(body);
-        // Link the original request when available for logging and telemetry correlation.
         if (args.Outcome.Result?.RequestMessage is { } requestMessage)
             response.RequestMessage = requestMessage;
         return Outcome.FromResult(response);

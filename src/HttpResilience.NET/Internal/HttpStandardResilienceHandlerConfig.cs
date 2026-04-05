@@ -1,6 +1,7 @@
 using System.Threading.RateLimiting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
+using Microsoft.Extensions.Logging;
 using Polly;
 using HttpResilience.NET.Options;
 
@@ -19,12 +20,16 @@ internal static class HttpStandardResilienceHandlerConfig
     /// <param name="requestTimeoutSeconds">Effective total request timeout in seconds (use options.TotalRequestTimeoutSeconds or override per client).</param>
     /// <param name="services">Service collection for registering disposable resources (e.g. rate limiters).</param>
     /// <param name="rateLimiterHandledExternally">When true, rate limiting is already added as an outer handler (e.g. via PipelineOrder); do not configure the built-in rate limiter.</param>
+    /// <param name="logger">Optional logger for structured resilience event logging.</param>
+    /// <param name="clientName">Named HTTP client identifier for log correlation.</param>
     /// <returns>An action that configures HttpStandardResilienceOptions when applied to an options instance.</returns>
     public static Action<HttpStandardResilienceOptions> Create(
         HttpResilienceOptions options,
         int requestTimeoutSeconds,
         IServiceCollection services,
-        bool rateLimiterHandledExternally = false)
+        bool rateLimiterHandledExternally = false,
+        ILogger? logger = null,
+        string? clientName = null)
     {
         var retry = options.Retry;
         var cb = options.CircuitBreaker;
@@ -55,6 +60,33 @@ internal static class HttpStandardResilienceHandlerConfig
             {
                 resilienceOptions.RateLimiter.RateLimiter = args =>
                     limiter.AcquireAsync(1, args.Context.CancellationToken);
+            }
+
+            if (logger is not null)
+            {
+                var name = clientName ?? "unknown";
+                resilienceOptions.Retry.OnRetry = args =>
+                {
+                    HttpResilienceLogging.RetryAttempt(logger, args.AttemptNumber, name,
+                        args.RetryDelay.TotalMilliseconds,
+                        args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
+                    return default;
+                };
+                resilienceOptions.CircuitBreaker.OnOpened = args =>
+                {
+                    HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
+                    return default;
+                };
+                resilienceOptions.CircuitBreaker.OnHalfOpened = _ =>
+                {
+                    HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
+                    return default;
+                };
+                resilienceOptions.CircuitBreaker.OnClosed = _ =>
+                {
+                    HttpResilienceLogging.CircuitBreakerClosed(logger, name);
+                    return default;
+                };
             }
         };
     }
