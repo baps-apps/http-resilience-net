@@ -410,7 +410,7 @@ public static class ServiceCollectionExtensions
             if (string.IsNullOrWhiteSpace(name)) continue;
             if (string.Equals(name, PipelineStrategyNames.Standard, StringComparison.OrdinalIgnoreCase))
             {
-                var resilienceBuilder = builder.AddStandardResilienceHandler(HttpStandardResilienceHandlerConfig.Create(options, timeout, rateLimiterHandledExternally: rateLimiterInOrder));
+                var resilienceBuilder = builder.AddStandardResilienceHandler(HttpStandardResilienceHandlerConfig.Create(options, timeout, builder.Services, rateLimiterHandledExternally: rateLimiterInOrder));
                 if (IsPipelineSelectionByAuthority(options))
                     resilienceBuilder.SelectPipelineByAuthority();
                 continue;
@@ -443,9 +443,11 @@ public static class ServiceCollectionExtensions
 
     private static void AddRateLimitHandler(IHttpClientBuilder builder, RateLimiterOptions rateLimiterOptions)
     {
+        var limiter = RateLimiterFactory.CreateRateLimiter(rateLimiterOptions);
+        builder.Services.AddSingleton(limiter);
+
         builder.AddResilienceHandler("rateLimit", resilienceBuilder =>
         {
-            var limiter = RateLimiterFactory.CreateRateLimiter(rateLimiterOptions);
             resilienceBuilder.AddRateLimiter(new RateLimiterStrategyOptions
             {
                 RateLimiter = args => limiter.AcquireAsync(1, args.Context.CancellationToken)

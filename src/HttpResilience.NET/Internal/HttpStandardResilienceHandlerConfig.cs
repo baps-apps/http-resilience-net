@@ -1,4 +1,5 @@
 using System.Threading.RateLimiting;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Polly;
 using HttpResilience.NET.Options;
@@ -16,16 +17,26 @@ internal static class HttpStandardResilienceHandlerConfig
     /// </summary>
     /// <param name="options">HTTP resilience options (retry, circuit breaker, timeout, rate limit).</param>
     /// <param name="requestTimeoutSeconds">Effective total request timeout in seconds (use options.TotalRequestTimeoutSeconds or override per client).</param>
-    /// <param name="rateLimiterHandledExternally">When true, rate limiting is already added as an outer handler (e.g. via PipelineStrategyOrder); do not configure the built-in rate limiter.</param>
+    /// <param name="services">Service collection for registering disposable resources (e.g. rate limiters).</param>
+    /// <param name="rateLimiterHandledExternally">When true, rate limiting is already added as an outer handler (e.g. via PipelineOrder); do not configure the built-in rate limiter.</param>
     /// <returns>An action that configures HttpStandardResilienceOptions when applied to an options instance.</returns>
     public static Action<HttpStandardResilienceOptions> Create(
         HttpResilienceOptions options,
         int requestTimeoutSeconds,
+        IServiceCollection services,
         bool rateLimiterHandledExternally = false)
     {
         var retry = options.Retry;
         var cb = options.CircuitBreaker;
         var rateLimit = options.RateLimiter;
+
+        RateLimiter? limiter = null;
+        if (rateLimit.Enabled && !rateLimiterHandledExternally)
+        {
+            limiter = RateLimiterFactory.CreateRateLimiter(rateLimit);
+            services.AddSingleton(limiter);
+        }
+
         return resilienceOptions =>
         {
             resilienceOptions.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(requestTimeoutSeconds);
@@ -40,9 +51,8 @@ internal static class HttpStandardResilienceHandlerConfig
             resilienceOptions.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(cb.SamplingDurationSeconds);
             resilienceOptions.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(cb.BreakDurationSeconds);
 
-            if (rateLimit.Enabled && !rateLimiterHandledExternally)
+            if (limiter is not null)
             {
-                RateLimiter limiter = RateLimiterFactory.CreateRateLimiter(rateLimit);
                 resilienceOptions.RateLimiter.RateLimiter = args =>
                     limiter.AcquireAsync(1, args.Context.CancellationToken);
             }
