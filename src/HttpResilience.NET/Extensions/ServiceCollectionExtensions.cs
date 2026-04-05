@@ -267,18 +267,32 @@ public static class ServiceCollectionExtensions
         IHttpFallbackHandler? fallbackHandler,
         Action<IHttpClientBuilder>? configurePipeline)
     {
-        var options = new HttpResilienceOptions();
-        section.Bind(options);
+        // Lightweight probe to check the Enabled flag only.
+        var probe = new HttpResilienceOptions();
+        section.Bind(probe);
 
-        if (!options.Enabled)
+        if (!probe.Enabled)
             return builder;
 
-        int timeout = requestTimeoutSeconds ?? options.Timeout.TotalRequestTimeoutSeconds;
+        // Register named options bound to this section so DI is the single source of truth.
+        string optionsName = builder.Name;
+        builder.Services.AddOptions<HttpResilienceOptions>(optionsName)
+            .Bind(section);
+        builder.Services.AddSingleton<IValidateOptions<HttpResilienceOptions>, HttpResilienceOptionsValidator>();
 
-        if (options.Connection.Enabled)
-            builder.ConfigurePrimaryHttpMessageHandler(_ => SocketsHttpHandlerFactory.Create(options));
+        int timeout = requestTimeoutSeconds ?? probe.Timeout.TotalRequestTimeoutSeconds;
 
-        AddHandlersInOrder(builder, options, timeout, options.PipelineOrder!, fallbackHandler);
+        if (probe.Connection.Enabled)
+        {
+            builder.ConfigurePrimaryHttpMessageHandler(serviceProvider =>
+            {
+                var opts = serviceProvider.GetRequiredService<IOptionsSnapshot<HttpResilienceOptions>>().Get(optionsName);
+                return SocketsHttpHandlerFactory.Create(opts);
+            });
+        }
+
+        if (probe.PipelineOrder is { Count: > 0 })
+            AddHandlersInOrder(builder, probe, timeout, probe.PipelineOrder, fallbackHandler);
 
         configurePipeline?.Invoke(builder);
         return builder;
@@ -356,16 +370,27 @@ public static class ServiceCollectionExtensions
         Action<ResiliencePipelineBuilder<HttpResponseMessage>> configureInnerPipeline,
         Action<IHttpClientBuilder>? configurePipeline = null)
     {
-        var options = new HttpResilienceOptions();
-        section.Bind(options);
+        var probe = new HttpResilienceOptions();
+        section.Bind(probe);
 
-        if (!options.Enabled)
+        if (!probe.Enabled)
             return builder;
 
-        int timeout = requestTimeoutSeconds ?? options.Timeout.TotalRequestTimeoutSeconds;
+        string optionsName = builder.Name;
+        builder.Services.AddOptions<HttpResilienceOptions>(optionsName)
+            .Bind(section);
+        builder.Services.AddSingleton<IValidateOptions<HttpResilienceOptions>, HttpResilienceOptionsValidator>();
 
-        if (options.Connection.Enabled)
-            builder.ConfigurePrimaryHttpMessageHandler(_ => SocketsHttpHandlerFactory.Create(options));
+        int timeout = requestTimeoutSeconds ?? probe.Timeout.TotalRequestTimeoutSeconds;
+
+        if (probe.Connection.Enabled)
+        {
+            builder.ConfigurePrimaryHttpMessageHandler(serviceProvider =>
+            {
+                var opts = serviceProvider.GetRequiredService<IOptionsSnapshot<HttpResilienceOptions>>().Get(optionsName);
+                return SocketsHttpHandlerFactory.Create(opts);
+            });
+        }
 
         AddCustomStandardHandler(builder, timeout, fallbackHandler, configureInnerPipeline, configurePipeline);
         return builder;
