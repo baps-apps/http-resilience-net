@@ -56,10 +56,10 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    private static bool IsValidPipelineStrategyOrder(List<string>? order)
+    private static bool IsValidPipelineOrder(List<string>? order)
     {
         if (order is null || order.Count == 0)
-            return true;
+            return false;
 
         var allowed = PipelineStrategyNames.Allowed;
         int standardOrHedging = 0;
@@ -119,14 +119,8 @@ public static class ServiceCollectionExtensions
             if (!Enum.IsDefined(options.Retry.BackoffType))
                 failures.Add("Retry.BackoffType must be Constant, Linear, or Exponential.");
 
-            if (!Enum.IsDefined(options.PipelineOrder))
-                failures.Add("PipelineOrder must be FallbackThenConcurrency or ConcurrencyThenFallback.");
-
-            if (!Enum.IsDefined(options.PipelineType))
-                failures.Add("PipelineType must be Standard or Hedging.");
-
-            if (!IsValidPipelineStrategyOrder(options.PipelineStrategyOrder))
-                failures.Add("PipelineStrategyOrder must contain only Fallback, Bulkhead, RateLimiter, Standard, Hedging and exactly one of Standard or Hedging.");
+            if (!IsValidPipelineOrder(options.PipelineOrder))
+                failures.Add("PipelineOrder is required when Enabled is true and must contain only Fallback, Bulkhead, RateLimiter, Standard, Hedging with exactly one of Standard or Hedging. Example: [\"Standard\"] or [\"Fallback\", \"Bulkhead\", \"Standard\"].");
 
             if (!Enum.IsDefined(options.PipelineSelection.Mode))
                 failures.Add("PipelineSelection.Mode must be None or ByAuthority.");
@@ -142,7 +136,10 @@ public static class ServiceCollectionExtensions
                 failures.Add("RateLimiter.Algorithm must be FixedWindow, SlidingWindow, or TokenBucket.");
 
             // Hedging options should only be validated when the pipeline is actually hedging.
-            if (options.PipelineType == ResiliencePipelineType.Hedging)
+            bool isHedging = options.PipelineOrder?.Exists(s =>
+                string.Equals(s, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase)) ?? false;
+
+            if (isHedging)
             {
                 if (options.Hedging.DelaySeconds is < 0 or > 60)
                     failures.Add("Hedging.DelaySeconds must be between 0 and 60.");
@@ -181,7 +178,9 @@ public static class ServiceCollectionExtensions
                 return true;
 
             // Hedging: only validate when the pipeline type is Hedging.
-            if (options.PipelineType != ResiliencePipelineType.Hedging &&
+            bool isHedging = options.PipelineOrder?.Exists(s =>
+                string.Equals(s, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase)) ?? false;
+            if (!isHedging &&
                 failure.Contains("Hedging", StringComparison.OrdinalIgnoreCase))
                 return true;
 
@@ -191,9 +190,9 @@ public static class ServiceCollectionExtensions
 
     /// <summary>
     /// When <see cref="HttpResilienceOptions.Enabled"/> is true, configures the HttpClient with a primary <see cref="SocketsHttpHandler"/> (connection pooling, timeouts)
-    /// and a resilience pipeline determined by <see cref="HttpResilienceOptions.PipelineType"/>: Standard (retry, circuit breaker, timeouts, optional rate limiting) or Hedging (multiple requests, first success wins).
+    /// and a resilience pipeline determined by <see cref="HttpResilienceOptions.PipelineOrder"/>: Standard (retry, circuit breaker, timeouts, optional rate limiting) or Hedging (multiple requests, first success wins).
     /// Optionally adds fallback and concurrency handlers when enabled in options. When Enabled is false or not set, returns the builder unchanged (no resilience applied).
-    /// <para><b>Use case:</b> Use for typical outgoing HTTP calls (APIs, microservices). Set <c>PipelineType</c> to "Hedging" in config for latency-sensitive calls to multiple replicas. Call after <c>AddHttpClient("MyClient", ...)</c> (or overloads).
+    /// <para><b>Use case:</b> Use for typical outgoing HTTP calls (APIs, microservices). Include "Hedging" in <c>PipelineOrder</c> in config for latency-sensitive calls to multiple replicas. Call after <c>AddHttpClient("MyClient", ...)</c> (or overloads).
     /// Call <see cref="AddHttpResilienceOptions(IServiceCollection,IConfiguration)"/> first with the same <paramref name="configuration"/>. Pass <paramref name="requestTimeoutSeconds"/> to override the total timeout for this client (e.g. longer for background jobs).</para>
     /// </summary>
     /// <param name="builder">The HttpClient builder from <c>AddHttpClient("MyClient", ...)</c>.</param>
@@ -278,10 +277,7 @@ public static class ServiceCollectionExtensions
         if (options.Connection.Enabled)
             builder.ConfigurePrimaryHttpMessageHandler(_ => SocketsHttpHandlerFactory.Create(options));
 
-        if (options.PipelineStrategyOrder is { Count: > 0 } order)
-            AddHandlersInOrder(builder, options, timeout, order, fallbackHandler);
-        else
-            AddHandlersLegacyOrder(builder, options, timeout, fallbackHandler);
+        AddHandlersInOrder(builder, options, timeout, options.PipelineOrder!, fallbackHandler);
 
         configurePipeline?.Invoke(builder);
         return builder;
@@ -376,8 +372,7 @@ public static class ServiceCollectionExtensions
 
     /// <summary>
     /// Shared wiring for the custom inner pipeline overloads. The inner pipeline is configured entirely via
-    /// <paramref name="configureInnerPipeline"/>; configuration options such as <see cref="HttpResilienceOptions.PipelineType"/>,
-    /// <see cref="HttpResilienceOptions.PipelineOrder"/>, and <see cref="HttpResilienceOptions.PipelineStrategyOrder"/> are not applied.
+    /// <paramref name="configureInnerPipeline"/>; configuration options such as <see cref="HttpResilienceOptions.PipelineOrder"/> are not applied.
     /// A total request timeout of <paramref name="totalTimeoutSeconds"/> is applied as the outermost strategy so that
     /// the resolved timeout (from <paramref name="totalTimeoutSeconds"/>) is always honoured as an absolute cap,
     /// regardless of what <paramref name="configureInnerPipeline"/> adds internally.
@@ -445,35 +440,6 @@ public static class ServiceCollectionExtensions
 
     private static bool IsPipelineSelectionByAuthority(HttpResilienceOptions options) =>
         options.PipelineSelection?.Mode == PipelineSelectionMode.ByAuthority;
-
-    private static void AddHandlersLegacyOrder(IHttpClientBuilder builder, HttpResilienceOptions options, int timeout, IHttpFallbackHandler? fallbackHandler)
-    {
-        if (options.PipelineType == ResiliencePipelineType.Hedging)
-        {
-            var hedgingBuilder = builder.AddStandardHedgingHandler().Configure(HttpStandardHedgingHandlerConfig.Create(options, timeout));
-            if (IsPipelineSelectionByAuthority(options))
-                hedgingBuilder.SelectPipelineByAuthority();
-            if (options.RateLimiter.Enabled)
-                AddRateLimitHandler(builder, options.RateLimiter);
-        }
-        else
-        {
-            var resilienceBuilder = builder.AddStandardResilienceHandler(HttpStandardResilienceHandlerConfig.Create(options, timeout));
-            if (IsPipelineSelectionByAuthority(options))
-                resilienceBuilder.SelectPipelineByAuthority();
-        }
-
-        var concurrencyFirst = options.PipelineOrder == PipelineOrderType.ConcurrencyThenFallback;
-        if (concurrencyFirst && options.Fallback.Enabled)
-            AddFallbackHandler(builder, options.Fallback, fallbackHandler);
-        if (options.Bulkhead.Enabled)
-        {
-            builder.AddResilienceHandler("concurrency", resilienceBuilder =>
-                resilienceBuilder.AddConcurrencyLimiter(options.Bulkhead.Limit, options.Bulkhead.QueueLimit));
-        }
-        if (!concurrencyFirst && options.Fallback.Enabled)
-            AddFallbackHandler(builder, options.Fallback, fallbackHandler);
-    }
 
     private static void AddRateLimitHandler(IHttpClientBuilder builder, RateLimiterOptions rateLimiterOptions)
     {
