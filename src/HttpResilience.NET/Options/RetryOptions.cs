@@ -16,11 +16,11 @@ public class RetryOptions
     public int MaxRetryAttempts { get; set; } = 3;
 
     /// <summary>
-    /// Base delay (seconds) between retries; actual delay depends on <see cref="BackoffType"/>. Maps to HttpRetryStrategyOptions.Delay.
+    /// Base delay (seconds, supports sub-second values like 0.5) between retries; actual delay depends on <see cref="BackoffType"/>. Maps to HttpRetryStrategyOptions.Delay.
     /// <para><b>Use case:</b> Start with 1–3 seconds; increase if the backend needs cooldown. Default: 2.</para>
     /// </summary>
-    [Range(1, 60, ErrorMessage = "BaseDelaySeconds must be between 1 and 60 seconds.")]
-    public int BaseDelaySeconds { get; set; } = 2;
+    [Range(0.0, 60.0, ErrorMessage = "BaseDelaySeconds must be between 0 and 60 seconds.")]
+    public double BaseDelaySeconds { get; set; } = 2.0;
 
     /// <summary>
     /// How delay grows between retries. Maps to Polly DelayBackoffType.

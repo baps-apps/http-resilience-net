@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Polly;
 using HttpResilience.NET.Internal;
@@ -34,7 +35,7 @@ public class HttpStandardResilienceHandlerConfigTests
             }
         };
 
-        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 25);
+        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 25, services: new ServiceCollection());
         var target = new HttpStandardResilienceOptions();
 
         config(target);
@@ -61,7 +62,7 @@ public class HttpStandardResilienceHandlerConfigTests
             RateLimiter = { Enabled = true, PermitLimit = 100, WindowSeconds = 1 }
         };
 
-        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 30, rateLimiterHandledExternally: true);
+        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 30, services: new ServiceCollection(), rateLimiterHandledExternally: true);
         var target = new HttpStandardResilienceOptions();
 
         config(target);

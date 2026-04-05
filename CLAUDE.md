@@ -50,16 +50,16 @@ Both are required. Most `AddHttpClientWithResilience` overloads read config dire
 
 ### Pipeline types
 
-- **Standard** (`PipelineType = Standard`) — `AddStandardResilienceHandler`: timeout, retry, circuit breaker, optional rate limiter.
-- **Hedging** (`PipelineType = Hedging`) — `AddStandardHedgingHandler`: sends multiple requests in parallel, first success wins.
+- **Standard** (include `"Standard"` in `PipelineOrder`) — `AddStandardResilienceHandler`: timeout, retry, circuit breaker, optional rate limiter.
+- **Hedging** (include `"Hedging"` in `PipelineOrder`) — `AddStandardHedgingHandler`: sends multiple requests in parallel, first success wins.
 
 ### Pipeline ordering
 
-Two ordering systems exist:
-- **`PipelineStrategyOrder`** (preferred, explicit) — list of strategy names outermost→innermost, e.g. `["Fallback", "Bulkhead", "Standard"]`. Must contain exactly one of `Standard` or `Hedging`.
-- **`PipelineOrder`** (legacy enum) — `FallbackThenConcurrency` or `ConcurrencyThenFallback`.
-
-Handlers are added innermost-first (reversed from the order list) in `AddHandlersInOrder`.
+A single `PipelineOrder` list controls all handler ordering:
+- `PipelineOrder` — list of strategy names outermost→innermost, e.g. `["Fallback", "Bulkhead", "Standard"]`.
+- Must contain exactly one of `Standard` or `Hedging`.
+- Required when `Enabled = true`.
+- Handlers are added innermost-first (reversed from the order list) in `AddHandlersInOrder`.
 
 ### Key files
 
