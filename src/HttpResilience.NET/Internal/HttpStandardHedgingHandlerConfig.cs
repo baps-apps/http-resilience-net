@@ -7,7 +7,7 @@ namespace HttpResilience.NET.Internal;
 /// Builds <see cref="HttpStandardHedgingResilienceOptions"/> from <see cref="HttpResilienceOptions"/> and request timeout.
 /// Hedging pipeline: TotalRequestTimeout, Hedging, and per-endpoint (Endpoint) options for AttemptTimeout and CircuitBreaker.
 /// </summary>
-public static class HttpStandardHedgingHandlerConfig
+internal static class HttpStandardHedgingHandlerConfig
 {
     /// <summary>
     /// Creates an action that configures <see cref="HttpStandardHedgingResilienceOptions"/> from the given options and per-request timeout.
