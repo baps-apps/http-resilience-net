@@ -35,6 +35,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Connection:Enabled"] = "true",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "0" // invalid: range 1–1000
         };
@@ -56,6 +57,8 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "200" // invalid: must be 400-599 when Enabled
         };
@@ -77,6 +80,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Retry:BackoffType"] = "99" // invalid: not a defined enum value
         };
         IConfiguration configuration = new ConfigurationBuilder()
@@ -97,6 +101,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Retry:BackoffType"] = "Linear",
             ["HttpResilienceOptions:Retry:UseJitter"] = "false",
             ["HttpResilienceOptions:Retry:UseRetryAfterHeader"] = "true"
@@ -123,7 +128,8 @@ public class HttpResilienceOptionsValidationTests
             ["HttpResilienceOptions:Enabled"] = "true",
             ["HttpResilienceOptions:RateLimiter:Algorithm"] = "SlidingWindow",
             ["HttpResilienceOptions:RateLimiter:SegmentsPerWindow"] = "4",
-            ["HttpResilienceOptions:PipelineOrder"] = "ConcurrencyThenFallback"
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Bulkhead",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard"
         };
         IConfiguration configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(configData)
@@ -136,16 +142,18 @@ public class HttpResilienceOptionsValidationTests
         var options = provider.GetRequiredService<IOptions<HttpResilienceOptions>>().Value;
         Assert.Equal(RateLimitAlgorithm.SlidingWindow, options.RateLimiter.Algorithm);
         Assert.Equal(4, options.RateLimiter.SegmentsPerWindow);
-        Assert.Equal(PipelineOrderType.ConcurrencyThenFallback, options.PipelineOrder);
+        Assert.NotNull(options.PipelineOrder);
+        Assert.Equal(2, options.PipelineOrder.Count);
+        Assert.Equal("Standard", options.PipelineOrder[1]);
     }
 
     [Fact]
-    public void AddHttpResilienceOptions_WithPipelineTypeHedging_BindsSuccessfully()
+    public void AddHttpResilienceOptions_WithPipelineOrderHedging_BindsSuccessfully()
     {
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
-            ["HttpResilienceOptions:PipelineType"] = "Hedging",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Hedging",
             ["HttpResilienceOptions:Hedging:MaxHedgedAttempts"] = "2"
         };
         IConfiguration configuration = new ConfigurationBuilder()
@@ -157,19 +165,20 @@ public class HttpResilienceOptionsValidationTests
         using ServiceProvider provider = services.BuildServiceProvider();
 
         var options = provider.GetRequiredService<IOptions<HttpResilienceOptions>>().Value;
-        Assert.Equal(ResiliencePipelineType.Hedging, options.PipelineType);
+        Assert.NotNull(options.PipelineOrder);
+        Assert.Contains("Hedging", options.PipelineOrder);
         Assert.Equal(2, options.Hedging.MaxHedgedAttempts);
     }
 
     [Fact]
-    public void AddHttpResilienceOptions_WithValidPipelineStrategyOrder_BindsSuccessfully()
+    public void AddHttpResilienceOptions_WithValidPipelineOrder_BindsSuccessfully()
     {
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
-            ["HttpResilienceOptions:PipelineStrategyOrder:0"] = "Fallback",
-            ["HttpResilienceOptions:PipelineStrategyOrder:1"] = "Bulkhead",
-            ["HttpResilienceOptions:PipelineStrategyOrder:2"] = "Standard"
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Bulkhead",
+            ["HttpResilienceOptions:PipelineOrder:2"] = "Standard"
         };
         IConfiguration configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(configData)
@@ -180,19 +189,19 @@ public class HttpResilienceOptionsValidationTests
         using ServiceProvider provider = services.BuildServiceProvider();
 
         var options = provider.GetRequiredService<IOptions<HttpResilienceOptions>>().Value;
-        Assert.NotNull(options.PipelineStrategyOrder);
-        Assert.Equal(3, options.PipelineStrategyOrder.Count);
-        Assert.Equal("Standard", options.PipelineStrategyOrder[2]);
+        Assert.NotNull(options.PipelineOrder);
+        Assert.Equal(3, options.PipelineOrder.Count);
+        Assert.Equal("Standard", options.PipelineOrder[2]);
     }
 
     [Fact]
-    public void AddHttpResilienceOptions_WithPipelineStrategyOrderMissingCore_ThrowsOnStart()
+    public void AddHttpResilienceOptions_WithPipelineOrderMissingCore_ThrowsOnStart()
     {
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
-            ["HttpResilienceOptions:PipelineStrategyOrder:0"] = "Fallback",
-            ["HttpResilienceOptions:PipelineStrategyOrder:1"] = "Bulkhead"
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Bulkhead"
         };
         IConfiguration configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(configData)
@@ -212,6 +221,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:PipelineSelection:Mode"] = "ByAuthority"
         };
         IConfiguration configuration = new ConfigurationBuilder()
@@ -232,6 +242,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "10",
             ["HttpResilienceOptions:Timeout:AttemptTimeoutSeconds"] = "15"
         };
@@ -253,6 +264,7 @@ public class HttpResilienceOptionsValidationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Connection:Enabled"] = "true",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "1001"
         };
@@ -302,9 +314,7 @@ public class HttpResilienceOptionsValidationTests
             ["HttpResilienceOptions:Timeout:AttemptTimeoutSeconds"] = "15",
             ["HttpResilienceOptions:Retry:BackoffType"] = "99",
             ["HttpResilienceOptions:RateLimiter:Algorithm"] = "99",
-            ["HttpResilienceOptions:PipelineOrder"] = "999",
-            ["HttpResilienceOptions:PipelineType"] = "999",
-            ["HttpResilienceOptions:PipelineStrategyOrder:0"] = "Invalid",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Invalid",
             ["HttpResilienceOptions:PipelineSelection:Mode"] = "999"
         };
 

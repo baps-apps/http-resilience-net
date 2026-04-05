@@ -19,11 +19,13 @@ public class HttpResilienceOptions
     public bool Enabled { get; set; } = false;
 
     /// <summary>
-    /// Type of resilience pipeline: Standard (retry, circuit breaker, timeouts, optional rate limiting) or Hedging (multiple requests, first success wins).
-    /// <para><b>Use case:</b> Set to Hedging in config for latency-sensitive calls to multiple replicas; use Standard (default) for typical API calls. Config key: "PipelineType" (values: "Standard", "Hedging").</para>
+    /// Order of pipeline strategies from outermost to innermost. Allowed values: "Fallback", "Bulkhead", "RateLimiter", "Standard", "Hedging".
+    /// Must contain exactly one of "Standard" or "Hedging". Required when <see cref="Enabled"/> is true.
+    /// <para><b>Use case:</b> e.g. [ "Fallback", "Bulkhead", "RateLimiter", "Standard" ] or [ "Hedging" ]. Config key: "PipelineOrder".</para>
+    /// <para><b>Standard</b> = retry, circuit breaker, timeouts, optional rate limiting. <b>Hedging</b> = multiple requests, first success wins.</para>
     /// </summary>
-    [JsonPropertyName("PipelineType")]
-    public ResiliencePipelineType PipelineType { get; set; } = ResiliencePipelineType.Standard;
+    [JsonPropertyName("PipelineOrder")]
+    public List<string>? PipelineOrder { get; set; }
 
     /// <summary>
     /// Connection and connection-pool options for the primary SocketsHttpHandler. Config key: "HttpResilienceOptions:Connection".
@@ -62,7 +64,7 @@ public class HttpResilienceOptions
     public FallbackOptions Fallback { get; set; } = new();
 
     /// <summary>
-    /// Hedging strategy options (used when <see cref="PipelineType"/> is <see cref="ResiliencePipelineType.Hedging"/>). Config key: "HttpResilienceOptions:Hedging".
+    /// Hedging strategy options (used when PipelineOrder contains "Hedging"). Config key: "HttpResilienceOptions:Hedging".
     /// </summary>
     [ValidateObjectMembers]
     public HedgingOptions Hedging { get; set; } = new();
@@ -72,22 +74,6 @@ public class HttpResilienceOptions
     /// </summary>
     [ValidateObjectMembers]
     public BulkheadOptions Bulkhead { get; set; } = new();
-
-    /// <summary>
-    /// Order of fallback and bulkhead handlers when both are enabled. Ignored when <see cref="PipelineStrategyOrder"/> is set.
-    /// <para><b>Options:</b> <see cref="PipelineOrderType.FallbackThenConcurrency"/> (default), <see cref="PipelineOrderType.ConcurrencyThenFallback"/>. Config key: "PipelineOrder".</para>
-    /// <para><b>Effect:</b> FallbackThenConcurrency = fallback outermost, then bulkhead; ConcurrencyThenFallback = bulkhead outermost, then fallback.</para>
-    /// </summary>
-    [JsonPropertyName("PipelineOrder")]
-    public PipelineOrderType PipelineOrder { get; set; } = PipelineOrderType.FallbackThenConcurrency;
-
-    /// <summary>
-    /// Optional order of outer strategies from outermost to innermost. Allowed values: "Fallback", "Bulkhead", "RateLimiter", "Standard", "Hedging".
-    /// Must contain exactly one of "Standard" or "Hedging". When null or empty, <see cref="PipelineOrder"/> and <see cref="PipelineType"/> determine behavior.
-    /// <para><b>Use case:</b> e.g. [ "Fallback", "Bulkhead", "RateLimiter", "Standard" ]. Config key: "PipelineStrategyOrder".</para>
-    /// </summary>
-    [JsonPropertyName("PipelineStrategyOrder")]
-    public List<string>? PipelineStrategyOrder { get; set; }
 
     /// <summary>
     /// Pipeline selection (e.g. per-authority). When Mode is "ByAuthority", a separate pipeline instance is used per request authority (scheme + host + port).

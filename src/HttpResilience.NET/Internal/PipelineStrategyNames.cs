@@ -3,7 +3,7 @@ using HttpResilience.NET.Options;
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
-/// Canonical names for pipeline strategies used in <see cref="HttpResilienceOptions.PipelineStrategyOrder"/>.
+/// Canonical names for pipeline strategies used in <see cref="HttpResilienceOptions.PipelineOrder"/>.
 /// Values must match configuration (e.g. "Fallback", "Bulkhead", "RateLimiter", "Standard", "Hedging").
 /// </summary>
 internal static class PipelineStrategyNames

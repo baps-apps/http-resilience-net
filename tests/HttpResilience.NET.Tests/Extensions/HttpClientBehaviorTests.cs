@@ -61,6 +61,7 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "2",
             ["HttpResilienceOptions:Retry:BaseDelaySeconds"] = "1",
             ["HttpResilienceOptions:Retry:BackoffType"] = "Constant",
@@ -102,6 +103,8 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503"
         };
@@ -136,7 +139,7 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
-            ["HttpResilienceOptions:PipelineType"] = "Hedging",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Hedging",
             ["HttpResilienceOptions:Hedging:DelaySeconds"] = "0",
             ["HttpResilienceOptions:Hedging:MaxHedgedAttempts"] = "1",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "5",
@@ -194,6 +197,8 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "1",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503",
@@ -237,6 +242,7 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "1",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "3",
             ["HttpResilienceOptions:Timeout:AttemptTimeoutSeconds"] = "1"
@@ -268,6 +274,8 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "1",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503"
@@ -307,6 +315,8 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "1",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503",
@@ -346,6 +356,7 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "10"
         };
 
@@ -390,8 +401,10 @@ public class HttpClientBehaviorTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "60",
             ["HttpResilienceOptions:TenantA:Enabled"] = "true",
+            ["HttpResilienceOptions:TenantA:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:TenantA:Timeout:TotalRequestTimeoutSeconds"] = "5",
             ["HttpResilienceOptions:TenantA:Timeout:AttemptTimeoutSeconds"] = "2",
             ["HttpResilienceOptions:TenantA:Retry:MaxRetryAttempts"] = "1"

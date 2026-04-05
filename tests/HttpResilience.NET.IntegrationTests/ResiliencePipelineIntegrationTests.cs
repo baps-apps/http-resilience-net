@@ -19,6 +19,7 @@ public class ResiliencePipelineIntegrationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "30",
             ["HttpResilienceOptions:Timeout:AttemptTimeoutSeconds"] = "10",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "2",
@@ -49,6 +50,7 @@ public class ResiliencePipelineIntegrationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Timeout:TotalRequestTimeoutSeconds"] = "30",
             ["HttpResilienceOptions:Timeout:AttemptTimeoutSeconds"] = "5",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "3",
@@ -80,6 +82,8 @@ public class ResiliencePipelineIntegrationTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "1",
