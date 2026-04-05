@@ -14,6 +14,7 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "10",
             ["HttpResilienceOptions:Retry:MaxRetryAttempts"] = "3"
         };
@@ -39,6 +40,7 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "5"
         };
         IConfiguration configuration = new ConfigurationBuilder()
@@ -87,6 +89,7 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:RateLimiter:Enabled"] = "true",
             ["HttpResilienceOptions:RateLimiter:PermitLimit"] = "100",
             ["HttpResilienceOptions:RateLimiter:WindowSeconds"] = "1"
@@ -113,6 +116,8 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Bulkhead",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Bulkhead:Enabled"] = "true",
             ["HttpResilienceOptions:Bulkhead:Limit"] = "50",
             ["HttpResilienceOptions:Bulkhead:QueueLimit"] = "10"
@@ -139,6 +144,8 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Fallback",
+            ["HttpResilienceOptions:PipelineOrder:1"] = "Standard",
             ["HttpResilienceOptions:Fallback:Enabled"] = "true",
             ["HttpResilienceOptions:Fallback:StatusCode"] = "503"
         };
@@ -159,12 +166,12 @@ public class ServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public void AddHttpClientWithResilience_WithPipelineTypeHedging_RegistersWithoutThrowing()
+    public void AddHttpClientWithResilience_WithPipelineOrderHedging_RegistersWithoutThrowing()
     {
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
-            ["HttpResilienceOptions:PipelineType"] = "Hedging",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Hedging",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "10",
             ["HttpResilienceOptions:Hedging:DelaySeconds"] = "2",
             ["HttpResilienceOptions:Hedging:MaxHedgedAttempts"] = "1"
@@ -186,12 +193,12 @@ public class ServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public void AddHttpClientWithResilience_WhenDisabled_ReturnsBuilderWithoutApplyingResilience_RegardlessOfPipelineType()
+    public void AddHttpClientWithResilience_WhenDisabled_ReturnsBuilderWithoutApplyingResilience_RegardlessOfPipelineOrder()
     {
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "false",
-            ["HttpResilienceOptions:PipelineType"] = "Hedging"
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Hedging"
         };
         IConfiguration configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(configData)
@@ -215,6 +222,7 @@ public class ServiceCollectionExtensionsTests
         var configData = new Dictionary<string, string?>
         {
             ["HttpResilienceOptions:Enabled"] = "true",
+            ["HttpResilienceOptions:PipelineOrder:0"] = "Standard",
             ["HttpResilienceOptions:Connection:MaxConnectionsPerServer"] = "10"
         };
         IConfiguration configuration = new ConfigurationBuilder()
