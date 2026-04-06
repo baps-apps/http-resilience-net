@@ -1,254 +1,127 @@
-# HttpResilience.NET – Implementation, Logic & Use Cases
+# HttpResilience.NET — Implementation Reference
 
-This document describes the **implementation logic**, **usefulness**, and **use cases** for each part of the package, including configuration examples for every section. For how to consume the package (setup, configuration, code), see the [README](../README.md).
+This document describes the **implementation logic** and **configuration** for each part of the package. For quick-start setup, see the [README](../README.md).
 
 ---
 
 ## Overview
 
-The package builds on **Microsoft.Extensions.Http.Resilience** and **Polly** to provide a configuration-driven HTTP resilience pipeline: retry, circuit breaker, timeouts, optional rate limiting, fallback, and bulkhead. Options are grouped by **feature** (Connection, Timeout, Retry, CircuitBreaker, RateLimiter, Fallback, Hedging, Bulkhead) so consumers can reason about one concern at a time.
+The package builds on **Microsoft.Extensions.Http.Resilience** and **Polly** to provide a configuration-driven HTTP resilience pipeline. Options are grouped by feature (Connection, Timeout, Retry, CircuitBreaker, RateLimiter, Fallback, Hedging, Bulkhead).
 
-**Pipeline type** is set by **PipelineType** (Standard or Hedging). **Pipeline order** is either legacy (**PipelineOrder**: Fallback vs Bulkhead) or explicit **PipelineStrategyOrder** (array of strategy names). When all enabled: Fallback → Bulkhead → (RateLimiter when in list) → (Standard or Hedging) → Primary. The root **Enabled** flag turns the whole pipeline on or off; **RateLimiter**, **Fallback**, and **Bulkhead** each have their own **Enabled** for optional add-ons.
-
-For telemetry, the package uses Polly's built-in telemetry pipeline and a small `MeteringEnricher` to add Microsoft-style tags such as `error.type`, `request.name`, and `request.dependency.name` on top of the standard resilience metrics. These metrics are emitted by the `Polly` meter (`resilience.polly.*` instruments) and can be collected by the shared `OpenTelemetry.NET` package.
+A single **PipelineOrder** list controls all handler ordering (e.g. `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`). It must contain exactly one of `"Standard"` or `"Hedging"`. The root **Enabled** flag turns the pipeline on or off; optional features (RateLimiter, Fallback, Bulkhead) each have their own **Enabled** flag.
 
 ---
 
 ## Root: Enabled
 
-- **What it does:** Master switch. When `false` or omitted, no resilience or custom primary handler is applied—the extensions return the builder unchanged.
-- **Options:** `true`, `false` (default).
-  **Effect:** `false` = no resilience pipeline and no custom primary handler; the extension returns the builder unchanged. `true` = full pipeline (timeouts, retry, circuit breaker, etc.) and primary handler from this package are applied.
-- **Use case:**
-  When you make an API call and **Enabled** is `false`, your app uses a normal `HttpClient` with no retries, no circuit breaker, no timeouts from this package. When you set **Enabled** to `true`, the same call goes through the resilience pipeline (timeouts, retry, circuit breaker, etc.). So: turn it on in production where you need resilience; leave it off in local dev or when calling only trusted APIs so you don't add extra behavior.
-
-### Enabled: examples
-
-**Bare minimum** — the only required key to activate the package:
+Master switch. When `false` (default), no resilience pipeline, no custom primary handler, and no startup validation. When `true`, the full pipeline is applied.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true
-  }
-}
+{ "HttpResilienceOptions": { "Enabled": true, "PipelineOrder": ["Standard"] } }
 ```
-
-All other sections use their defaults when omitted.
-
-**Disable without removing config** — safe to deploy to environments where resilience is not wanted:
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": false
-  }
-}
-```
-
-The extension returns the builder unchanged; no handlers, no `SocketsHttpHandler`, no validation runs.
 
 ---
 
-## PipelineType
+## PipelineOrder
 
-- **What it does:** Chooses the core resilience pipeline: **Standard** (retry, circuit breaker, timeouts, optional rate limiting) or **Hedging** (multiple requests, first success wins; optional rate limiting when **RateLimiter:Enabled**).
-- **Options:** `Standard` (default), `Hedging`. Config key: `PipelineType`.
-- **Effect:** One extension (`AddHttpClientWithResilience`) applies either pipeline based on this value. No code change needed to switch between standard and hedging; set in config per environment or client.
-- **Use case:** Use **Hedging** when the same API is behind a load balancer with multiple replicas and you care about tail latency; use **Standard** for typical API calls.
+Order of pipeline strategies from **outermost to innermost**. Allowed values: `"Fallback"`, `"Bulkhead"`, `"RateLimiter"`, `"Standard"`, `"Hedging"`.
 
-### PipelineType: examples
+**Rules:**
+- Must contain exactly one of `"Standard"` or `"Hedging"`.
+- No duplicates. Case-insensitive.
+- Required when `Enabled = true`.
+- Optional strategies (Fallback, Bulkhead, RateLimiter) are only added when their `Enabled` flag is `true`.
 
-**Bare minimum** — omit to use Standard (default):
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true
-  }
-}
-```
-
-**Explicit Standard pipeline:**
+**How it works:** Handlers are added in reverse order internally, so the first element is outermost (executes first).
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard"
+    "PipelineOrder": ["Fallback", "Bulkhead", "RateLimiter", "Standard"]
   }
 }
 ```
 
-**Switch to Hedging** — no code change required:
+Execution order: Fallback → Bulkhead → RateLimiter → Standard → SocketsHttpHandler → Network.
+
+For **Hedging**, replace `"Standard"` with `"Hedging"`:
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineType": "Hedging",
-    "Hedging": {
-      "DelaySeconds": 1,
-      "MaxHedgedAttempts": 1
-    }
-  }
-}
+{ "PipelineOrder": ["Fallback", "RateLimiter", "Hedging"] }
 ```
 
 ---
 
 ## Connection
 
-- **What it does:** Configures the primary `SocketsHttpHandler`: connection pool size per server, idle/lifetime timeouts for pooled connections, and connect timeout for TCP/TLS.
-- **Implementation:** `SocketsHttpHandlerFactory` reads these options and sets `MaxConnectionsPerServer`, `ConnectTimeout`, `PooledConnectionIdleTimeout`, `PooledConnectionLifetime`. **Redirect and authentication:** `AllowAutoRedirect`, `MaxAutomaticRedirections`, `Credentials`, and other security-related properties are **not** set by this package; .NET defaults apply. To change redirect or auth behavior, configure the primary handler after creation (e.g. via a custom factory) or use a custom handler in your application.
-- **Options and effect:**
-  - **MaxConnectionsPerServer:** Range 1–1000. Default: 10. **Effect:** Max concurrent TCP connections to a single host:port. Higher = more parallel requests to the same server; lower = less load on that server.
-  - **PooledConnectionIdleTimeoutSeconds:** Range 1–3600. Default: 120. **Effect:** After this many seconds idle, a pooled connection is closed. Lower = free resources sooner; higher = fewer reconnects for steady traffic.
-  - **PooledConnectionLifetimeSeconds:** Range 1–3600. Default: 600. **Effect:** A connection is recycled after this many seconds. Use to respect DNS/load-balancer changes.
-  - **ConnectTimeoutSeconds:** Range 1–120. Default: 21. **Effect:** Max time to establish TCP/TLS. If exceeded, the connection attempt fails (no resilience retry for connect itself).
-- **Use case:**
-  When you make an API call, your app first needs a TCP connection to the server. **Connection** controls how many connections are kept to each server, how long idle ones stay open, and how long to wait when *establishing* a new connection. For example: if the server is down, **ConnectTimeoutSeconds** means "give up after X seconds" instead of hanging. If you call the same API a lot, **MaxConnectionsPerServer** lets more requests share connections instead of opening new ones every time.
+Configures the primary `SocketsHttpHandler` when `Connection.Enabled = true`.
 
-### Connection: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `Enabled` | — | `false` | When false, .NET's default handler is used |
+| `MaxConnectionsPerServer` | 1–1000 | 10 | Max concurrent TCP connections per host:port |
+| `PooledConnectionIdleTimeoutSeconds` | 1–3600 | 120 | Close idle connections after this many seconds |
+| `PooledConnectionLifetimeSeconds` | 1–3600 | 600 | Recycle connections to respect DNS/LB changes |
+| `ConnectTimeoutSeconds` | 1–120 | 21 | Max time for TCP/TLS establishment |
 
-**Bare minimum** — enable with all defaults (10 connections, 21s connect timeout, 120s idle, 600s lifetime):
+> `AllowAutoRedirect`, `Credentials`, and other security properties are **not** set by this package; .NET defaults apply.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Connection": {
-      "Enabled": true
-    }
-  }
+"Connection": {
+  "Enabled": true,
+  "MaxConnectionsPerServer": 20,
+  "ConnectTimeoutSeconds": 10,
+  "PooledConnectionIdleTimeoutSeconds": 90,
+  "PooledConnectionLifetimeSeconds": 300
 }
 ```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Connection": {
-      "Enabled": true,
-      "MaxConnectionsPerServer": 20,             // max concurrent TCP connections per host:port (default: 10)
-      "ConnectTimeoutSeconds": 10,               // fail fast if TCP/TLS handshake takes longer (default: 21)
-      "PooledConnectionIdleTimeoutSeconds": 90,  // close idle connections after 90s (default: 120)
-      "PooledConnectionLifetimeSeconds": 300     // recycle connections after 5 min to respect DNS TTL (default: 600)
-    }
-  }
-}
-```
-
-> When `Connection.Enabled` is `false` (the default), no `SocketsHttpHandler` is installed. .NET's default handler with its own defaults is used — the same behaviour as calling `AddStandardResilienceHandler` directly.
 
 ---
 
 ## Timeout
 
-- **What it does:** Two timeouts: **total request timeout** (whole call, including retries) and **per-attempt timeout** (single try; when exceeded, that try is aborted and may be retried).
-- **Implementation:** Maps to `TotalRequestTimeout` and `AttemptTimeout` in the resilience options. Per-client override via `requestTimeoutSeconds` in the extension methods.
-- **Options and effect:**
-  - **TotalRequestTimeoutSeconds:** Range 1–600. Default: 30. **Effect:** Hard limit for the whole operation (all attempts and retries). When exceeded, the request fails. Caller never waits longer than this.
-  - **AttemptTimeoutSeconds:** Range 1–300. Default: 10. **Effect:** Limit for a *single* attempt. When exceeded, that attempt is aborted and may be retried (subject to total timeout and retry count).
-- **Use case:**
-  When you make an API call, **AttemptTimeoutSeconds** is the limit for *one* try: if the server doesn't respond in that time, that attempt is cancelled and (if retry is on) another try may happen. **TotalRequestTimeoutSeconds** is the limit for the *entire* operation (all tries together). So the user or caller never waits longer than the total timeout; and each attempt is cut short by the attempt timeout so you don't waste time on a single stuck request.
+Two timeouts: **total** (entire operation including retries) and **per-attempt**.
 
-### Timeout: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `TotalRequestTimeoutSeconds` | 1–600 | 30 | Hard limit for the whole operation |
+| `AttemptTimeoutSeconds` | 1–300 | 10 | Limit per single attempt |
 
-**Bare minimum** — total timeout only (attempt timeout defaults to 10s):
+**Validation:** `AttemptTimeoutSeconds` must be ≤ `TotalRequestTimeoutSeconds`.
 
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Timeout": {
-      "TotalRequestTimeoutSeconds": 30
-    }
-  }
-}
-```
-
-**Full settings** — both timeouts explicit. Rule: `AttemptTimeoutSeconds` must be ≤ `TotalRequestTimeoutSeconds`:
+> **Sizing:** With 3 retries and exponential backoff at 2s, total delay can reach ~14s (2+4+8). Ensure `TotalRequestTimeoutSeconds` accommodates attempts + backoff.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Timeout": {
-      "TotalRequestTimeoutSeconds": 30,  // hard cap for the entire call including retries (default: 30)
-      "AttemptTimeoutSeconds": 8         // each individual attempt is cut off here; budget for ~3 retries + delays (default: 10)
-    }
-  }
+"Timeout": {
+  "TotalRequestTimeoutSeconds": 30,
+  "AttemptTimeoutSeconds": 8
 }
 ```
-
-> **Sizing guidance:** With 3 retries and exponential backoff starting at 2s, total delay can reach ~14s (2+4+8). Ensure `TotalRequestTimeoutSeconds` > `AttemptTimeoutSeconds` × (1 + MaxRetryAttempts) + cumulative backoff budget. Startup validation enforces `AttemptTimeout ≤ TotalTimeout`.
 
 ---
 
 ## Retry
 
-- **What it does:** Retries failed attempts (transient failures) with configurable count, delay, backoff type, jitter, and optional use of the `Retry-After` header.
-- **Implementation:** Maps to `HttpRetryStrategyOptions` (MaxRetryAttempts, Delay, BackoffType, UseJitter, ShouldRetryAfterHeader). Backoff: Constant, Linear, or Exponential.
-- **Options and effect:**
-  - **MaxRetryAttempts:** Range 0–10. Default: 3. **Effect:** Number of retries after the first failure. 0 = no retries; higher = more chances before failing.
-  - **BaseDelaySeconds:** Range 1–60. Default: 2. **Effect:** Base delay between retries (seconds). Actual delay depends on **BackoffType** (e.g. exponential: 2s, 4s, 8s).
-  - **BackoffType:** Options: `Constant`, `Linear`, `Exponential` (default). **Effect:** How delay grows: Constant = same delay every time; Linear = delay × attempt; Exponential = delay × 2^attempt (standard for backing off).
-  - **UseJitter:** Options: `true` (default), `false`. **Effect:** When true, random jitter is added to delays so many clients don't retry at once (reduces thundering herd).
-  - **UseRetryAfterHeader:** Options: `true` (default), `false`. **Effect:** When true, if the response has a `Retry-After` header (e.g. 429/503), that value is used for the next retry delay.
-- **Use case:**
-  When you make an API call and it fails (e.g. network blip or server returns 503), **Retry** can automatically try again a few times instead of failing immediately. You choose how many retries (**MaxRetryAttempts**), how long to wait between them (**BaseDelaySeconds**, **BackoffType**), and whether to add randomness (**UseJitter**) so many clients don't all retry at the same second. If the API sends a **Retry-After** header (e.g. "try again in 60 seconds"), **UseRetryAfterHeader** lets the pipeline respect that. Set **MaxRetryAttempts** to **0** if you don't want any retries.
+Retries failed attempts with configurable count, delay, backoff, jitter, and `Retry-After` header support.
 
-  **Guidance:**
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `MaxRetryAttempts` | 0–10 | 3 | Retries after first failure. 0 = no retries |
+| `BaseDelaySeconds` | 0.0–60.0 | 2.0 | Base delay (seconds, supports sub-second e.g. `0.5`) |
+| `BackoffType` | `Constant` / `Linear` / `Exponential` | `Exponential` | How delay grows between retries |
+| `UseJitter` | bool | `true` | Add random jitter to prevent thundering herd |
+| `UseRetryAfterHeader` | bool | `true` | Respect `Retry-After` header from 429/503 responses |
 
-  - For **interactive/UI paths**, keep `MaxRetryAttempts` low (0–3) and `BaseDelaySeconds` modest (1–3 seconds) so users are not blocked for long.
-  - For **background or batch jobs**, you can afford higher retry counts and longer delays, but always ensure the combination of retries and delays still fits within `Timeout:TotalRequestTimeoutSeconds`.
-  - When combining **hedging** and **retries**, remember that both features increase load on the dependency. Use conservative retry counts in hedged pipelines to avoid excessive amplification of traffic.
-
-### Retry: examples
-
-**Bare minimum** — retry count only, all other options use defaults (2s exponential backoff, jitter on, Retry-After header honoured):
+**Guidance:** For interactive paths, keep `MaxRetryAttempts` low (0–3). Set to `0` to disable retries entirely.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Retry": {
-      "MaxRetryAttempts": 3
-    }
-  }
-}
-```
-
-**Disable retries entirely:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Retry": {
-      "MaxRetryAttempts": 0
-    }
-  }
-}
-```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Retry": {
-      "MaxRetryAttempts": 3,          // retries after first failure; 0 = no retries (default: 3)
-      "BaseDelaySeconds": 2,          // base wait between retries; actual delay shaped by BackoffType (default: 2)
-      "BackoffType": "Exponential",   // Constant | Linear | Exponential — grows delay 2s → 4s → 8s (default: Exponential)
-      "UseJitter": true,              // add randomness to delays so concurrent clients don't retry in sync (default: true)
-      "UseRetryAfterHeader": true     // respect Retry-After header from 429/503 responses (default: true)
-    }
-  }
+"Retry": {
+  "MaxRetryAttempts": 3,
+  "BaseDelaySeconds": 2,
+  "BackoffType": "Exponential",
+  "UseJitter": true,
+  "UseRetryAfterHeader": true
 }
 ```
 
@@ -256,573 +129,237 @@ The extension returns the builder unchanged; no handlers, no `SocketsHttpHandler
 
 ## CircuitBreaker
 
-- **What it does:** Stops sending requests to a failing dependency when the failure ratio in a sampling window exceeds a threshold; after a break duration, it allows a trial request (half-open).
-- **Implementation:** Maps to `HttpCircuitBreakerStrategyOptions`: MinimumThroughput, FailureRatio, SamplingDuration, BreakDuration. Applied in both standard and hedging pipelines (per-endpoint in hedging). Configuration keys use the same names as the options (MinimumThroughput, FailureRatio, SamplingDurationSeconds, BreakDurationSeconds) for consistent binding from configuration or JSON.
-- **Options and effect:**
-  - **MinimumThroughput:** Range 1–100. Default: 100. **Effect:** Minimum requests in the sampling window before the circuit can open. Prevents opening on low traffic (e.g. 2 failures out of 3 calls).
-  - **FailureRatio:** Range 0.01–1.0. Default: 0.1. **Effect:** Fraction of requests that may fail (e.g. 0.1 = 10%). Above this in the window, the circuit opens.
-  - **SamplingDurationSeconds:** Range 1–600. Default: 30. **Effect:** Time window (seconds) over which failure ratio is computed. Shorter = faster to open; longer = less flapping.
-  - **BreakDurationSeconds:** Range 1–300. Default: 5. **Effect:** How long (seconds) the circuit stays open before one trial request (half-open). Gives the backend time to recover.
-- **Use case:**
-  When you make many API calls and the backend starts failing (e.g. 50% of requests fail in the last 30 seconds), the **circuit breaker** "opens": it stops sending new requests for a while (**BreakDurationSeconds**) instead of hammering a broken service. After that time, it sends one trial request; if that succeeds, it closes the circuit and traffic flows again. So your app fails fast when the dependency is down instead of wasting time and resources on requests that are likely to fail.
+Stops sending requests when the failure ratio exceeds a threshold within a sampling window.
 
-### CircuitBreaker: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `MinimumThroughput` | 1–100 | 100 | Min requests before circuit can open |
+| `FailureRatio` | 0.01–1.0 | 0.1 | Fraction of failures that triggers open (e.g. 0.1 = 10%) |
+| `SamplingDurationSeconds` | 1–600 | 30 | Time window for failure measurement |
+| `BreakDurationSeconds` | 1–300 | 5 | How long circuit stays open before half-open trial |
 
-**Bare minimum** — most important knobs; opens when >50% of 10+ requests fail in 30s, stays open 15s:
+> **Tuning:** The default `MinimumThroughput: 100` is conservative. For services with < 100 req/30s, lower to 10–20. A `FailureRatio: 0.1` is strict; for best-effort APIs consider 0.3–0.5.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "CircuitBreaker": {
-      "FailureRatio": 0.5,
-      "MinimumThroughput": 10
-    }
-  }
+"CircuitBreaker": {
+  "MinimumThroughput": 10,
+  "FailureRatio": 0.5,
+  "SamplingDurationSeconds": 30,
+  "BreakDurationSeconds": 15
 }
 ```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "CircuitBreaker": {
-      "MinimumThroughput": 10,        // minimum requests in the window before circuit can open (default: 100)
-      "FailureRatio": 0.5,            // open when 50%+ of requests fail within the window (default: 0.1)
-      "SamplingDurationSeconds": 30,  // sliding window over which failures are measured (default: 30)
-      "BreakDurationSeconds": 15      // stay open this long before sending one trial (half-open) request (default: 5)
-    }
-  }
-}
-```
-
-> **Tuning guidance:** The default `MinimumThroughput: 100` is conservative — it prevents the circuit opening on low-traffic services. For services with < 100 req/30s, lower this to e.g. 10–20. A `FailureRatio: 0.1` (10%) is strict; for best-effort APIs consider 0.3–0.5.
 
 ---
 
 ## RateLimiter (optional)
 
-- **What it does:** Limits how many requests can be sent per time window. When **RateLimiter:Enabled** is `true`, applied in both **standard** and **hedging** pipelines (in hedging, a separate rate-limit handler wraps the hedging handler).
-- **Implementation:** Uses `System.Threading.RateLimiting`: FixedWindow, SlidingWindow, or TokenBucket. Permit limit, window/period, and queue limit configurable per algorithm.
-- **Options and effect:**
-  - **Enabled:** Options: `true`, `false` (default). **Effect:** When true, rate limiting is applied in both standard and hedging pipelines. When false, no rate limit.
-  - **PermitLimit:** Range 1–100000. Default: 1000. **Effect:** Max requests allowed per window. Combined with **WindowSeconds** (e.g. 1000 per 1s = 1000 req/s).
-  - **WindowSeconds:** Range 1–3600. Default: 1. **Effect:** Length of the rate-limit window in seconds. For SlidingWindow, window is split by **SegmentsPerWindow**.
-  - **QueueLimit:** Range 0–10000. Default: 0. **Effect:** When limit is exceeded, how many requests can wait (0 = fail immediately; >0 = queue up to that many).
-  - **Algorithm:** Options: `FixedWindow` (default), `SlidingWindow`, `TokenBucket`. **Effect:** FixedWindow = simple "X permits per window"; SlidingWindow = smoother, avoids boundary spikes; TokenBucket = sustained average rate with burst capacity.
-  - **SegmentsPerWindow:** Range 1–100. Default: 2. **Effect:** Only for SlidingWindow: how many segments the window is split into.
-  - **TokenBucketCapacity**, **TokensPerPeriod**, **ReplenishmentPeriodSeconds:** Used only for TokenBucket. **Effect:** Bucket size, refill amount, and refill interval (e.g. 1000 tokens, 1000 per 1s = 1000 req/s sustained).
-- **Use case:**
-  When you make API calls and the backend (or your quota) only allows e.g. 100 requests per second, **RateLimiter** ensures you don't exceed that. Works with both standard and hedging pipelines. If you send too many in a window, extra requests either wait in a queue (if **QueueLimit** > 0) or fail. You choose the algorithm (e.g. **FixedWindow** for simple "X requests per second", **TokenBucket** for a smoother average rate).
+Limits requests per time window. Three algorithms from `System.Threading.RateLimiting`.
 
-### RateLimiter: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `Enabled` | bool | `false` | Enable/disable rate limiting |
+| `PermitLimit` | 1–100000 | 1000 | Max requests per window |
+| `WindowSeconds` | 1–3600 | 1 | Window length |
+| `QueueLimit` | 0–10000 | 0 | Requests that wait when limit hit (0 = reject) |
+| `Algorithm` | `FixedWindow` / `SlidingWindow` / `TokenBucket` | `FixedWindow` | Rate limiting algorithm |
+| `SegmentsPerWindow` | 1–100 | 2 | SlidingWindow only: segments per window |
+| `TokenBucketCapacity` | 1–100000 | 1000 | TokenBucket only: max tokens |
+| `TokensPerPeriod` | 1–100000 | 1000 | TokenBucket only: tokens per replenishment |
+| `ReplenishmentPeriodSeconds` | 1–3600 | 1 | TokenBucket only: replenishment interval |
 
-**Bare minimum** — enable with a limit; uses FixedWindow, 1s window, no queue:
-
+**FixedWindow** — simple X permits per window:
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "RateLimiter": {
-      "Enabled": true,
-      "PermitLimit": 100
-    }
-  }
-}
+"RateLimiter": { "Enabled": true, "Algorithm": "FixedWindow", "PermitLimit": 100, "WindowSeconds": 1 }
 ```
 
-**Full settings — FixedWindow** (simple "X requests per window"):
-
+**SlidingWindow** — smoother, avoids boundary spikes:
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "RateLimiter": {
-      "Enabled": true,
-      "Algorithm": "FixedWindow",  // default algorithm
-      "PermitLimit": 100,          // max requests per window (default: 1000)
-      "WindowSeconds": 1,          // window length in seconds (default: 1)
-      "QueueLimit": 10             // requests that can wait when limit is hit; 0 = reject immediately (default: 0)
-    }
-  }
-}
+"RateLimiter": { "Enabled": true, "Algorithm": "SlidingWindow", "PermitLimit": 100, "WindowSeconds": 10, "SegmentsPerWindow": 5 }
 ```
 
-**Full settings — SlidingWindow** (smoother, prevents boundary spikes):
-
+**TokenBucket** — sustained average with burst capacity:
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "RateLimiter": {
-      "Enabled": true,
-      "Algorithm": "SlidingWindow",
-      "PermitLimit": 100,          // max requests across the rolling window
-      "WindowSeconds": 10,         // total window size (e.g. 100 req per 10s = 10 req/s average)
-      "SegmentsPerWindow": 5,      // window divided into 5 segments of 2s each for smooth counting (default: 2)
-      "QueueLimit": 0
-    }
-  }
-}
-```
-
-**Full settings — TokenBucket** (sustained average with burst capacity):
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "RateLimiter": {
-      "Enabled": true,
-      "Algorithm": "TokenBucket",
-      "TokenBucketCapacity": 200,         // max tokens in bucket; controls burst size (default: 1000)
-      "TokensPerPeriod": 50,              // tokens added each replenishment period (default: 1000)
-      "ReplenishmentPeriodSeconds": 1,    // refill every 1s → sustained 50 req/s with burst up to 200 (default: 1)
-      "QueueLimit": 0
-    }
-  }
-}
+"RateLimiter": { "Enabled": true, "Algorithm": "TokenBucket", "TokenBucketCapacity": 200, "TokensPerPeriod": 50, "ReplenishmentPeriodSeconds": 1 }
 ```
 
 ---
 
 ## Fallback (optional)
 
-- **What it does:** On total failure (after retries/hedging), returns a **synthetic response** (status code and optional body) or a **custom response** from an **IHttpFallbackHandler**. Only when **Fallback:Enabled** is `true`.
-- **Implementation:** Polly fallback handler when the inner pipeline fails or returns non-success. Restrict to 5xx + exceptions via **OnlyOn5xx**. When a custom **IHttpFallbackHandler** is passed to `AddHttpClientWithResilience`, it is invoked first; if it returns a response, that is used; otherwise the synthetic response from options is used. The synthetic response has **RequestMessage** set from the failed outcome's request when the outcome was a failed `HttpResponseMessage`, so logging and telemetry can correlate the fallback response to the original request.
-- **Options and effect:**
-  - **Enabled:** Options: `true`, `false` (default). **Effect:** When true, on total failure the pipeline returns a synthetic (or custom) response instead of throwing. When false, failures propagate as exceptions.
-  - **StatusCode:** Range 400–599. Default: 503. **Effect:** HTTP status code of the synthetic response when no custom handler is used or the custom handler returns null.
-  - **OnlyOn5xx:** Options: `true`, `false` (default). **Effect:** When true, fallback only for 5xx responses and exceptions; 4xx are returned as-is. When false, fallback for any non-success (including 4xx).
-  - **ResponseBody:** Optional string. Default: null. **Effect:** Plain-text body of the synthetic response; null = empty body.
-- **Custom fallback:** Implement **IHttpFallbackHandler** (e.g. call another URL, return cached value, custom logic). Pass an **instance** to `AddHttpClientWithResilience(..., fallbackHandler: handler)`. Resolve the handler from DI when configuring the client if needed (e.g. in a context where you have `IServiceProvider`). **HttpFallbackContext** provides the failed outcome (result or exception).
-- **Use case:**
-  When you make an API call and *everything* fails, the pipeline can return a synthetic response (e.g. 503) or your custom handler can return a cached/default response. **OnlyOn5xx** means "only do this for server errors and exceptions; if the API returns 400 Bad Request, let that through."
+On total failure, returns a **synthetic response** or a **custom response** from an `IHttpFallbackHandler`.
 
-### Fallback: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `Enabled` | bool | `false` | Enable/disable fallback |
+| `StatusCode` | 400–599 | 503 | Synthetic response status code |
+| `OnlyOn5xx` | bool | `false` | `true` = only fallback on 5xx + exceptions; 4xx pass through |
+| `ResponseBody` | string? | `null` | Plain-text body for synthetic response |
 
-**Bare minimum** — enable fallback; returns a 503 with empty body for any non-success:
+**Custom fallback:** Implement `IHttpFallbackHandler` and pass to `AddHttpClientWithResilience(..., fallbackHandler: handler)`. If the handler returns `null`, the synthetic response is used as backstop. `HttpFallbackContext` provides the failed outcome.
+
+The synthetic response has `RequestMessage` set from the failed outcome for correlation.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Fallback": {
-      "Enabled": true
-    }
-  }
+"Fallback": {
+  "Enabled": true,
+  "StatusCode": 503,
+  "OnlyOn5xx": true,
+  "ResponseBody": "Service temporarily unavailable."
 }
 ```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Fallback": {
-      "Enabled": true,
-      "StatusCode": 503,                                   // synthetic response status code, 400–599 (default: 503)
-      "OnlyOn5xx": true,                                   // true = only fallback on 5xx + exceptions; 4xx flows through (default: false)
-      "ResponseBody": "Service temporarily unavailable."  // plain-text body; null = empty body (default: null)
-    }
-  }
-}
-```
-
-> When a custom `IHttpFallbackHandler` is registered via code and returns a response, `ResponseBody` is not used. If the custom handler returns `null`, the synthetic response above is used as the backstop.
 
 ---
 
 ## Hedging
 
-- **What it does:** Sends multiple requests (original + hedged attempts after a delay) and uses the **first successful** response. **Chosen by PipelineType** set to `Hedging` in config (same extension `AddHttpClientWithResilience`).
-- **Implementation:** Configures `HttpStandardHedgingResilienceOptions`: TotalRequestTimeout, Hedging.Delay, Hedging.MaxHedgedAttempts, and per-endpoint Timeout and CircuitBreaker. When **RateLimiter:Enabled** is true, a rate-limit handler is also applied (hedging + rate limiting supported).
-- **Options and effect:**
-  - **DelaySeconds:** Range 0–60. Default: 2. **Effect:** Seconds to wait before sending an extra hedged request. 0 = send hedges immediately with the first request; higher = give the first attempt a chance before adding load.
-  - **MaxHedgedAttempts:** Range 0–10. Default: 1. **Effect:** Number of *extra* attempts (total = 1 + this). 0 = no hedging (only first request); 1 = one backup request; higher = more parallel attempts for lower tail latency.
-- **Use case:**
-  When you make an API call and you care a lot about **latency** (e.g. the same API is behind a load balancer with several replicas), set **PipelineType** to **Hedging** in config. The pipeline then sends a first request, then after **DelaySeconds** maybe sends a second (and more) to another replica. Whichever responds first successfully wins; the others are cancelled.
+Sends multiple requests (original + hedged) and uses the **first successful** response. Include `"Hedging"` in `PipelineOrder` to activate.
 
-### Hedging: examples
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `DelaySeconds` | 0–60 | 2 | Seconds before sending hedged request. 0 = immediate |
+| `MaxHedgedAttempts` | 0–10 | 1 | Extra attempts (total = 1 + this) |
 
-**Bare minimum** — enable hedging with defaults (2s delay, 1 extra attempt):
+> **Hedging amplifies load.** With `MaxHedgedAttempts: 2`, up to 3 requests can be in-flight. Keep low (1–2) and consider RateLimiter/Bulkhead to bound amplification.
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineType": "Hedging"
-  }
-}
+"Hedging": { "DelaySeconds": 1, "MaxHedgedAttempts": 1 }
 ```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineType": "Hedging",
-    "Timeout": {
-      "TotalRequestTimeoutSeconds": 10  // must cover DelaySeconds × MaxHedgedAttempts + one attempt
-    },
-    "Hedging": {
-      "DelaySeconds": 1,    // wait 1s before firing hedged request; 0 = fire immediately (default: 2)
-      "MaxHedgedAttempts": 2  // 2 extra attempts → up to 3 requests total (default: 1)
-    },
-    "CircuitBreaker": {
-      "MinimumThroughput": 10,
-      "FailureRatio": 0.5
-    }
-  }
-}
-```
-
-> **Hedging amplifies load.** With `MaxHedgedAttempts: 2`, up to 3 requests can be in-flight simultaneously. Keep `MaxHedgedAttempts` low (1–2) and consider `RateLimiter` or `Bulkhead` in the order list to bound the amplification effect.
 
 ---
 
 ## Bulkhead (optional)
 
-- **What it does:** Limits **concurrent** outbound requests. Only when **Bulkhead:Enabled** is `true`. Extra requests wait in queue up to **QueueLimit** or fail.
-- **Implementation:** Polly concurrency limiter (limit + queue limit) around the inner pipeline.
-- **Options and effect:**
-  - **Enabled:** Options: `true`, `false` (default). **Effect:** When true, concurrent outbound requests are capped at **Limit**. When false, no concurrency limit.
-  - **Limit:** Range 1–1000. Default: 100. **Effect:** Max number of requests that can be in flight at once. Extra requests wait (if **QueueLimit** > 0) or fail immediately.
-  - **QueueLimit:** Range 0–10000. Default: 0. **Effect:** Max requests that can wait for a slot. 0 = no queue (fail when at limit); >0 = queue up to this many before failing.
-- **Use case:**
-  When you make many API calls at once (e.g. 1000 users each calling the same backend), **Bulkhead** caps how many of those calls can be "in flight" at the same time (e.g. **Limit** = 50). The 51st request either waits in a queue (if **QueueLimit** > 0) or fails. So one slow or broken backend doesn't tie up all your threads or connections; the rest of your app can still do other work. Think of it as "only N calls to this API at a time."
+Limits **concurrent** outbound requests.
 
-### Bulkhead: examples
-
-**Bare minimum** — enable with a concurrency limit; no queue (fail immediately when at limit):
+| Property | Range | Default | Effect |
+|----------|-------|---------|--------|
+| `Enabled` | bool | `false` | Enable/disable bulkhead |
+| `Limit` | 1–1000 | 100 | Max concurrent in-flight requests |
+| `QueueLimit` | 0–10000 | 0 | Requests waiting for a slot (0 = reject at limit) |
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Bulkhead": {
-      "Enabled": true,
-      "Limit": 50
-    }
-  }
-}
+"Bulkhead": { "Enabled": true, "Limit": 50, "QueueLimit": 20 }
 ```
-
-**Full settings:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Bulkhead": {
-      "Enabled": true,
-      "Limit": 50,      // max concurrent in-flight requests; excess requests queue or fail (default: 100)
-      "QueueLimit": 20  // requests that wait for a slot; 0 = reject at limit immediately (default: 0)
-    }
-  }
-}
-```
-
----
-
-## PipelineOrder
-
-- **What it does:** When both **Fallback** and **Bulkhead** are enabled and **PipelineStrategyOrder** is not set, controls whether Fallback runs first (then Bulkhead) or Bulkhead first (then Fallback). Ignored when **PipelineStrategyOrder** is set.
-- **Options:** `FallbackThenConcurrency` (default), `ConcurrencyThenFallback`.
-  **Effect:** **FallbackThenConcurrency** = Fallback handler is outermost, then Bulkhead, then the rest of the pipeline. **ConcurrencyThenFallback** = Bulkhead is outermost, then Fallback. Usually keep default so fallback wraps everything.
-- **Use case:**
-  When you have both fallback and bulkhead on and don't use **PipelineStrategyOrder**, this decides order. For full control over order (including RateLimiter and core), use **PipelineStrategyOrder** instead.
-
-### PipelineOrder: examples
-
-**Bare minimum** — omit to use default (`FallbackThenConcurrency`):
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "Fallback": { "Enabled": true },
-    "Bulkhead": { "Enabled": true, "Limit": 50 }
-  }
-}
-```
-
-**Explicit order** — Bulkhead outermost so concurrency is enforced before fallback catches the rejection:
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineOrder": "ConcurrencyThenFallback",
-    "Fallback": { "Enabled": true, "StatusCode": 503 },
-    "Bulkhead": { "Enabled": true, "Limit": 50 }
-  }
-}
-```
-
-> Prefer `PipelineStrategyOrder` for full control. `PipelineOrder` only positions Fallback and Bulkhead relative to each other; it does not control the position of RateLimiter.
-
----
-
-## PipelineStrategyOrder (optional)
-
-- **What it does:** Explicit order of outer strategies from **outermost to innermost**. Allowed values: `Fallback`, `Bulkhead`, `RateLimiter`, `Standard`, `Hedging`. The list must contain **exactly one** of `Standard` or `Hedging`. When null or empty, **PipelineOrder** and **PipelineType** determine behavior.
-- **Options:** Array of strategy names, e.g. `[ "Fallback", "Bulkhead", "RateLimiter", "Standard" ]`. Config key: `PipelineStrategyOrder`.
-- **Effect:** Handlers are added in reverse order (innermost first), so the first element is the outermost. Enables e.g. RateLimiter between Bulkhead and Standard, or a custom order without changing code.
-- **Use case:**
-  When you need a specific pipeline order (e.g. Fallback → Bulkhead → RateLimiter → Hedging), set **PipelineStrategyOrder** in config. Each strategy is only added if enabled (Fallback.Enabled, Bulkhead.Enabled, RateLimiter.Enabled).
-
-### PipelineStrategyOrder: examples
-
-**Bare minimum** — list with just `Standard` (or `Hedging`); equivalent to the default with no extras:
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineStrategyOrder": ["Standard"]
-  }
-}
-```
-
-**Full settings — Standard with all outer strategies:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineStrategyOrder": ["Fallback", "Bulkhead", "RateLimiter", "Standard"],
-    "Fallback": {
-      "Enabled": true,
-      "StatusCode": 503
-    },
-    "Bulkhead": {
-      "Enabled": true,
-      "Limit": 50
-    },
-    "RateLimiter": {
-      "Enabled": true,
-      "PermitLimit": 200,
-      "WindowSeconds": 1
-    }
-  }
-}
-```
-
-The order above means: Fallback (outermost) catches the final failure; Bulkhead caps concurrency; RateLimiter throttles throughput; Standard handles retry/CB/timeout (innermost).
-
-**Hedging variant:**
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineStrategyOrder": ["Fallback", "RateLimiter", "Hedging"],
-    "PipelineType": "Hedging",
-    "Fallback": { "Enabled": true },
-    "RateLimiter": { "Enabled": true, "PermitLimit": 50 },
-    "Hedging": { "DelaySeconds": 1, "MaxHedgedAttempts": 1 }
-  }
-}
-```
-
-> **Inner pipeline order (advanced, code-first)**
->
-> For most apps, the inner order of the standard pipeline (total timeout, attempt timeout, retry, circuit breaker, rate limiter) comes from Microsoft's `AddStandardResilienceHandler` via `HttpStandardResilienceOptions`. When you need **full control** over the inner order (e.g. retry outside circuit breaker, different timeout placement), use the advanced overload:
->
-> ```csharp
-> services.AddHttpClient("MyClient", _ => { })
->     .AddHttpClientWithResilience(
->         configuration,
->         requestTimeoutSeconds: 30,
->         fallbackHandler: null,
->         configureInnerPipeline: inner =>
->         {
->             // Total timeout is already prepended automatically from requestTimeoutSeconds / config.
->             // Add your inner strategies here in the order they should execute (outermost first):
->             inner
->                 .AddRetry(new HttpRetryStrategyOptions { /* ... */ })
->                 .AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions { /* ... */ })
->                 .AddTimeout(new HttpTimeoutStrategyOptions { /* ... */ });  // per-attempt timeout
->         });
-> ```
->
-> This overload bypasses `AddStandardResilienceHandler` and lets you construct the inner pipeline directly with `ResiliencePipelineBuilder<HttpResponseMessage>`, mirroring Polly/Microsoft code-first control. In this mode, config keys like `PipelineType`, `PipelineOrder`, and `PipelineStrategyOrder` are not applied to the inner pipeline; treat it as an escape hatch for advanced scenarios.
->
-> When using a **per-tenant or per-client** configuration section with a custom inner pipeline, use the overload that accepts **IConfigurationSection** so the primary handler (connection pool, timeouts) is built from that section: `AddHttpClientWithResilience(tenantSection, requestTimeoutSeconds: null, fallbackHandler: null, configureInnerPipeline: inner => { ... })`.
 
 ---
 
 ## PipelineSelection (optional)
 
-- **What it does:** When **Mode** is `ByAuthority`, a **separate pipeline instance** is used per request authority (scheme + host + port). Same options apply; state (e.g. circuit breaker) is per authority.
-- **Options:** **Mode:** `None` (default), `ByAuthority`. Config key: `PipelineSelection:Mode`.
-- **Effect:** **None** = one pipeline per named client. **ByAuthority** = one pipeline instance per distinct authority so e.g. circuit breakers don't share state across different hosts.
-- **Use case:**
-  When the same HttpClient is used to call multiple hosts (e.g. dynamic URLs or several downstream services), set **PipelineSelection:Mode** to **ByAuthority** so each host has its own circuit breaker and resilience state.
+When `Mode` is `ByAuthority`, a **separate pipeline instance** is used per request authority (scheme + host + port), isolating circuit breakers and rate limiters per host.
 
-### PipelineSelection: examples
-
-**Bare minimum / default** — single pipeline shared across all authorities (omitting `PipelineSelection` is equivalent):
+| Value | Effect |
+|-------|--------|
+| `None` (default) | One pipeline per named client |
+| `ByAuthority` | One pipeline per distinct authority |
 
 ```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineSelection": {
-      "Mode": "None"
-    }
-  }
-}
-```
-
-**Per-authority isolation** — each distinct `scheme://host:port` gets its own circuit breaker state:
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineSelection": {
-      "Mode": "ByAuthority"
-    }
-  }
-}
+"PipelineSelection": { "Mode": "ByAuthority" }
 ```
 
 ---
 
 ## Custom pipeline (code)
 
-- **What it does:** The overload `AddHttpClientWithResilience(..., configurePipeline: b => { })` lets you add **extra resilience handlers** (outermost) after the built-in pipeline. Use to add custom Polly strategies (e.g. logging, custom retry).
-- **Use case:**
-  When you need strategies not covered by options (e.g. a custom handler that logs failures), pass **configurePipeline** and call `b.AddResilienceHandler("name", ...)` on the builder. Handlers added there execute first (outermost).
+Two escape hatches for code-first control:
+
+1. **`configurePipeline`** — adds extra resilience handlers outermost (e.g. custom logging):
+   ```csharp
+   .AddHttpClientWithResilience(config, requestTimeoutSeconds: null, fallbackHandler: null,
+       configurePipeline: b => b.AddResilienceHandler("custom", rb => { /* ... */ }));
+   ```
+
+2. **`configureInnerPipeline`** — full control via `ResiliencePipelineBuilder<HttpResponseMessage>`, bypassing `AddStandardResilienceHandler`. Config keys like `PipelineOrder` are not applied to the inner pipeline:
+   ```csharp
+   .AddHttpClientWithResilience(config, requestTimeoutSeconds: 30, fallbackHandler: null,
+       configureInnerPipeline: inner =>
+       {
+           inner
+               .AddRetry(new HttpRetryStrategyOptions { /* ... */ })
+               .AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions { /* ... */ })
+               .AddTimeout(new HttpTimeoutStrategyOptions { Timeout = TimeSpan.FromSeconds(30) });
+       });
+   ```
+
+For per-tenant scenarios, use the `IConfigurationSection` overload so the primary handler is built from that section.
 
 ---
 
-## Validation and type-safe options
+## Health checks
 
-- Options with a fixed set of values are **enums** in code for type safety: **RetryBackoffType** (Constant, Linear, Exponential), **RateLimitAlgorithm** (FixedWindow, SlidingWindow, TokenBucket), **PipelineOrderType** (FallbackThenConcurrency, ConcurrencyThenFallback), **PipelineSelectionMode** (None, ByAuthority), **ResiliencePipelineType** (Standard, Hedging). Config keys and values are unchanged (e.g. `"BackoffType": "Exponential"`, `"Algorithm": "FixedWindow"`).
-- Options are validated at **startup** when using `AddHttpResilienceOptions`: data annotations (ranges) and `Enum.IsDefined` for those enums, plus `PipelineStrategyOrder` (exactly one of Standard/Hedging, only allowed names). Invalid configuration throws so misconfiguration fails fast.
+Register `AddHttpResilienceHealthChecks()` to expose aggregate circuit breaker state via ASP.NET health checks:
 
----
-
-## Summary table
-
-| Section        | Always applied when root Enabled?    | Use case focus                                |
-|----------------|--------------------------------------|-----------------------------------------------|
-| Connection     | Yes                                  | Pool size, connect/timeouts                   |
-| Timeout        | Yes                                  | Total vs per-attempt timeout                  |
-| Retry          | Yes (disable via MaxRetryAttempts=0) | Transient failures, backoff, jitter           |
-| CircuitBreaker | Yes                                  | Stop calling failing dependencies             |
-| RateLimiter    | No (RateLimiter:Enabled)             | Quota / rate limits (standard and hedging)    |
-| Fallback       | No (Fallback:Enabled)                | Synthetic or custom response on total failure |
-| Hedging        | When PipelineType is Hedging         | Lower tail latency, multiple replicas         |
-| Bulkhead       | No (Bulkhead:Enabled)                | Limit concurrent outbound requests            |
-
----
-
-## Complete reference configuration
-
-The following example enables every section with reasonable production values. Use it as a starting point and remove sections/keys you do not need.
-
-```json
-{
-  "HttpResilienceOptions": {
-    "Enabled": true,
-    "PipelineType": "Standard",
-    "PipelineStrategyOrder": ["Fallback", "Bulkhead", "RateLimiter", "Standard"],
-
-    "Connection": {
-      "Enabled": true,
-      "MaxConnectionsPerServer": 20,
-      "ConnectTimeoutSeconds": 10,
-      "PooledConnectionIdleTimeoutSeconds": 90,
-      "PooledConnectionLifetimeSeconds": 300
-    },
-
-    "Timeout": {
-      "TotalRequestTimeoutSeconds": 30,
-      "AttemptTimeoutSeconds": 8
-    },
-
-    "Retry": {
-      "MaxRetryAttempts": 3,
-      "BaseDelaySeconds": 2,
-      "BackoffType": "Exponential",
-      "UseJitter": true,
-      "UseRetryAfterHeader": true
-    },
-
-    "CircuitBreaker": {
-      "MinimumThroughput": 10,
-      "FailureRatio": 0.5,
-      "SamplingDurationSeconds": 30,
-      "BreakDurationSeconds": 15
-    },
-
-    "RateLimiter": {
-      "Enabled": true,
-      "Algorithm": "FixedWindow",
-      "PermitLimit": 200,
-      "WindowSeconds": 1,
-      "QueueLimit": 0
-    },
-
-    "Fallback": {
-      "Enabled": true,
-      "StatusCode": 503,
-      "OnlyOn5xx": true,
-      "ResponseBody": "Service temporarily unavailable."
-    },
-
-    "Bulkhead": {
-      "Enabled": true,
-      "Limit": 50,
-      "QueueLimit": 10
-    },
-
-    "PipelineSelection": {
-      "Mode": "None"
-    }
-  }
-}
+```csharp
+services.AddHttpResilienceHealthChecks();
 ```
+
+- **Healthy** — all circuit breakers are closed.
+- **Degraded** — any circuit breaker is open or half-open.
+- Per-client state is included in the health check data dictionary.
+- Suitable for Kubernetes readiness probes.
+
+Internally uses `CircuitBreakerStateTracker`, which is automatically wired when the Standard or Hedging pipeline is configured.
+
+---
+
+## Structured logging
+
+Resilience events are logged via high-performance `LoggerMessage` source generation (zero-allocation when disabled):
+
+| Event | Level | When |
+|-------|-------|------|
+| Fallback activated | Warning | Fallback strategy produces a response |
+| Retry attempt | Warning | A retry is attempted |
+| Circuit breaker opened | Warning | Circuit transitions to open |
+| Circuit breaker half-open | Information | Circuit allows a trial request |
+| Circuit breaker closed | Information | Circuit recovers |
+
+These are wired automatically when the pipeline is configured — no additional registration needed.
 
 ---
 
 ## Telemetry and metrics enrichment
 
-- **What it does:** Adds a minimal Microsoft-style telemetry enrichment layer on top of Polly telemetry, so resilience metrics carry standard tags for downstream analysis.
-- **Implementation:** Uses Polly's `TelemetryOptions` and a custom `HttpResilienceMeteringEnricher`:
-  - `HttpResilienceMeteringEnricher` derives from `Polly.Telemetry.MeteringEnricher`.
-  - It is registered via `AddHttpResilienceTelemetry`, which configures:
-    - `services.Configure<TelemetryOptions>(options => options.MeteringEnrichers.Add(new HttpResilienceMeteringEnricher()));`
-  - The shared `OpenTelemetry.NET` package collects the `Polly` meter by calling `metrics.AddMeter("Polly")` in its metrics configuration, so all `resilience.polly.*` instruments (strategy events, attempt duration, pipeline duration) are exported alongside existing HTTP/server metrics.
-- **Tags added by the enricher:**
-  - **`error.type`**
-    - When an exception is present on the outcome: full CLR type name (e.g. `System.TimeoutException`, `System.Net.Http.HttpRequestException`).
-    - When there is no exception but the result is an `HttpResponseMessage` with non-success status: a string such as `HttpStatusCode.500`.
-  - **`request.name`**
-    - Prefer `ResilienceContext.OperationKey` when set (friendly, logical operation name controlled by the caller).
-    - Otherwise, derived from Polly tags such as `pipeline.name` and `strategy.name` (e.g. `my-http-pipeline/Retry`).
-  - **`request.dependency.name`**
-    - For HTTP outcomes, derived from the target URI using `scheme://host[:port]` (e.g. `https://api.example.com`, `http://orders.internal:8080`).
-    - If no HTTP request information is available, falls back to `pipeline.name` when present.
-- **How to enable telemetry in an app:**
-  - Register resilience options and telemetry:
-    - `services.AddHttpResilienceOptions(configuration);`
-    - `services.AddHttpResilienceTelemetry();`
-  - Configure OpenTelemetry via the shared package (in the hosting app):
-    - `builder.AddObservability();` (from `OpenTelemetry.NET`, which already sets up metrics, tracing, and exporters and adds the `Polly` meter).
-  - Register HTTP clients using the existing extension:
-    - `services.AddHttpClient("MyClient").AddHttpClientWithResilience(configuration);`
-- **Effect:** All resilience events from standard and hedging handlers (retry, circuit breaker, timeout, rate limiter, fallback, hedging, bulkhead) emit Polly metrics enriched with `error.type`, `request.name`, and `request.dependency.name`. These can be used in dashboards and alerts for:
-  - Grouping failures by dependency (`request.dependency.name`).
-  - Grouping by logical operation (`request.name`).
-  - Breaking down failure categories (`error.type` by exception type or HTTP status).
+`AddHttpResilienceTelemetry()` registers `HttpResilienceMeteringEnricher` which adds tags to Polly metrics (`resilience.polly.*` instruments):
 
-For **how to consume** the package (NuGet, configuration, code), see the [README](../README.md).
+| Tag | Source |
+|-----|--------|
+| `error.type` | Exception type name (e.g. `System.TimeoutException`) or `HttpStatusCode.<code>` |
+| `request.name` | `ResilienceContext.OperationKey` if set, else pipeline/strategy names |
+| `request.dependency.name` | `scheme://host[:port]` from the request URI |
+
+**Safe by default:** No bodies, headers, paths, or query strings are exported.
+
+Collect the Polly meter in your metrics pipeline:
+```csharp
+metrics.AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName); // or "Polly"
+```
+
+---
+
+## Validation
+
+Options are validated at **startup** when `Enabled = true`. Invalid configuration throws `OptionsValidationException` for fast failure.
+
+**Rules:**
+- Data annotation ranges on all numeric properties.
+- `PipelineOrder`: required, valid names, no duplicates, exactly one of Standard/Hedging.
+- `AttemptTimeoutSeconds` ≤ `TotalRequestTimeoutSeconds`.
+- `Enum.IsDefined` for `BackoffType`, `Algorithm`, `PipelineSelection.Mode`.
+- Validation failures from disabled sections are ignored (e.g. RateLimiter range errors when `RateLimiter.Enabled = false`).
+
+---
+
+## Summary
+
+| Section | Always applied when Enabled? | Purpose |
+|---------|------------------------------|---------|
+| Connection | When `Connection.Enabled` | Pool size, connect timeout |
+| Timeout | Yes | Total vs per-attempt timeout |
+| Retry | Yes (disable via `MaxRetryAttempts: 0`) | Transient failures, backoff, jitter |
+| CircuitBreaker | Yes | Stop calling failing dependencies |
+| RateLimiter | When `RateLimiter.Enabled` | Quota / rate limits |
+| Fallback | When `Fallback.Enabled` | Synthetic or custom response on failure |
+| Hedging | When `PipelineOrder` contains `"Hedging"` | Lower tail latency |
+| Bulkhead | When `Bulkhead.Enabled` | Limit concurrent outbound requests |
+
+For **how to consume** the package, see the [README](../README.md). For **operational guidance**, see [OPERATIONS.md](OPERATIONS.md).

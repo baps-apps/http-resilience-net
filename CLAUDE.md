@@ -72,6 +72,11 @@ A single `PipelineOrder` list controls all handler ordering:
 | `src/.../Internal/SocketsHttpHandlerFactory.cs` | Creates `SocketsHttpHandler` from `ConnectionOptions` |
 | `src/.../Internal/RateLimiterFactory.cs` | Creates `FixedWindow`, `SlidingWindow`, or `TokenBucket` rate limiter |
 | `src/.../Abstractions/IHttpFallbackHandler.cs` | Custom fallback interface; return `null` to use synthetic response |
+| `src/.../Internal/HttpResilienceLogging.cs` | Structured logging via `LoggerMessage` source generation |
+| `src/.../Internal/CircuitBreakerStateTracker.cs` | Thread-safe circuit breaker state tracking for health checks |
+| `src/.../Internal/HttpResilienceHealthCheck.cs` | ASP.NET health check for aggregate circuit breaker state |
+| `src/.../Extensions/HealthCheckExtensions.cs` | `AddHttpResilienceHealthChecks()` registration |
+| `src/.../Extensions/HttpResilienceTelemetryExtensions.cs` | `AddHttpResilienceTelemetry()` and `HttpResilienceMeteringEnricher` |
 
 ### Configuration section
 

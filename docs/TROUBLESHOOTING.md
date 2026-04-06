@@ -1,127 +1,91 @@
-## Troubleshooting
+# Troubleshooting
 
-This document lists common issues when adopting `HttpResilience.NET` and how to diagnose and fix them.
-
----
-
-### Startup fails with OptionsValidationException
-
-**Symptom**: Application fails to start with `OptionsValidationException` for `HttpResilienceOptions`.
-
-- **Likely causes**:
-  - `HttpResilienceOptions:Enabled` is `true` (validation only runs when the feature is enabled).
-  - A value is out of range (e.g. `Connection:MaxConnectionsPerServer = 0` or `> 1000`; `CircuitBreaker:MinimumThroughput` outside 1–100).
-  - `Timeout:AttemptTimeoutSeconds` is greater than `Timeout:TotalRequestTimeoutSeconds`.
-  - An enum value is invalid (e.g. `Retry:BackoffType = "Exponetial"` typo).
-  - `PipelineStrategyOrder` is invalid:
-    - Contains an unknown entry.
-    - Does not contain exactly one of `Standard` or `Hedging`.
-    - Contains duplicates.
-
-- **What to do**:
-  - Check the exception message; it is written to explain exactly which rule failed.
-  - Compare your configuration against `IMPLEMENTATION.md` and `RECIPES.md`.
-  - Fix typos (e.g. `"Exponential"` vs `"Exponetial"`) and ensure allowed ranges.
-  - If you need to temporarily bypass validation (e.g. debugging), you can set `"HttpResilienceOptions:Enabled" = false`; this disables both the resilience pipeline and startup validation. Do **not** leave it disabled in production unintentionally.
+Common issues when adopting HttpResilience.NET and how to diagnose them.
 
 ---
 
-### Requests behave as if there is no resilience
+## Startup fails with OptionsValidationException
 
-**Symptom**: Timeouts, retries, circuit breakers, etc. do not seem to be applied.
+**Likely causes** (validation only runs when `Enabled = true`):
 
-- **Checklist**:
-  - Ensure `"HttpResilienceOptions:Enabled" = true`.
-  - Confirm that you called:
-    - `services.AddHttpResilienceOptions(configuration);`
-    - `services.AddHttpClient("MyClient").AddHttpClientWithResilience(configuration);` or the section-based overload.
-  - Verify that the named client you are using matches the registration (e.g. `CreateClient("MyClient")`).
-  - Ensure that you are not overriding the `HttpClient`'s `Timeout` in a way that conflicts with pipeline timeouts.
+- A value is out of range (e.g. `MaxConnectionsPerServer = 0`).
+- `AttemptTimeoutSeconds` > `TotalRequestTimeoutSeconds`.
+- An enum value is misspelled (e.g. `"Exponetial"` instead of `"Exponential"`).
+- `PipelineOrder` is invalid: unknown entry, missing `Standard`/`Hedging`, duplicates, or contains both.
 
----
+**What to do:**
 
-### Timeouts fire sooner or later than expected
-
-**Symptom**: Requests time out earlier than expected, or appear to hang longer than the configured total timeout.
-
-- **Things to check**:
-  - `Timeout:TotalRequestTimeoutSeconds` vs `Timeout:AttemptTimeoutSeconds`:
-    - Each attempt is bounded by `AttemptTimeoutSeconds`.
-    - All attempts together are bounded by `TotalRequestTimeoutSeconds`.
-  - Retries:
-    - Remember that retries + delays must fit within the **total** timeout.
-  - Connect timeout:
-    - `Connection:ConnectTimeoutSeconds` controls TCP/TLS establishment only; application-level timeouts apply after connection is acquired.
-
-- **Guidance**:
-  - Keep `AttemptTimeoutSeconds` lower than or equal to `TotalRequestTimeoutSeconds` (this is now validated).
-  - For interactive calls, consider `TotalRequestTimeoutSeconds` in the range 5–30 seconds.
+- Check the exception message — it explains which rule failed.
+- Compare config against [IMPLEMENTATION.md](IMPLEMENTATION.md).
+- To temporarily bypass: set `Enabled: false` (disables both pipeline and validation). Don't leave disabled in production.
 
 ---
 
-### Circuit breaker opens “too often” or “never”
+## Requests behave as if there is no resilience
 
-**Symptom**: Circuit breaker opens aggressively on small bursts, or never opens despite many failures.
-
-- **Parameters to tune**:
-  - `CircuitBreaker:MinimumThroughput`:
-    - Too low: breaker may open on a handful of failures.
-    - Too high: breaker may never see enough traffic to open.
-  - `CircuitBreaker:FailureRatio`:
-    - Lower = more sensitive; higher = more tolerant.
-  - `CircuitBreaker:SamplingDurationSeconds`:
-    - Shorter window = more responsive but more “flappy”.
-  - `CircuitBreaker:BreakDurationSeconds`:
-    - How long the circuit stays open before trying again.
-
-- **Use telemetry**:
-  - Check failure rate per `request.dependency.name` and breaker-open events (see `OPERATIONS.md` for metrics).
+- Ensure `Enabled = true` in config.
+- Confirm both calls were made: `AddHttpResilienceOptions(configuration)` then `AddHttpClientWithResilience(configuration)`.
+- Verify the named client matches (e.g. `CreateClient("MyClient")` matches `AddHttpClient("MyClient", ...)`).
+- Check that `HttpClient.Timeout` isn't overriding pipeline timeouts.
 
 ---
 
-### Unexpected fallback responses
+## Timeouts fire sooner or later than expected
 
-**Symptom**: Responses with fallback status/message appear when you did not expect them, or you get exceptions instead of fallback.
-
-- **Checklist**:
-  - `Fallback:Enabled` must be `true`.
-  - `Fallback:OnlyOn5xx`:
-    - `true`: fallback only for 5xx and exceptions; 4xx pass through.
-    - `false`: any non-success status may trigger fallback.
-  - If you use a custom `IHttpFallbackHandler`:
-    - Remember that if it returns `null`, the synthetic fallback response (status/body from options) is used.
+- Each attempt is bounded by `AttemptTimeoutSeconds`.
+- All attempts together are bounded by `TotalRequestTimeoutSeconds`.
+- Retries + delays must fit within the total timeout.
+- `ConnectTimeoutSeconds` controls TCP/TLS establishment only.
+- Keep `AttemptTimeoutSeconds` ≤ `TotalRequestTimeoutSeconds` (validated at startup).
 
 ---
 
-### Rate limiter or bulkhead “blocking” too much traffic
+## Circuit breaker opens too often or never
 
-**Symptom**: Many requests are failing quickly with limit errors, or waiting unexpectedly in queues.
+**Too often:**
 
-- **Parameters to review**:
-  - `RateLimiter:PermitLimit` and `WindowSeconds`:
-    - Ensure they match your backend’s allowed throughput.
-  - `RateLimiter:QueueLimit`:
-    - `0` means fail immediately when limit is reached.
-  - `Bulkhead:Limit` and `QueueLimit`:
-    - Limit is concurrent in-flight requests.
-    - Queue is how many can wait.
+- `MinimumThroughput` too low — opens on a handful of failures.
+- `FailureRatio` too low — too sensitive.
+- `SamplingDurationSeconds` too short — more reactive but flappy.
 
-- **Mitigation**:
-  - Increase limits cautiously, monitoring downstream health.
-  - For critical APIs, prefer smaller queues to avoid long waits.
+**Never opens:**
+
+- `MinimumThroughput` too high for actual traffic volume.
+- `FailureRatio` too high — too tolerant.
+
+Use telemetry (`error.type`, `request.dependency.name`) and health checks to debug. See [OPERATIONS.md](OPERATIONS.md).
 
 ---
 
-### Telemetry tags missing or incomplete
+## Unexpected fallback responses
 
-**Symptom**: You do not see `error.type`, `request.name`, or `request.dependency.name` on resilience metrics.
+- Ensure `Fallback.Enabled = true` and `"Fallback"` is in `PipelineOrder`.
+- `OnlyOn5xx = true` means 4xx responses pass through; only 5xx and exceptions trigger fallback.
+- If using a custom `IHttpFallbackHandler` that returns `null`, the synthetic response (StatusCode/ResponseBody from config) is used as backstop.
 
-- **Checklist**:
-  - Did you call `services.AddHttpResilienceTelemetry();`?
-  - Does your telemetry bootstrap include the Polly meter (`metrics.AddMeter("Polly")`)?
-  - Are you looking at the right aggregation window and environment?
+---
 
-- **Notes**:
-  - `request.name` prefers `ResilienceContext.OperationKey` when set; otherwise uses pipeline/strategy names.
-  - `request.dependency.name` requires access to the `HttpRequestMessage.RequestUri` (available for HTTP outcomes).
+## Rate limiter or bulkhead blocking too much
 
+- Review `PermitLimit` / `WindowSeconds` against actual throughput.
+- `QueueLimit = 0` means immediate rejection at limit.
+- `Bulkhead.Limit` caps concurrent in-flight requests, not total.
+- Increase limits cautiously while monitoring downstream health.
+
+---
+
+## Telemetry tags missing
+
+- Ensure `AddHttpResilienceTelemetry()` was called.
+- Ensure your metrics pipeline includes the Polly meter: `metrics.AddMeter("Polly")`.
+- `request.name` prefers `ResilienceContext.OperationKey` when set; otherwise uses pipeline/strategy names.
+- `request.dependency.name` requires `HttpRequestMessage.RequestUri` (available for HTTP outcomes).
+
+---
+
+## Health check shows Degraded
+
+- One or more circuit breakers are open or half-open.
+- Check which client by inspecting the health check data dictionary.
+- Investigate the failing dependency (see [RUNBOOK.md](RUNBOOK.md)).
+- The health check returns Healthy once all circuits close.

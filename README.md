@@ -1,6 +1,6 @@
 # HttpResilience.NET
 
-Shared .NET package for HTTP client resilience: options, `SocketsHttpHandler` factory, and extensions to add resilience to `HttpClient`. Pipeline type is chosen via config (**PipelineType**: Standard or Hedging). Supports optional **rate limiting** (standard and hedging), **fallback** (synthetic or custom via `IHttpFallbackHandler`), **bulkhead**, configurable **pipeline order**, **per-authority** pipeline selection, and a **custom pipeline** delegate for extra strategies.
+Shared .NET package for HTTP client resilience: options, `SocketsHttpHandler` factory, and extensions to add resilience to `HttpClient`. Pipeline behaviour is driven by a single **PipelineOrder** list (e.g. `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`). Supports optional **rate limiting**, **fallback** (synthetic or custom via `IHttpFallbackHandler`), **bulkhead**, **per-authority** pipeline selection, **health checks**, and a **custom pipeline** delegate for extra strategies.
 
 Consumer solutions reference **HttpResilience.NET NuGet package** (from a feed or local nupkg), not a project reference.
 
@@ -30,14 +30,12 @@ For detailed implementation logic, use cases per option, and comparison with han
 
 ## Pipeline types
 
-
 | Type         | Description                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Standard** | Timeout, retry, circuit breaker, optional rate limiting. Single request per attempt; retries on transient failure. Use for most APIs.         |
 | **Hedging**  | Multiple requests (hedged attempts), first success wins; optional rate limiting. Use for tail-latency sensitive calls to replicated backends. |
 
-
-Optional features (each has its own `Enabled` in its section):
+Include `"Standard"` or `"Hedging"` (exactly one) in the **PipelineOrder** list. Optional features (each has its own `Enabled` in its section):
 
 - **RateLimiter** – Polly rate limiter (FixedWindow / SlidingWindow / TokenBucket) around the inner or hedging handler.
 - **Fallback** – return a synthetic response on total failure, or use a custom **IHttpFallbackHandler**.
@@ -75,13 +73,13 @@ Or add a **PackageReference** in your `.csproj`. Consumers reference the **HttpR
 
 ### 1. Configure `appsettings.json`
 
-Minimal configuration with resilience enabled (default pipeline: Standard):
+Minimal configuration with resilience enabled:
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard",
+    "PipelineOrder": ["Standard"],
     "Connection": {
       "Enabled": true,
       "MaxConnectionsPerServer": 10,
@@ -107,7 +105,7 @@ Minimal configuration with resilience enabled (default pipeline: Standard):
 }
 ```
 
-Set **Enabled** to **true** to enable HTTP resilience. All other properties are optional; defaults are applied when not provided. For full options and examples (rate limiter, fallback, bulkhead, hedging), see the **Configuration** section below.
+Set **Enabled** to **true** and provide a **PipelineOrder** list with at least `"Standard"` or `"Hedging"`. All other properties are optional with sensible defaults. For full options and examples (rate limiter, fallback, bulkhead, hedging), see the **Configuration** section below.
 
 ### 2. Add to `Program.cs`
 
@@ -122,7 +120,10 @@ builder.Services.AddHttpResilienceOptions(builder.Configuration);
 // Optional but recommended for production: telemetry (enriches metrics with error.type, request.name, request.dependency.name)
 builder.Services.AddHttpResilienceTelemetry();
 
-// Named client with resilience (pipeline type from config: Standard or Hedging)
+// Optional: health checks for circuit breaker state
+builder.Services.AddHttpResilienceHealthChecks();
+
+// Named client with resilience (pipeline from config PipelineOrder)
 builder.Services.AddHttpClient("MyClient", client => { /* optional */ })
     .AddHttpClientWithResilience(builder.Configuration, requestTimeoutSeconds: 30);
 
@@ -174,8 +175,7 @@ Use the **HttpResilienceOptions** section. Options are grouped by feature: **Con
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard",
-    "PipelineOrder": "FallbackThenConcurrency",
+    "PipelineOrder": ["Fallback", "Bulkhead", "RateLimiter", "Standard"],
     "Connection": {
       "Enabled": true,
       "MaxConnectionsPerServer": 10,
@@ -200,15 +200,15 @@ Use the **HttpResilienceOptions** section. Options are grouped by feature: **Con
       "SamplingDurationSeconds": 30,
       "BreakDurationSeconds": 5
     },
-    "RateLimiter": { "Enabled": false, "PermitLimit": 1000, "WindowSeconds": 1, "QueueLimit": 0, "Algorithm": "FixedWindow" },
-    "Fallback": { "Enabled": false, "StatusCode": 503, "OnlyOn5xx": false, "ResponseBody": null },
+    "RateLimiter": { "Enabled": true, "PermitLimit": 1000, "WindowSeconds": 1, "QueueLimit": 0, "Algorithm": "FixedWindow" },
+    "Fallback": { "Enabled": true, "StatusCode": 503, "OnlyOn5xx": false, "ResponseBody": null },
     "Hedging": { "DelaySeconds": 2, "MaxHedgedAttempts": 1 },
-    "Bulkhead": { "Enabled": false, "Limit": 100, "QueueLimit": 0 }
+    "Bulkhead": { "Enabled": true, "Limit": 100, "QueueLimit": 0 }
   }
 }
 ```
 
-Optional **PipelineStrategyOrder** (array): order of outer strategies, e.g. `[ "Fallback", "Bulkhead", "RateLimiter", "Standard" ]`. When set, overrides **PipelineOrder**. Handlers are added so the **first element is outermost**.
+**PipelineOrder** is a list of strategy names from outermost to innermost: `"Fallback"`, `"Bulkhead"`, `"RateLimiter"`, and exactly one of `"Standard"` or `"Hedging"`. The first element is outermost (executes first). Optional strategies are only added when their `Enabled` flag is `true`.
 
 **Binding from a specific section** (e.g. multi-tenant):
 
@@ -224,13 +224,10 @@ Ranges and allowed values are validated at startup when using `AddHttpResilience
 
 This table maps the config schema to what `AddHttpClientWithResilience(...)` configures and when you typically use it.
 
-
 | Option / section                                | What it configures                                                                                                                 | Typical usage                                                                            |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `Enabled`                                       | If `false`, no resilience pipeline. If `true`, applies primary handler + resilience handlers.                                      | Feature-flag resilience per environment/service.                                         |
-| `PipelineType` (`Standard`/`Hedging`)           | Chooses standard vs hedging handler (timeout, retry, circuit breaker; hedging = multiple requests, first success wins).            | Standard for most APIs; Hedging for tail-latency sensitive calls to replicated backends. |
-| `PipelineOrder`                                 | Relative order of **Fallback** and **Bulkhead** when both enabled (legacy).                                                        | Keep defaults unless you need bulkhead outermost vs fallback outermost.                  |
-| `PipelineStrategyOrder` (array)                 | Explicit outer strategy order: `Fallback`, `Bulkhead`, `RateLimiter`, and one of `Standard`/`Hedging`. First element is outermost. | Full control of outer handler ordering without code changes.                             |
+| `PipelineOrder` (array)                         | Strategy order outermost→innermost: `Fallback`, `Bulkhead`, `RateLimiter`, and exactly one of `Standard`/`Hedging`.               | `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`. Required when `Enabled = true`.  |
 | `PipelineSelection:Mode` (`None`/`ByAuthority`) | When `ByAuthority`, separate pipeline instances per authority (scheme+host+port).                                                  | One `HttpClient` calling many hosts; isolate circuit breakers per host.                  |
 | `Connection:`*                                  | Primary `SocketsHttpHandler` (pool, timeouts, `ConnectTimeout`).                                                                   | Connection pool tuning and faster failure on connect hangs.                              |
 | `Timeout:TotalRequestTimeoutSeconds`            | Total operation timeout (all attempts/retries).                                                                                    | Ensure callers never wait longer than a fixed bound.                                     |
@@ -239,7 +236,7 @@ This table maps the config schema to what `AddHttpClientWithResilience(...)` con
 | `CircuitBreaker:`*                              | HTTP circuit breaker (failure ratio, throughput, sampling/break duration).                                                         | Fail fast when a dependency is unhealthy and give it time to recover.                    |
 | `RateLimiter:Enabled` + `RateLimiter:`*         | Polly rate limiter (FixedWindow/SlidingWindow/TokenBucket) around inner/hedging handler.                                           | Enforce quotas and prevent self-throttling / downstream overload.                        |
 | `Fallback:Enabled` + `Fallback:*`               | Polly fallback; custom `IHttpFallbackHandler` runs first if provided, else synthetic response.                                     | Serve cached/default responses or degrade gracefully on total failure.                   |
-| `Hedging:*`                                     | Hedging delay + max hedged attempts.                                                                                               | Reduce tail latency by racing replicas.                                                  |
+| `Hedging:*`                                     | Hedging delay + max hedged attempts (when `PipelineOrder` contains `"Hedging"`).                                                   | Reduce tail latency by racing replicas.                                                  |
 | `Bulkhead:Enabled` + `Bulkhead:*`               | Polly concurrency limiter.                                                                                                         | Stop one hot dependency from consuming all outbound concurrency.                         |
 
 
@@ -261,7 +258,7 @@ services.AddHttpClient("MyClient", _ => { })
     .AddHttpClientWithResilience(builder.Configuration, requestTimeoutSeconds: null, fallbackHandler: null, configurePipeline: b => b.AddResilienceHandler("custom", rb => { /* ... */ }));
 ```
 
-**Custom inner pipeline** (full control via code; options like `PipelineOrder` / `PipelineStrategyOrder` are not applied):
+**Custom inner pipeline** (full control via code; `PipelineOrder` is not applied):
 
 ```csharp
 services.AddHttpClient("MyClient", _ => { })
@@ -282,7 +279,7 @@ For **per-tenant or per-client** connection/timeout when using a custom inner pi
 
 ## Telemetry
 
-Register `**AddHttpResilienceTelemetry()**` to enable metrics and diagnostics for resilience pipelines. The package uses the same telemetry abstractions as Microsoft.Extensions.Http.Resilience (e.g. meters and enrichers). See [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) for emitted metrics and tags.
+Register `AddHttpResilienceTelemetry()` to enable metrics enrichment (`error.type`, `request.name`, `request.dependency.name`) on Polly metrics. Register `AddHttpResilienceHealthChecks()` to expose aggregate circuit breaker state (Healthy/Degraded) via ASP.NET health checks. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for dashboards and alerts.
 
 ## Operations and docs
 

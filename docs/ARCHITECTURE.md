@@ -1,6 +1,6 @@
 # Architecture and Pipeline Overview
 
-This document gives a one-page view of how HttpResilience.NET fits together: handler stack, pipeline order, and per-authority selection.
+One-page view of how HttpResilience.NET fits together: handler stack, pipeline order, and per-authority selection.
 
 ---
 
@@ -15,15 +15,15 @@ This document gives a one-page view of how HttpResilience.NET fits together: han
         ▼
   ┌─────────────────────────────────────────────────────────────────┐
   │  Resilience pipeline (when Enabled = true)                      │
-  │  Order depends on PipelineStrategyOrder or PipelineOrder +       │
-  │  PipelineType. Outermost (first to execute) at top.               │
+  │  Order determined by PipelineOrder list.                        │
+  │  Outermost (first to execute) at top.                           │
   ├─────────────────────────────────────────────────────────────────┤
-  │  Optional: Fallback   (if Fallback.Enabled)                      │
-  │  Optional: Bulkhead  (if Bulkhead.Enabled)                       │
-  │  Optional: RateLimiter (if RateLimiter.Enabled / in order)       │
-  │  Standard **or** Hedging (timeout, retry, circuit breaker, …)    │
+  │  Optional: Fallback    (if Fallback.Enabled and in list)        │
+  │  Optional: Bulkhead    (if Bulkhead.Enabled and in list)        │
+  │  Optional: RateLimiter (if RateLimiter.Enabled and in list)     │
+  │  Standard OR Hedging   (exactly one, required in list)          │
   ├─────────────────────────────────────────────────────────────────┤
-  │  Primary: SocketsHttpHandler (connection pool, connect timeout)   │
+  │  Primary: SocketsHttpHandler (connection pool, connect timeout)  │
   └─────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -32,19 +32,17 @@ This document gives a one-page view of how HttpResilience.NET fits together: han
 
 ---
 
-## Pipeline order (simplified)
+## Pipeline order
 
-When **PipelineStrategyOrder** is set (e.g. `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`), handlers are added so the **first element is outermost**:
+**PipelineOrder** is a list of strategy names from outermost to innermost (e.g. `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`). Handlers are added in reverse order internally so the first element is outermost.
 
-| Position   | Strategy   | When added |
-|-----------|------------|------------|
-| Outermost | Fallback   | If Fallback.Enabled and in list |
-|           | Bulkhead   | If Bulkhead.Enabled and in list |
-|           | RateLimiter| If RateLimiter.Enabled and in list |
-|           | Standard or Hedging | Exactly one; from PipelineType or list |
-| Innermost | (primary)  | SocketsHttpHandler |
-
-When **PipelineStrategyOrder** is not set, **PipelineOrder** (FallbackThenConcurrency vs ConcurrencyThenFallback) and **PipelineType** (Standard vs Hedging) determine order; see [IMPLEMENTATION.md](IMPLEMENTATION.md).
+| Position   | Strategy        | When added                          |
+|------------|-----------------|-------------------------------------|
+| Outermost  | Fallback        | If `Fallback.Enabled` and in list   |
+|            | Bulkhead        | If `Bulkhead.Enabled` and in list   |
+|            | RateLimiter     | If `RateLimiter.Enabled` and in list|
+|            | Standard or Hedging | Exactly one; required in list   |
+| Innermost  | (primary)       | SocketsHttpHandler                  |
 
 ---
 
@@ -83,16 +81,16 @@ sequenceDiagram
 
 When **PipelineSelection:Mode** is **ByAuthority**:
 
-- The same named `HttpClient` can call **multiple hosts** (e.g. `https://api-a.example.com` and `https://api-b.example.com`).
-- A **separate pipeline instance** (and thus separate circuit breaker, rate limiter, etc.) is used per **authority** (scheme + host + port).
-- So one failing host does not open the circuit for another.
+- The same named `HttpClient` can call **multiple hosts**.
+- A **separate pipeline instance** (circuit breaker, rate limiter, etc.) is used per **authority** (scheme + host + port).
+- One failing host does not open the circuit for another.
 
 ```
   HttpClient("MultiHost")
         │
-        ├── request to https://api-a.example.com  →  Pipeline instance A (circuit A, …)
+        ├── request to https://api-a.example.com  →  Pipeline instance A
         │
-        └── request to https://api-b.example.com  →  Pipeline instance B (circuit B, …)
+        └── request to https://api-b.example.com  →  Pipeline instance B
 ```
 
 When **Mode** is **None** (default), a single pipeline instance is shared for all requests from that named client.
@@ -109,7 +107,7 @@ flowchart LR
     end
     subgraph Startup
         Bind[AddHttpResilienceOptions]
-        Validate[ValidateOnStart (only when Enabled = true)]
+        Validate[ValidateOnStart when Enabled = true]
         Register[AddHttpClient + AddHttpClientWithResilience]
     end
     subgraph Runtime
@@ -130,6 +128,6 @@ flowchart LR
 
 ## References
 
-- [IMPLEMENTATION.md](IMPLEMENTATION.md) – Option semantics and pipeline order in detail  
-- [OPERATIONS.md](OPERATIONS.md) – Telemetry and alerts  
-- [PRODUCTION-CHECKLIST.md](PRODUCTION-CHECKLIST.md) – Pre-go-live checklist
+- [IMPLEMENTATION.md](IMPLEMENTATION.md) — Option semantics and configuration details
+- [OPERATIONS.md](OPERATIONS.md) — Telemetry, health checks, and alerts
+- [PRODUCTION-CHECKLIST.md](PRODUCTION-CHECKLIST.md) — Pre-go-live checklist

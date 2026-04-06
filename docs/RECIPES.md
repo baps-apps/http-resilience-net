@@ -1,24 +1,21 @@
-## Configuration Recipes
+# Configuration Recipes
 
-This document provides **opinionated configuration examples** for common scenarios.
-
-For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, see `OPERATIONS.md`.
+Opinionated configuration examples for common scenarios. For full option semantics see [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ---
 
-### Baseline internal REST API (standard pipeline)
+## Baseline internal REST API
 
-**Goal**: Reasonable defaults for typical internal HTTP calls between services.
+Standard pipeline with sensible defaults for typical service-to-service calls.
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard",
+    "PipelineOrder": ["Standard"],
     "Connection": {
       "Enabled": true,
       "MaxConnectionsPerServer": 20,
-      "PooledConnectionIdleTimeoutSeconds": 120,
       "PooledConnectionLifetimeSeconds": 600,
       "ConnectTimeoutSeconds": 10
     },
@@ -43,23 +40,20 @@ For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, se
 }
 ```
 
-- **When to use**: Most synchronous REST calls in line-of-business apps.
-
 ---
 
-### Latency-critical calls with hedging
+## Latency-critical calls with hedging
 
-**Goal**: Minimize tail latency for replicated backends (e.g. behind a load balancer).
+Minimize tail latency for replicated backends behind a load balancer.
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Hedging",
+    "PipelineOrder": ["RateLimiter", "Hedging"],
     "Connection": {
       "Enabled": true,
       "MaxConnectionsPerServer": 100,
-      "PooledConnectionIdleTimeoutSeconds": 60,
       "PooledConnectionLifetimeSeconds": 300,
       "ConnectTimeoutSeconds": 5
     },
@@ -79,9 +73,6 @@ For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, se
     },
     "RateLimiter": {
       "Enabled": true,
-      "PermitLimit": 500,
-      "WindowSeconds": 1,
-      "QueueLimit": 50,
       "Algorithm": "TokenBucket",
       "TokenBucketCapacity": 500,
       "TokensPerPeriod": 500,
@@ -91,19 +82,17 @@ For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, se
 }
 ```
 
-- **When to use**: Read-heavy, latency-sensitive endpoints where a small extra load is acceptable to reduce tails.
-
 ---
 
-### Protecting against downstream overload (bulkhead + rate limit)
+## Protecting against downstream overload
 
-**Goal**: Ensure a misbehaving dependency cannot consume all outbound capacity.
+Bulkhead + rate limiter to prevent one dependency from consuming all outbound capacity.
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard",
+    "PipelineOrder": ["Bulkhead", "RateLimiter", "Standard"],
     "Timeout": {
       "TotalRequestTimeoutSeconds": 60,
       "AttemptTimeoutSeconds": 20
@@ -121,29 +110,26 @@ For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, se
     },
     "RateLimiter": {
       "Enabled": true,
+      "Algorithm": "FixedWindow",
       "PermitLimit": 200,
       "WindowSeconds": 1,
-      "QueueLimit": 50,
-      "Algorithm": "FixedWindow"
-    },
-    "PipelineOrder": "ConcurrencyThenFallback"
+      "QueueLimit": 50
+    }
   }
 }
 ```
 
-- **When to use**: Hot dependencies that risk saturating outbound connections/threads.
-
 ---
 
-### Graceful degradation with fallback
+## Graceful degradation with fallback
 
-**Goal**: Return a synthetic or cached response when a downstream is unavailable.
+Return a synthetic response when a non-critical dependency is unavailable.
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard",
+    "PipelineOrder": ["Fallback", "Standard"],
     "Timeout": {
       "TotalRequestTimeoutSeconds": 10,
       "AttemptTimeoutSeconds": 5
@@ -164,53 +150,50 @@ For full option semantics, see `IMPLEMENTATION.md`. For operational guidance, se
 }
 ```
 
-- **When to use**: Non-critical dependencies (e.g. recommendations, analytics) where a friendly failure is better than an exception.
-
-For more advanced scenarios, implement `IHttpFallbackHandler` and pass it into `AddHttpClientWithResilience`.
+For advanced scenarios, implement `IHttpFallbackHandler` and pass it to `AddHttpClientWithResilience`.
 
 ---
 
-### Multi-tenant / multi-environment configuration
+## Multi-tenant / multi-environment
 
-**Goal**: Use multiple **option sets** in the same process (e.g. per-tenant or per-region).
+Use multiple option sets in the same process (per-tenant or per-region).
 
-Example `appsettings.json`:
+**appsettings.json:**
 
 ```json
 {
   "HttpResilienceOptions": {
     "Enabled": true,
-    "PipelineType": "Standard"
+    "PipelineOrder": ["Standard"]
   },
   "HttpResilienceOptions:TenantA": {
     "Enabled": true,
-    "PipelineType": "Standard",
+    "PipelineOrder": ["Standard"],
     "Timeout": { "TotalRequestTimeoutSeconds": 20, "AttemptTimeoutSeconds": 10 }
   },
   "HttpResilienceOptions:TenantB": {
     "Enabled": true,
-    "PipelineType": "Hedging",
-    "Timeout": { "TotalRequestTimeoutSeconds": 5, "AttemptTimeoutSeconds": 2 }
+    "PipelineOrder": ["Hedging"],
+    "Timeout": { "TotalRequestTimeoutSeconds": 5, "AttemptTimeoutSeconds": 2 },
+    "Hedging": { "DelaySeconds": 0, "MaxHedgedAttempts": 1 }
   }
 }
 ```
 
-Registration:
+**Registration:**
 
 ```csharp
-// Bind the default section once for global options
+// Base options (once)
 services.AddHttpResilienceOptions(configuration);
 
-// Tenant A client uses a nested section
+// Per-tenant clients
 var tenantASection = configuration.GetSection("HttpResilienceOptions:TenantA");
 services.AddHttpClient("TenantA")
     .AddHttpClientWithResilience(tenantASection);
 
-// Tenant B client uses a different nested section
 var tenantBSection = configuration.GetSection("HttpResilienceOptions:TenantB");
 services.AddHttpClient("TenantB")
     .AddHttpClientWithResilience(tenantBSection);
 ```
 
-This pattern lets platform teams define a **base** `HttpResilienceOptions` and override only what is needed per tenant or environment. When using the **custom inner pipeline** overload with per-tenant config, use `AddHttpClientWithResilience(tenantSection, requestTimeoutSeconds: null, fallbackHandler: null, configureInnerPipeline: inner => { ... })` so the primary handler (connection, timeouts) is built from that section; see `IMPLEMENTATION.md` (Inner pipeline order).
-
+For per-tenant custom inner pipelines, use `AddHttpClientWithResilience(tenantSection, requestTimeoutSeconds: null, fallbackHandler: null, configureInnerPipeline: inner => { ... })`.
