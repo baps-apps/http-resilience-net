@@ -17,12 +17,14 @@ internal static class HttpStandardHedgingHandlerConfig
     /// <param name="requestTimeoutSeconds">Effective total request timeout in seconds.</param>
     /// <param name="logger">Optional logger for structured resilience event logging.</param>
     /// <param name="clientName">Named HTTP client identifier for log correlation.</param>
+    /// <param name="tracker">Optional circuit breaker state tracker for health check integration.</param>
     /// <returns>An action that configures HttpStandardHedgingResilienceOptions when applied to an options instance.</returns>
     public static Action<HttpStandardHedgingResilienceOptions> Create(
         HttpResilienceOptions options,
         int requestTimeoutSeconds,
         ILogger? logger = null,
-        string? clientName = null)
+        string? clientName = null,
+        CircuitBreakerStateTracker? tracker = null)
     {
         var hedging = options.Hedging;
         var timeout = options.Timeout;
@@ -41,25 +43,28 @@ internal static class HttpStandardHedgingHandlerConfig
             resilienceOptions.Endpoint.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(cb.SamplingDurationSeconds);
             resilienceOptions.Endpoint.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(cb.BreakDurationSeconds);
 
-            if (logger is not null)
+            var name = clientName ?? "unknown";
+            resilienceOptions.Endpoint.CircuitBreaker.OnOpened = args =>
             {
-                var name = clientName ?? "unknown";
-                resilienceOptions.Endpoint.CircuitBreaker.OnOpened = args =>
-                {
+                if (logger is not null)
                     HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
-                    return default;
-                };
-                resilienceOptions.Endpoint.CircuitBreaker.OnHalfOpened = _ =>
-                {
+                tracker?.ReportOpened(name);
+                return default;
+            };
+            resilienceOptions.Endpoint.CircuitBreaker.OnHalfOpened = _ =>
+            {
+                if (logger is not null)
                     HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
-                    return default;
-                };
-                resilienceOptions.Endpoint.CircuitBreaker.OnClosed = _ =>
-                {
+                tracker?.ReportHalfOpen(name);
+                return default;
+            };
+            resilienceOptions.Endpoint.CircuitBreaker.OnClosed = _ =>
+            {
+                if (logger is not null)
                     HttpResilienceLogging.CircuitBreakerClosed(logger, name);
-                    return default;
-                };
-            }
+                tracker?.ReportClosed(name);
+                return default;
+            };
         };
     }
 }

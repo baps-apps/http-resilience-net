@@ -1,5 +1,4 @@
 using System.Threading.RateLimiting;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using Polly;
@@ -18,29 +17,26 @@ internal static class HttpStandardResilienceHandlerConfig
     /// </summary>
     /// <param name="options">HTTP resilience options (retry, circuit breaker, timeout, rate limit).</param>
     /// <param name="requestTimeoutSeconds">Effective total request timeout in seconds (use options.TotalRequestTimeoutSeconds or override per client).</param>
-    /// <param name="services">Service collection for registering disposable resources (e.g. rate limiters).</param>
-    /// <param name="rateLimiterHandledExternally">When true, rate limiting is already added as an outer handler (e.g. via PipelineOrder); do not configure the built-in rate limiter.</param>
+    /// <param name="rateLimiter">
+    /// Pre-created rate limiter singleton to wire into the standard pipeline, or <see langword="null"/> when rate limiting
+    /// is disabled or handled by a separate outer handler. The caller is responsible for registering this instance
+    /// in the DI container via a factory-based <c>AddSingleton</c> overload so the container owns the lifetime and
+    /// disposes the limiter when the <see cref="IServiceProvider"/> is disposed.
+    /// </param>
     /// <param name="logger">Optional logger for structured resilience event logging.</param>
     /// <param name="clientName">Named HTTP client identifier for log correlation.</param>
+    /// <param name="tracker">Optional circuit breaker state tracker for health check integration.</param>
     /// <returns>An action that configures HttpStandardResilienceOptions when applied to an options instance.</returns>
     public static Action<HttpStandardResilienceOptions> Create(
         HttpResilienceOptions options,
         int requestTimeoutSeconds,
-        IServiceCollection services,
-        bool rateLimiterHandledExternally = false,
+        RateLimiter? rateLimiter = null,
         ILogger? logger = null,
-        string? clientName = null)
+        string? clientName = null,
+        CircuitBreakerStateTracker? tracker = null)
     {
         var retry = options.Retry;
         var cb = options.CircuitBreaker;
-        var rateLimit = options.RateLimiter;
-
-        RateLimiter? limiter = null;
-        if (rateLimit.Enabled && !rateLimiterHandledExternally)
-        {
-            limiter = RateLimiterFactory.CreateRateLimiter(rateLimit);
-            services.AddSingleton(limiter);
-        }
 
         return resilienceOptions =>
         {
@@ -56,15 +52,16 @@ internal static class HttpStandardResilienceHandlerConfig
             resilienceOptions.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(cb.SamplingDurationSeconds);
             resilienceOptions.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(cb.BreakDurationSeconds);
 
-            if (limiter is not null)
+            if (rateLimiter is not null)
             {
                 resilienceOptions.RateLimiter.RateLimiter = args =>
-                    limiter.AcquireAsync(1, args.Context.CancellationToken);
+                    rateLimiter.AcquireAsync(1, args.Context.CancellationToken);
             }
+
+            var name = clientName ?? "unknown";
 
             if (logger is not null)
             {
-                var name = clientName ?? "unknown";
                 resilienceOptions.Retry.OnRetry = args =>
                 {
                     HttpResilienceLogging.RetryAttempt(logger, args.AttemptNumber, name,
@@ -72,22 +69,29 @@ internal static class HttpStandardResilienceHandlerConfig
                         args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
                     return default;
                 };
-                resilienceOptions.CircuitBreaker.OnOpened = args =>
-                {
-                    HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
-                    return default;
-                };
-                resilienceOptions.CircuitBreaker.OnHalfOpened = _ =>
-                {
-                    HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
-                    return default;
-                };
-                resilienceOptions.CircuitBreaker.OnClosed = _ =>
-                {
-                    HttpResilienceLogging.CircuitBreakerClosed(logger, name);
-                    return default;
-                };
             }
+
+            resilienceOptions.CircuitBreaker.OnOpened = args =>
+            {
+                if (logger is not null)
+                    HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
+                tracker?.ReportOpened(name);
+                return default;
+            };
+            resilienceOptions.CircuitBreaker.OnHalfOpened = _ =>
+            {
+                if (logger is not null)
+                    HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
+                tracker?.ReportHalfOpen(name);
+                return default;
+            };
+            resilienceOptions.CircuitBreaker.OnClosed = _ =>
+            {
+                if (logger is not null)
+                    HttpResilienceLogging.CircuitBreakerClosed(logger, name);
+                tracker?.ReportClosed(name);
+                return default;
+            };
         };
     }
 

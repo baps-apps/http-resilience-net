@@ -1,4 +1,5 @@
 using System.Net;
+using System.Threading.RateLimiting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
@@ -429,6 +430,14 @@ public static class ServiceCollectionExtensions
         bool rateLimiterInOrder = order.Exists(s => string.Equals(s, PipelineStrategyNames.RateLimiter, StringComparison.OrdinalIgnoreCase));
         string clientName = builder.Name;
 
+        // When rate limiting is enabled and handled inline by the Standard pipeline (not as a standalone outer handler),
+        // register it as a factory-based singleton so the container owns the lifetime and disposes it on shutdown.
+        if (options.RateLimiter.Enabled && !rateLimiterInOrder)
+        {
+            var rateLimiterOptions = options.RateLimiter;
+            builder.Services.AddSingleton<RateLimiter>(_ => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
+        }
+
         for (int i = order.Count - 1; i >= 0; i--)
         {
             var name = order[i];
@@ -438,7 +447,12 @@ public static class ServiceCollectionExtensions
                 var resilienceBuilder = builder.AddStandardResilienceHandler().Configure((resilienceOptions, serviceProvider) =>
                 {
                     var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
-                    HttpStandardResilienceHandlerConfig.Create(options, timeout, builder.Services, rateLimiterHandledExternally: rateLimiterInOrder, logger: logger, clientName: clientName)(resilienceOptions);
+                    var tracker = serviceProvider.GetService<CircuitBreakerStateTracker>();
+                    // Resolve the rate limiter singleton from DI (registered above as factory-based so the container disposes it).
+                    var rateLimiter = (!rateLimiterInOrder && options.RateLimiter.Enabled)
+                        ? serviceProvider.GetService<RateLimiter>()
+                        : null;
+                    HttpStandardResilienceHandlerConfig.Create(options, timeout, rateLimiter: rateLimiter, logger: logger, clientName: clientName, tracker: tracker)(resilienceOptions);
                 });
                 if (IsPipelineSelectionByAuthority(options))
                     resilienceBuilder.SelectPipelineByAuthority();
@@ -449,7 +463,8 @@ public static class ServiceCollectionExtensions
                 var hedgingBuilder = builder.AddStandardHedgingHandler().Configure((resilienceOptions, serviceProvider) =>
                 {
                     var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
-                    HttpStandardHedgingHandlerConfig.Create(options, timeout, logger: logger, clientName: clientName)(resilienceOptions);
+                    var tracker = serviceProvider.GetService<CircuitBreakerStateTracker>();
+                    HttpStandardHedgingHandlerConfig.Create(options, timeout, logger: logger, clientName: clientName, tracker: tracker)(resilienceOptions);
                 });
                 if (IsPipelineSelectionByAuthority(options))
                     hedgingBuilder.SelectPipelineByAuthority();
@@ -476,11 +491,11 @@ public static class ServiceCollectionExtensions
 
     private static void AddRateLimitHandler(IHttpClientBuilder builder, RateLimiterOptions rateLimiterOptions)
     {
-        var limiter = RateLimiterFactory.CreateRateLimiter(rateLimiterOptions);
-        builder.Services.AddSingleton(limiter);
+        builder.Services.AddSingleton<RateLimiter>(_ => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
 
-        builder.AddResilienceHandler("rateLimit", resilienceBuilder =>
+        builder.AddResilienceHandler("rateLimit", (resilienceBuilder, context) =>
         {
+            var limiter = context.ServiceProvider.GetRequiredService<RateLimiter>();
             resilienceBuilder.AddRateLimiter(new RateLimiterStrategyOptions
             {
                 RateLimiter = args => limiter.AcquireAsync(1, args.Context.CancellationToken)

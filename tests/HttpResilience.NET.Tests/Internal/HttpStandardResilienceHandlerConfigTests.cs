@@ -1,4 +1,3 @@
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Polly;
 using HttpResilience.NET.Internal;
@@ -35,7 +34,7 @@ public class HttpStandardResilienceHandlerConfigTests
             }
         };
 
-        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 25, services: new ServiceCollection());
+        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 25);
         var target = new HttpStandardResilienceOptions();
 
         config(target);
@@ -54,7 +53,7 @@ public class HttpStandardResilienceHandlerConfigTests
     }
 
     [Fact]
-    public void Create_WhenRateLimiterHandledExternally_DoesNotConfigureRateLimiter()
+    public void Create_WhenNoRateLimiterProvided_DoesNotConfigureRateLimiter()
     {
         var options = new HttpResilienceOptions
         {
@@ -62,7 +61,8 @@ public class HttpStandardResilienceHandlerConfigTests
             RateLimiter = { Enabled = true, PermitLimit = 100, WindowSeconds = 1 }
         };
 
-        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 30, services: new ServiceCollection(), rateLimiterHandledExternally: true);
+        // Pass no rateLimiter (null) — simulates rate limiter handled externally or disabled inline.
+        var config = HttpStandardResilienceHandlerConfig.Create(options, requestTimeoutSeconds: 30, rateLimiter: null);
         var target = new HttpStandardResilienceOptions();
 
         config(target);
