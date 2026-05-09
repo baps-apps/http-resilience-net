@@ -50,7 +50,7 @@ public class HttpClientBehaviorTests
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            await Task.Delay(_delay, cancellationToken);
+            await Task.Delay(_delay, cancellationToken).ConfigureAwait(false);
             return new HttpResponseMessage(HttpStatusCode.OK) { RequestMessage = request };
         }
     }
@@ -265,7 +265,7 @@ public class HttpClientBehaviorTests
         HttpClient client = factory.CreateClient("TimeoutClient");
 
         await Assert.ThrowsAsync<Polly.Timeout.TimeoutRejectedException>(async () =>
-            await client.GetAsync("https://example.com/"));
+            await client.GetAsync("https://example.com/").ConfigureAwait(false));
     }
 
     [Fact]
@@ -463,7 +463,7 @@ internal sealed class AddHeaderHandler : DelegatingHandler
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         request.Headers.TryAddWithoutValidation(_name, _value);
-        return await base.SendAsync(request, cancellationToken);
+        return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
     }
 }
 

@@ -1,3 +1,4 @@
+using System.Threading.RateLimiting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -24,6 +25,9 @@ services.AddLogging(builder =>
 services.AddHttpResilienceOptions(configuration);
 
 // Enable Polly telemetry so resilience metrics (retries, circuit breaker, etc.) can be collected.
+// The enricher adds Microsoft-style HTTP tags: error.type, request.name, request.dependency.name.
+// Hot-path values (HttpStatusCode.* names, scheme://host[:port] dependency names, pipeline/strategy
+// composite request names) are cached so steady-state event enrichment is allocation-light.
 services.AddHttpResilienceTelemetry();
 
 // ---------------------------------------------------------------------------
@@ -129,7 +133,9 @@ async Task RunScenarioAsync(string name, string clientName, string path = "/get"
         using var response = await client.GetAsync(path);
         logger.LogInformation("  Status: {StatusCode}", (int)response.StatusCode);
         if (response.Content.Headers.ContentLength is > 0 and var len)
+        {
             logger.LogInformation("  Content-Length: {Length}", len);
+        }
     }
     catch (Exception ex)
     {
@@ -152,6 +158,23 @@ await RunScenarioAsync("6. Bulkhead + rate limiter", "BulkheadAndRateLimit");
 await RunScenarioAsync("7a. Multi-tenant: TenantA (section-based)", "TenantA");
 await RunScenarioAsync("7b. Multi-tenant: TenantB (hedging section)", "TenantB");
 
+// ---------------------------------------------------------------------------
+// Scenario 8: Inspect the per-client keyed RateLimiter
+// Each named HttpClient with rate limiting enabled gets its own RateLimiter
+// registered as a keyed singleton (key = HttpClient name). Resolve directly
+// from DI via GetRequiredKeyedService<RateLimiter>(clientName) for snapshotting
+// or live inspection. The container owns disposal.
+// ---------------------------------------------------------------------------
+logger.LogInformation("--- Scenario: 8. Per-client keyed RateLimiter inspection ---");
+var bulkheadLimiter = provider.GetRequiredKeyedService<RateLimiter>("BulkheadAndRateLimit");
+var stats = bulkheadLimiter.GetStatistics();
+if (stats is not null)
+{
+    logger.LogInformation("  RateLimiter[BulkheadAndRateLimit] available permits: {Available}, queued: {Queued}",
+        stats.CurrentAvailablePermits, stats.CurrentQueuedCount);
+}
+logger.LogInformation("");
+
 logger.LogInformation("Done.");
 
 // ---------------------------------------------------------------------------
@@ -164,9 +187,13 @@ file sealed class SampleCustomFallbackHandler : IHttpFallbackHandler
     public ValueTask<HttpResponseMessage?> TryHandleAsync(HttpFallbackContext context, CancellationToken cancellationToken)
     {
         if (context.HasResult && context.Result is { } response)
+        {
             Console.WriteLine("  [CustomFallback] Observed failed response: " + (int)response.StatusCode);
+        }
         else if (context.Exception is { } ex)
+        {
             Console.WriteLine("  [CustomFallback] Observed exception: " + ex.Message);
+        }
 
         // Return null to use the synthetic response from Fallback options (StatusCode, ResponseBody).
         // Alternatively: return ValueTask.FromResult<HttpResponseMessage?>(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("cached") });

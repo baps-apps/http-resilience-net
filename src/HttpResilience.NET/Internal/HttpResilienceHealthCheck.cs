@@ -9,6 +9,9 @@ namespace HttpResilience.NET.Internal;
 /// </summary>
 internal sealed class HttpResilienceHealthCheck : IHealthCheck
 {
+    // Indexed by (int)CircuitState to avoid boxing/allocation from Enum.ToString.
+    private static readonly string[] _stateNames = { "Closed", "Open", "HalfOpen" };
+
     private readonly CircuitBreakerStateTracker _tracker;
 
     /// <summary>Initializes a new instance with the given <paramref name="tracker"/>.</summary>
@@ -17,21 +20,31 @@ internal sealed class HttpResilienceHealthCheck : IHealthCheck
     /// <inheritdoc/>
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
     {
-        var states = _tracker.GetAllStates();
-        var data = new Dictionary<string, object>();
-        var unhealthy = new List<string>();
+        Dictionary<string, object>? data = null;
+        List<string>? unhealthy = null;
 
-        foreach (var (clientName, state) in states)
+        foreach (var (clientName, state) in _tracker.Enumerate())
         {
-            data[clientName] = state.ToString();
+            string stateName = StateName(state);
+            (data ??= new Dictionary<string, object>())[clientName] = stateName;
             if (state != CircuitState.Closed)
-                unhealthy.Add($"{clientName}={state}");
+            {
+                (unhealthy ??= new List<string>()).Add($"{clientName}={stateName}");
+            }
         }
 
-        if (unhealthy.Count == 0)
+        if (unhealthy is null)
+        {
             return Task.FromResult(HealthCheckResult.Healthy("All circuit breakers are closed.", data));
+        }
 
         var description = $"Circuit breakers not closed: {string.Join(", ", unhealthy)}";
         return Task.FromResult(HealthCheckResult.Degraded(description, data: data));
+    }
+
+    private static string StateName(CircuitState state)
+    {
+        int idx = (int)state;
+        return (uint)idx < (uint)_stateNames.Length ? _stateNames[idx] : state.ToString();
     }
 }

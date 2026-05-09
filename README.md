@@ -13,6 +13,7 @@ Consumer solutions reference **HttpResilience.NET NuGet package** (from a feed o
 - [Configuration](#configuration)
 - [Options reference](#options-reference)
 - [Telemetry](#telemetry)
+- [Rate limiter scope across multiple HttpClients](#rate-limiter-scope-across-multiple-httpclients)
 - [Operations and docs](#operations-and-docs)
 - [Versioning and compatibility](#versioning-and-compatibility)
 
@@ -181,7 +182,8 @@ Use the **HttpResilienceOptions** section. Options are grouped by feature: **Con
       "MaxConnectionsPerServer": 10,
       "PooledConnectionIdleTimeoutSeconds": 120,
       "PooledConnectionLifetimeSeconds": 600,
-      "ConnectTimeoutSeconds": 21
+      "ConnectTimeoutSeconds": 21,
+      "EnableMultipleHttp2Connections": true
     },
     "Timeout": {
       "TotalRequestTimeoutSeconds": 30,
@@ -229,7 +231,7 @@ This table maps the config schema to what `AddHttpClientWithResilience(...)` con
 | `Enabled`                                       | If `false`, no resilience pipeline. If `true`, applies primary handler + resilience handlers.                                      | Feature-flag resilience per environment/service.                                         |
 | `PipelineOrder` (array)                         | Strategy order outermost→innermost: `Fallback`, `Bulkhead`, `RateLimiter`, and exactly one of `Standard`/`Hedging`.               | `["Fallback", "Bulkhead", "RateLimiter", "Standard"]`. Required when `Enabled = true`.  |
 | `PipelineSelection:Mode` (`None`/`ByAuthority`) | When `ByAuthority`, separate pipeline instances per authority (scheme+host+port).                                                  | One `HttpClient` calling many hosts; isolate circuit breakers per host.                  |
-| `Connection:`*                                  | Primary `SocketsHttpHandler` (pool, timeouts, `ConnectTimeout`).                                                                   | Connection pool tuning and faster failure on connect hangs.                              |
+| `Connection:`*                                  | Primary `SocketsHttpHandler` (pool, timeouts, `ConnectTimeout`, HTTP/2 multi-connection).                                          | Connection pool tuning, faster failure on connect hangs, and HTTP/2 throughput scaling.  |
 | `Timeout:TotalRequestTimeoutSeconds`            | Total operation timeout (all attempts/retries).                                                                                    | Ensure callers never wait longer than a fixed bound.                                     |
 | `Timeout:AttemptTimeoutSeconds`                 | Per-attempt timeout.                                                                                                               | Prevent a single attempt from consuming the entire total timeout.                        |
 | `Retry:`*                                       | HTTP retry strategy (attempt count, delay/backoff, jitter, `Retry-After` header).                                                  | Transient faults, throttling, flaky dependencies.                                        |
@@ -280,6 +282,92 @@ For **per-tenant or per-client** connection/timeout when using a custom inner pi
 ## Telemetry
 
 Register `AddHttpResilienceTelemetry()` to enable metrics enrichment (`error.type`, `request.name`, `request.dependency.name`) on Polly metrics. Register `AddHttpResilienceHealthChecks()` to expose aggregate circuit breaker state (Healthy/Degraded) via ASP.NET health checks. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for dashboards and alerts.
+
+## Rate limiter scope across multiple HttpClients
+
+When your application talks to several independent downstream services (e.g. **SSO**, **MIS**, **ASM**, **MDS**), you have to decide whether to share one `RateLimiter` across all of them or give each `HttpClient` its own.
+
+> **Recommendation: one limiter per `HttpClient`.** This is also the library default — each named client registered with rate limiting enabled gets its own keyed-singleton `RateLimiter` (key = the `HttpClient` name). The DI container owns the lifetime and disposes them on shutdown.
+
+### Why per-client (separate) is the right default
+
+| Concern | Shared limiter | Separate limiter (per `HttpClient`) |
+| --- | --- | --- |
+| **Per-service capacity** | One global cap can't reflect SSO=200 rps, MIS=50 rps, MDS=80 rps simultaneously — you either over-throttle the fast ones or over-pressure the slow ones. | Each downstream gets a `PermitLimit` that matches its actual throughput contract. |
+| **Failure isolation** | A slow MIS fills the shared queue → unrelated SSO/ASM calls block behind it (cascading degradation). | A burst or slowdown on one downstream does not affect callers of the others. |
+| **Independent tuning** | Changing one knob affects all four services. | Tune SSO without touching MDS. |
+| **Symmetry with the circuit breaker** | Circuit breakers are already per-client; mixing scopes makes ops confusing. | Rate limiter and circuit breaker share the same scope and metrics dimension. |
+| **Telemetry granularity** | A shared `available_permits` metric can't tell you which downstream is hot. | Per-client metrics show exactly which dependency is saturated. |
+| **Backpressure semantics** | One client's burst can starve another client's permits. | Backpressure is contained to the client that caused it. |
+
+### When a single shared limiter actually makes sense
+
+Rare. Consider it only when:
+
+- All `HttpClient`s hit **the same physical backend** (e.g. all calls go through the same API gateway and the gateway enforces a single quota). Even then, prefer enforcing on the gateway.
+- You have a hard **process-wide outbound budget** (paid per request, fixed `$/sec` cap). A shared `TokenBucket` reflects that budget directly.
+- All downstreams are homogeneous and cheap, and one cap is sufficient.
+
+For typical enterprise scenarios with distinct backends (SSO/MIS/ASM/MDS), none of these apply.
+
+### Recommended configuration shape
+
+Bind each named client to its own configuration section:
+
+```jsonc
+{
+  "HttpResilienceOptions:SSO": {
+    "Enabled": true,
+    "PipelineOrder": ["RateLimiter", "Standard"],
+    "RateLimiter": { "Enabled": true, "PermitLimit": 200, "WindowSeconds": 1, "QueueLimit": 50, "Algorithm": "FixedWindow" }
+  },
+  "HttpResilienceOptions:MIS": {
+    "Enabled": true,
+    "PipelineOrder": ["RateLimiter", "Standard"],
+    "RateLimiter": { "Enabled": true, "PermitLimit": 50,  "WindowSeconds": 1, "QueueLimit": 20, "Algorithm": "FixedWindow" }
+  },
+  "HttpResilienceOptions:ASM": {
+    "Enabled": true,
+    "PipelineOrder": ["RateLimiter", "Standard"],
+    "RateLimiter": { "Enabled": true, "PermitLimit": 100, "WindowSeconds": 1, "QueueLimit": 30, "Algorithm": "FixedWindow" }
+  },
+  "HttpResilienceOptions:MDS": {
+    "Enabled": true,
+    "PipelineOrder": ["RateLimiter", "Standard"],
+    "RateLimiter": { "Enabled": true, "PermitLimit": 80,  "WindowSeconds": 1, "QueueLimit": 25, "Algorithm": "FixedWindow" }
+  }
+}
+```
+
+```csharp
+services.AddHttpResilienceOptions(configuration);
+
+services.AddHttpClient("SSO").AddHttpClientWithResilience(configuration.GetSection("HttpResilienceOptions:SSO"));
+services.AddHttpClient("MIS").AddHttpClientWithResilience(configuration.GetSection("HttpResilienceOptions:MIS"));
+services.AddHttpClient("ASM").AddHttpClientWithResilience(configuration.GetSection("HttpResilienceOptions:ASM"));
+services.AddHttpClient("MDS").AddHttpClientWithResilience(configuration.GetSection("HttpResilienceOptions:MDS"));
+```
+
+Each client now has its own keyed `RateLimiter`. To inspect or operate on a limiter directly:
+
+```csharp
+var ssoLimiter = serviceProvider.GetRequiredKeyedService<RateLimiter>("SSO");
+var stats = ssoLimiter.GetStatistics();
+```
+
+### Rate limiter vs bulkhead — different questions
+
+These two strategies answer different questions and can be combined:
+
+- **Rate limiter** — *"how fast am I allowed to talk to this service?"* → scope **per downstream** (per `HttpClient`).
+- **Bulkhead** — *"how much of my own capacity am I willing to spend on outbound calls?"* → scope is typically **per client**, but a process-wide bulkhead at a higher layer is a reasonable additional cap if you need to protect your own thread pool / sockets across all outbound traffic.
+
+### Sizing rules of thumb
+
+- `PermitLimit` ≈ the throughput the downstream guarantees you, with 10–20 % headroom.
+- `WindowSeconds` = `1` for steady traffic; longer if the downstream documents per-minute quotas.
+- `QueueLimit` should be small. Long queues hide failures and amplify p99 latency. If the queue is persistently full, raise downstream capacity or shed load — do not grow the queue.
+- For bursty traffic prefer `TokenBucket` (smooths bursts) over `FixedWindow` (boundary spikes).
 
 ## Operations and docs
 

@@ -64,6 +64,7 @@ Configures the primary `SocketsHttpHandler` when `Connection.Enabled = true`.
 | `PooledConnectionIdleTimeoutSeconds` | 1–3600 | 120 | Close idle connections after this many seconds |
 | `PooledConnectionLifetimeSeconds` | 1–3600 | 600 | Recycle connections to respect DNS/LB changes |
 | `ConnectTimeoutSeconds` | 1–120 | 21 | Max time for TCP/TLS establishment |
+| `EnableMultipleHttp2Connections` | bool | `true` | Maps to `SocketsHttpHandler.EnableMultipleHttp2Connections`. Allows additional HTTP/2 connections to the same origin under high concurrency so traffic is not bottlenecked on a single TCP connection's stream limit. Set to `false` to opt out. |
 
 > `AllowAutoRedirect`, `Credentials`, and other security properties are **not** set by this package; .NET defaults apply.
 
@@ -73,7 +74,8 @@ Configures the primary `SocketsHttpHandler` when `Connection.Enabled = true`.
   "MaxConnectionsPerServer": 20,
   "ConnectTimeoutSeconds": 10,
   "PooledConnectionIdleTimeoutSeconds": 90,
-  "PooledConnectionLifetimeSeconds": 300
+  "PooledConnectionLifetimeSeconds": 300,
+  "EnableMultipleHttp2Connections": true
 }
 ```
 

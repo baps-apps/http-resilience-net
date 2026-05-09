@@ -29,8 +29,8 @@ public class RateLimiterDisposalTests
 
         var provider = services.BuildServiceProvider();
 
-        // Resolve the rate limiter singleton registered by the library.
-        var limiter = provider.GetRequiredService<RateLimiter>();
+        // Resolve the per-client keyed rate limiter registered by the library (key = HttpClient name).
+        var limiter = provider.GetRequiredKeyedService<RateLimiter>("DisposalTest");
         Assert.NotNull(limiter);
 
         // Verify the limiter is functional before disposal.
@@ -42,7 +42,7 @@ public class RateLimiterDisposalTests
 
         // After disposal, the limiter should throw ObjectDisposedException.
         await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
-            await limiter.AcquireAsync(1));
+            await limiter.AcquireAsync(1).ConfigureAwait(false));
     }
 
     [Fact]
@@ -67,12 +67,12 @@ public class RateLimiterDisposalTests
             .AddHttpClientWithResilience(configuration);
 
         var provider = services.BuildServiceProvider();
-        var limiter = provider.GetRequiredService<RateLimiter>();
+        var limiter = provider.GetRequiredKeyedService<RateLimiter>("DisposalTest2");
         Assert.NotNull(limiter);
 
         await provider.DisposeAsync();
 
         await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
-            await limiter.AcquireAsync(1));
+            await limiter.AcquireAsync(1).ConfigureAwait(false));
     }
 }

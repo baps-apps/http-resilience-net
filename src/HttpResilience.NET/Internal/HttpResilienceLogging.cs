@@ -13,8 +13,8 @@ internal static partial class HttpResilienceLogging
     public static partial void FallbackActivated(ILogger logger, string clientName, int? statusCode, string? exceptionType);
 
     [LoggerMessage(EventId = 2, Level = LogLevel.Warning,
-        Message = "HttpResilience retry attempt {AttemptNumber} for client '{ClientName}' after {RetryDelayMs}ms. Reason: {Reason}")]
-    public static partial void RetryAttempt(ILogger logger, int attemptNumber, string clientName, double retryDelayMs, string? reason);
+        Message = "HttpResilience retry attempt {AttemptNumber} for client '{ClientName}' after {RetryDelayMs}ms. Exception: {ExceptionMessage}, StatusCode: {StatusCode}")]
+    public static partial void RetryAttempt(ILogger logger, int attemptNumber, string clientName, double retryDelayMs, string? exceptionMessage, int? statusCode);
 
     [LoggerMessage(EventId = 3, Level = LogLevel.Warning,
         Message = "HttpResilience circuit breaker OPENED for client '{ClientName}'. Break duration: {BreakDurationSeconds}s")]

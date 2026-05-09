@@ -28,7 +28,8 @@ internal static class SocketsHttpHandlerFactory
             MaxConnectionsPerServer = conn.MaxConnectionsPerServer,
             ConnectTimeout = TimeSpan.FromSeconds(conn.ConnectTimeoutSeconds),
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(conn.PooledConnectionIdleTimeoutSeconds),
-            PooledConnectionLifetime = TimeSpan.FromSeconds(conn.PooledConnectionLifetimeSeconds)
+            PooledConnectionLifetime = TimeSpan.FromSeconds(conn.PooledConnectionLifetimeSeconds),
+            EnableMultipleHttp2Connections = conn.EnableMultipleHttp2Connections
         };
     }
 }

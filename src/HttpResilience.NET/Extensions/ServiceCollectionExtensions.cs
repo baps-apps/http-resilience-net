@@ -2,6 +2,7 @@ using System.Net;
 using System.Threading.RateLimiting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -54,14 +55,16 @@ public static class ServiceCollectionExtensions
             .Bind(section)
             .ValidateOnStart();
 
-        services.AddSingleton<IValidateOptions<HttpResilienceOptions>, HttpResilienceOptionsValidator>();
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IValidateOptions<HttpResilienceOptions>, HttpResilienceOptionsValidator>());
         return services;
     }
 
     private static bool IsValidPipelineOrder(List<string>? order)
     {
         if (order is null || order.Count == 0)
+        {
             return false;
+        }
 
         var allowed = PipelineStrategyNames.Allowed;
         int standardOrHedging = 0;
@@ -70,9 +73,14 @@ public static class ServiceCollectionExtensions
         foreach (var item in order)
         {
             if (string.IsNullOrWhiteSpace(item) || !allowed.Contains(item))
+            {
                 return false;
+            }
+
             if (!seen.Add(item))
+            {
                 return false;
+            }
 
             if (string.Equals(item, PipelineStrategyNames.Standard, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(item, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase))
@@ -93,7 +101,9 @@ public static class ServiceCollectionExtensions
         {
             // When the master switch is off, skip validation entirely so startup never fails.
             if (!options.Enabled)
+            {
                 return ValidateOptionsResult.Success;
+            }
 
             var failures = new List<string>();
 
@@ -105,7 +115,9 @@ public static class ServiceCollectionExtensions
                 foreach (var failure in daFailures)
                 {
                     if (ShouldIgnoreFailureForDisabledSection(failure, options))
+                    {
                         continue;
+                    }
 
                     failures.Add(failure);
                 }
@@ -113,29 +125,43 @@ public static class ServiceCollectionExtensions
 
             // Root-level and always-on validations
             if (options.Connection.Enabled && options.Connection.MaxConnectionsPerServer is < 1 or > 1000)
+            {
                 failures.Add("Connection.MaxConnectionsPerServer must be between 1 and 1000.");
+            }
 
             if (options.Timeout.AttemptTimeoutSeconds > options.Timeout.TotalRequestTimeoutSeconds)
+            {
                 failures.Add("Timeout.AttemptTimeoutSeconds must be less than or equal to Timeout.TotalRequestTimeoutSeconds.");
+            }
 
             if (!Enum.IsDefined(options.Retry.BackoffType))
+            {
                 failures.Add("Retry.BackoffType must be Constant, Linear, or Exponential.");
+            }
 
             if (!IsValidPipelineOrder(options.PipelineOrder))
+            {
                 failures.Add("PipelineOrder is required when Enabled is true and must contain only Fallback, Bulkhead, RateLimiter, Standard, Hedging with exactly one of Standard or Hedging. Example: [\"Standard\"] or [\"Fallback\", \"Bulkhead\", \"Standard\"].");
+            }
 
             if (!Enum.IsDefined(options.PipelineSelection.Mode))
+            {
                 failures.Add("PipelineSelection.Mode must be None or ByAuthority.");
+            }
 
             // Nested feature-specific validations – only when nested feature is enabled / active.
 
             if (options.Fallback.Enabled &&
                 options.Fallback.StatusCode is < 400 or > 599)
+            {
                 failures.Add("Fallback.StatusCode must be between 400 and 599 when Fallback.Enabled is true.");
+            }
 
             if (options.RateLimiter.Enabled &&
                 !Enum.IsDefined(options.RateLimiter.Algorithm))
+            {
                 failures.Add("RateLimiter.Algorithm must be FixedWindow, SlidingWindow, or TokenBucket.");
+            }
 
             // Hedging options should only be validated when the pipeline is actually hedging.
             bool isHedging = options.PipelineOrder?.Exists(s =>
@@ -144,10 +170,14 @@ public static class ServiceCollectionExtensions
             if (isHedging)
             {
                 if (options.Hedging.DelaySeconds is < 0 or > 60)
+                {
                     failures.Add("Hedging.DelaySeconds must be between 0 and 60.");
+                }
 
                 if (options.Hedging.MaxHedgedAttempts is < 0 or > 10)
+                {
                     failures.Add("Hedging.MaxHedgedAttempts must be between 0 and 10.");
+                }
             }
 
             return failures.Count > 0
@@ -162,29 +192,39 @@ public static class ServiceCollectionExtensions
             // Connection: only validate when the feature is enabled.
             if (!options.Connection.Enabled &&
                 failure.Contains("Connection", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
 
             // RateLimiter: only validate when the feature is enabled.
             if (!options.RateLimiter.Enabled &&
                 failure.Contains("RateLimiter", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
 
             // Fallback: only validate when the feature is enabled.
             if (!options.Fallback.Enabled &&
                 failure.Contains("Fallback", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
 
             // Bulkhead: only validate when the feature is enabled.
             if (!options.Bulkhead.Enabled &&
                 failure.Contains("Bulkhead", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
 
             // Hedging: only validate when the pipeline type is Hedging.
             bool isHedging = options.PipelineOrder?.Exists(s =>
                 string.Equals(s, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase)) ?? false;
             if (!isHedging &&
                 failure.Contains("Hedging", StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
+            }
 
             return false;
         }
@@ -273,7 +313,9 @@ public static class ServiceCollectionExtensions
         section.Bind(probe);
 
         if (!probe.Enabled)
+        {
             return builder;
+        }
 
         // Register named options bound to this section so DI is the single source of truth.
         string optionsName = builder.Name;
@@ -287,13 +329,15 @@ public static class ServiceCollectionExtensions
         {
             builder.ConfigurePrimaryHttpMessageHandler(serviceProvider =>
             {
-                var opts = serviceProvider.GetRequiredService<IOptionsSnapshot<HttpResilienceOptions>>().Get(optionsName);
+                var opts = serviceProvider.GetRequiredService<IOptionsMonitor<HttpResilienceOptions>>().Get(optionsName);
                 return SocketsHttpHandlerFactory.Create(opts);
             });
         }
 
         if (probe.PipelineOrder is { Count: > 0 })
+        {
             AddHandlersInOrder(builder, probe, timeout, probe.PipelineOrder, fallbackHandler);
+        }
 
         configurePipeline?.Invoke(builder);
         return builder;
@@ -330,16 +374,20 @@ public static class ServiceCollectionExtensions
         section.Bind(options);
 
         if (!options.Enabled)
+        {
             return builder;
+        }
 
         int timeout = requestTimeoutSeconds ?? options.Timeout.TotalRequestTimeoutSeconds;
 
         if (options.Connection.Enabled)
+        {
             builder.ConfigurePrimaryHttpMessageHandler(serviceProvider =>
             {
                 HttpResilienceOptions opts = serviceProvider.GetRequiredService<IOptions<HttpResilienceOptions>>().Value;
                 return SocketsHttpHandlerFactory.Create(opts);
             });
+        }
 
         AddCustomStandardHandler(builder, timeout, fallbackHandler, configureInnerPipeline, configurePipeline);
         return builder;
@@ -375,7 +423,9 @@ public static class ServiceCollectionExtensions
         section.Bind(probe);
 
         if (!probe.Enabled)
+        {
             return builder;
+        }
 
         string optionsName = builder.Name;
         builder.Services.AddOptions<HttpResilienceOptions>(optionsName)
@@ -388,7 +438,7 @@ public static class ServiceCollectionExtensions
         {
             builder.ConfigurePrimaryHttpMessageHandler(serviceProvider =>
             {
-                var opts = serviceProvider.GetRequiredService<IOptionsSnapshot<HttpResilienceOptions>>().Get(optionsName);
+                var opts = serviceProvider.GetRequiredService<IOptionsMonitor<HttpResilienceOptions>>().Get(optionsName);
                 return SocketsHttpHandlerFactory.Create(opts);
             });
         }
@@ -431,31 +481,39 @@ public static class ServiceCollectionExtensions
         string clientName = builder.Name;
 
         // When rate limiting is enabled and handled inline by the Standard pipeline (not as a standalone outer handler),
-        // register it as a factory-based singleton so the container owns the lifetime and disposes it on shutdown.
+        // register it as a per-client keyed singleton so each named HttpClient gets its own RateLimiter
+        // (avoids last-wins collisions across clients) and the container owns the lifetime / disposes it on shutdown.
         if (options.RateLimiter.Enabled && !rateLimiterInOrder)
         {
             var rateLimiterOptions = options.RateLimiter;
-            builder.Services.AddSingleton<RateLimiter>(_ => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
+            builder.Services.AddKeyedSingleton<RateLimiter>(clientName, (_, _) => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
         }
 
         for (int i = order.Count - 1; i >= 0; i--)
         {
             var name = order[i];
-            if (string.IsNullOrWhiteSpace(name)) continue;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
             if (string.Equals(name, PipelineStrategyNames.Standard, StringComparison.OrdinalIgnoreCase))
             {
                 var resilienceBuilder = builder.AddStandardResilienceHandler().Configure((resilienceOptions, serviceProvider) =>
                 {
                     var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
                     var tracker = serviceProvider.GetService<CircuitBreakerStateTracker>();
-                    // Resolve the rate limiter singleton from DI (registered above as factory-based so the container disposes it).
+                    // Resolve the per-client keyed rate limiter from DI (registered above so the container disposes it).
                     var rateLimiter = (!rateLimiterInOrder && options.RateLimiter.Enabled)
-                        ? serviceProvider.GetService<RateLimiter>()
+                        ? serviceProvider.GetKeyedService<RateLimiter>(clientName)
                         : null;
                     HttpStandardResilienceHandlerConfig.Create(options, timeout, rateLimiter: rateLimiter, logger: logger, clientName: clientName, tracker: tracker)(resilienceOptions);
                 });
                 if (IsPipelineSelectionByAuthority(options))
+                {
                     resilienceBuilder.SelectPipelineByAuthority();
+                }
+
                 continue;
             }
             if (string.Equals(name, PipelineStrategyNames.Hedging, StringComparison.OrdinalIgnoreCase))
@@ -467,12 +525,15 @@ public static class ServiceCollectionExtensions
                     HttpStandardHedgingHandlerConfig.Create(options, timeout, logger: logger, clientName: clientName, tracker: tracker)(resilienceOptions);
                 });
                 if (IsPipelineSelectionByAuthority(options))
+                {
                     hedgingBuilder.SelectPipelineByAuthority();
+                }
+
                 continue;
             }
             if (string.Equals(name, PipelineStrategyNames.RateLimiter, StringComparison.OrdinalIgnoreCase) && options.RateLimiter.Enabled)
             {
-                AddRateLimitHandler(builder, options.RateLimiter);
+                AddRateLimitHandler(builder, options.RateLimiter, clientName);
                 continue;
             }
             if (string.Equals(name, PipelineStrategyNames.Bulkhead, StringComparison.OrdinalIgnoreCase) && options.Bulkhead.Enabled)
@@ -482,20 +543,23 @@ public static class ServiceCollectionExtensions
                 continue;
             }
             if (string.Equals(name, PipelineStrategyNames.Fallback, StringComparison.OrdinalIgnoreCase) && options.Fallback.Enabled)
+            {
                 AddFallbackHandler(builder, options.Fallback, fallbackHandler);
+            }
         }
     }
 
     private static bool IsPipelineSelectionByAuthority(HttpResilienceOptions options) =>
         options.PipelineSelection?.Mode == PipelineSelectionMode.ByAuthority;
 
-    private static void AddRateLimitHandler(IHttpClientBuilder builder, RateLimiterOptions rateLimiterOptions)
+    private static void AddRateLimitHandler(IHttpClientBuilder builder, RateLimiterOptions rateLimiterOptions, string clientName)
     {
-        builder.Services.AddSingleton<RateLimiter>(_ => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
+        // Per-client keyed singleton so multiple HttpClients each get their own RateLimiter (no cross-client collisions).
+        builder.Services.AddKeyedSingleton<RateLimiter>(clientName, (_, _) => RateLimiterFactory.CreateRateLimiter(rateLimiterOptions));
 
         builder.AddResilienceHandler("rateLimit", (resilienceBuilder, context) =>
         {
-            var limiter = context.ServiceProvider.GetRequiredService<RateLimiter>();
+            var limiter = context.ServiceProvider.GetRequiredKeyedService<RateLimiter>(clientName);
             resilienceBuilder.AddRateLimiter(new RateLimiterStrategyOptions
             {
                 RateLimiter = args => limiter.AcquireAsync(1, args.Context.CancellationToken)
@@ -525,7 +589,7 @@ public static class ServiceCollectionExtensions
         });
     }
 
-    private static async ValueTask<Outcome<HttpResponseMessage>> ExecuteFallbackAsync(
+    private static ValueTask<Outcome<HttpResponseMessage>> ExecuteFallbackAsync(
         IHttpFallbackHandler? customHandler,
         FallbackActionArguments<HttpResponseMessage> args,
         int statusCode,
@@ -540,18 +604,47 @@ public static class ServiceCollectionExtensions
                 args.Outcome.Exception?.GetType().Name);
         }
 
-        if (customHandler is not null)
+        // Fast path: no custom handler — build synthetic response synchronously, no async state machine.
+        if (customHandler is null)
         {
-            var context = new HttpFallbackContext(args.Outcome);
-            var customResponse = await customHandler.TryHandleAsync(context, args.Context.CancellationToken).ConfigureAwait(false);
-            if (customResponse is not null)
-                return Outcome.FromResult(customResponse);
+            return new ValueTask<Outcome<HttpResponseMessage>>(Outcome.FromResult(BuildSyntheticResponse(args, statusCode, body)));
         }
+
+        return ExecuteFallbackSlowAsync(customHandler, args, statusCode, body);
+    }
+
+    private static async ValueTask<Outcome<HttpResponseMessage>> ExecuteFallbackSlowAsync(
+        IHttpFallbackHandler customHandler,
+        FallbackActionArguments<HttpResponseMessage> args,
+        int statusCode,
+        string? body)
+    {
+        var context = new HttpFallbackContext(args.Outcome);
+        var customResponse = await customHandler.TryHandleAsync(context, args.Context.CancellationToken).ConfigureAwait(false);
+        if (customResponse is not null)
+        {
+            return Outcome.FromResult(customResponse);
+        }
+
+        return Outcome.FromResult(BuildSyntheticResponse(args, statusCode, body));
+    }
+
+    private static HttpResponseMessage BuildSyntheticResponse(
+        FallbackActionArguments<HttpResponseMessage> args,
+        int statusCode,
+        string? body)
+    {
         var response = new HttpResponseMessage((HttpStatusCode)statusCode);
         if (!string.IsNullOrEmpty(body))
+        {
             response.Content = new StringContent(body);
+        }
+
         if (args.Outcome.Result?.RequestMessage is { } requestMessage)
+        {
             response.RequestMessage = requestMessage;
-        return Outcome.FromResult(response);
+        }
+
+        return response;
     }
 }

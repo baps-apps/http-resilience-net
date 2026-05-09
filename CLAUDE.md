@@ -5,6 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Prerequisites
 
 - .NET 10 SDK (pinned in `global.json` with `rollForward: latestFeature`)
+- `nuget.config` clears defaults and adds `baps-apps-packages` (GitHub Packages) for `CodeStyle.NET` and `OpenTelemetry.NET`. Restore from a fresh clone needs a GitHub PAT configured for that source — see `scripts/README.md`.
 
 ## Build & Test Commands
 
@@ -27,7 +28,12 @@ dotnet run --project samples/HttpResilience.NET.Sample/
 
 # Pack the NuGet package
 dotnet pack src/HttpResilience.NET/
+
+# Publish to GitHub Packages (requires GITHUB_PAT env var; see scripts/README.md)
+pwsh scripts/publish-package.ps1
 ```
+
+Solution file is `HttpResilience.NET.slnx` (XML solution format, not legacy `.sln`). `dotnet` CLI commands resolve it automatically from repo root.
 
 ## Code Conventions
 
@@ -84,8 +90,16 @@ The default section name is `"HttpResilienceOptions"` (from `HttpResilienceConfi
 
 ### Sample project
 
-The sample (`samples/HttpResilience.NET.Sample/`) is intentionally standalone — it uses `<ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>` and pins package versions directly in its `.csproj`, independent of the solution-wide `Directory.Packages.props`.
+The sample (`samples/HttpResilience.NET.Sample/`) consumes the published `HttpResilience.NET` NuGet package (not a `ProjectReference`), so it exercises the same surface external consumers see. The `HttpResilience.NET` `PackageVersion` in `Directory.Packages.props` controls which version it pulls.
 
 ### Package management
 
-All other projects use central package management via `Directory.Packages.props` at the repo root. When adding packages to `src/` or `tests/` projects, add the version to `Directory.Packages.props` and reference without a version in the `.csproj`.
+All projects use central package management via `Directory.Packages.props` at the repo root. When adding packages, add the version to `Directory.Packages.props` and reference without a version in the `.csproj`.
+
+### Build hardening (`Directory.Build.props`)
+
+Applies to all projects: `TreatWarningsAsErrors=true`, `Deterministic=true`, `GenerateDocumentationFile=true`, embedded PDBs with SourceLink (`Microsoft.SourceLink.GitHub`). New projects inherit these automatically.
+
+### Deeper docs
+
+`docs/` holds long-form references that supplement this file: `ARCHITECTURE.md`, `IMPLEMENTATION.md`, `RECIPES.md`, `OPERATIONS.md`, `RUNBOOK.md`, `TROUBLESHOOTING.md`, `SECURITY-GOVERNANCE.md`, `VERSIONING.md`, `PRODUCTION-CHECKLIST.md`, `COMPARISON.md`. Consult them for nuance beyond what's summarised here.

@@ -39,6 +39,22 @@ public sealed class CircuitBreakerStateTracker
     /// <summary>Returns a snapshot of all tracked client states.</summary>
     public Dictionary<string, CircuitState> GetAllStates() => new(_states, StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Enumerates the live state map without copying. Iteration is thread-safe per <see cref="ConcurrentDictionary{TKey,TValue}"/>.</summary>
+    public IEnumerable<KeyValuePair<string, CircuitState>> Enumerate() => _states;
+
     /// <summary>True if any tracked circuit breaker is currently open.</summary>
-    public bool HasOpenCircuits => _states.Values.Any(s => s == CircuitState.Open);
+    public bool HasOpenCircuits
+    {
+        get
+        {
+            foreach (var kv in _states)
+            {
+                if (kv.Value == CircuitState.Open)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
 }

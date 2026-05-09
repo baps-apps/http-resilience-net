@@ -41,4 +41,11 @@ public class ConnectionOptions
     /// </summary>
     [Range(1, 120, ErrorMessage = "ConnectTimeoutSeconds must be between 1 and 120.")]
     public int ConnectTimeoutSeconds { get; set; } = 21;
+
+    /// <summary>
+    /// Allow multiple concurrent HTTP/2 connections to the same origin. Maps to SocketsHttpHandler.EnableMultipleHttp2Connections.
+    /// <para><b>Use case:</b> Critical for high-throughput HTTP/2 microservices — without this, all HTTP/2 traffic to one origin
+    /// is multiplexed onto a single TCP connection and bottlenecks on its concurrent stream limit. Default: true.</para>
+    /// </summary>
+    public bool EnableMultipleHttp2Connections { get; set; } = true;
 }

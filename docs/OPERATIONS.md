@@ -110,4 +110,5 @@ HttpResilience.NET is a thin configuration layer over Microsoft.Extensions.Http.
 - **Per-request overhead** — small number of delegating handlers; negligible vs network I/O.
 - **Retries/hedging** increase request volume to dependencies. Keep `MaxRetryAttempts` small (0–3) for interactive traffic.
 - **Rate limiters and bulkheads** are created per pipeline (not per request) and live as long as the DI container.
-- Rate/concurrency limits are **global per named client** in the process. Use different named clients or `ByAuthority` mode for different quotas.
+- Rate limiters are registered as **keyed singletons** keyed by the named `HttpClient` name (`AddKeyedSingleton<RateLimiter>(clientName, ...)`), so each named client gets its own limiter instance — no cross-client collisions — and the container owns disposal. Resolve directly via `GetRequiredKeyedService<RateLimiter>(clientName)` if needed.
+- Rate/concurrency limits are **per named client** in the process. Use different named clients or `ByAuthority` mode for different quotas.

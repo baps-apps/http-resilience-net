@@ -47,21 +47,30 @@ internal static class HttpStandardHedgingHandlerConfig
             resilienceOptions.Endpoint.CircuitBreaker.OnOpened = args =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
+                }
+
                 tracker?.ReportOpened(name);
                 return default;
             };
             resilienceOptions.Endpoint.CircuitBreaker.OnHalfOpened = _ =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
+                }
+
                 tracker?.ReportHalfOpen(name);
                 return default;
             };
             resilienceOptions.Endpoint.CircuitBreaker.OnClosed = _ =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerClosed(logger, name);
+                }
+
                 tracker?.ReportClosed(name);
                 return default;
             };

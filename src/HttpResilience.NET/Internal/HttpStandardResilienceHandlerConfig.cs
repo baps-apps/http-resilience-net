@@ -66,7 +66,8 @@ internal static class HttpStandardResilienceHandlerConfig
                 {
                     HttpResilienceLogging.RetryAttempt(logger, args.AttemptNumber, name,
                         args.RetryDelay.TotalMilliseconds,
-                        args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
+                        args.Outcome.Exception?.Message,
+                        (int?)args.Outcome.Result?.StatusCode);
                     return default;
                 };
             }
@@ -74,21 +75,30 @@ internal static class HttpStandardResilienceHandlerConfig
             resilienceOptions.CircuitBreaker.OnOpened = args =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerOpened(logger, name, args.BreakDuration.TotalSeconds);
+                }
+
                 tracker?.ReportOpened(name);
                 return default;
             };
             resilienceOptions.CircuitBreaker.OnHalfOpened = _ =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerHalfOpen(logger, name);
+                }
+
                 tracker?.ReportHalfOpen(name);
                 return default;
             };
             resilienceOptions.CircuitBreaker.OnClosed = _ =>
             {
                 if (logger is not null)
+                {
                     HttpResilienceLogging.CircuitBreakerClosed(logger, name);
+                }
+
                 tracker?.ReportClosed(name);
                 return default;
             };

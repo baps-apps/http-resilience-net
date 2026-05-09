@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Internal;
@@ -15,14 +16,14 @@ internal static class PipelineStrategyNames
     public const string Hedging = "Hedging";
 
     /// <summary>
-    /// Set of allowed strategy names (case-insensitive) for validation.
+    /// Set of allowed strategy names (case-insensitive) for validation. Frozen for fast read-only Contains.
     /// </summary>
-    public static readonly HashSet<string> Allowed = new(StringComparer.OrdinalIgnoreCase)
+    public static readonly FrozenSet<string> Allowed = new[]
     {
         Fallback,
         Bulkhead,
         RateLimiter,
         Standard,
         Hedging
-    };
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 }
