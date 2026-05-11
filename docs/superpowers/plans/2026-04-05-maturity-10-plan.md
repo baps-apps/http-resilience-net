@@ -1004,7 +1004,7 @@ public class ConcurrencyIntegrationTests
 
         public string BaseAddress { get; }
         public HttpMessageHandler CreateHandler() => _createHandler();
-        public async ValueTask DisposeAsync() => await _host.StopAsync().ConfigureAwait(false);
+        public async ValueTask DisposeAsync() => await _host.StopAsync();
     }
 }
 ```

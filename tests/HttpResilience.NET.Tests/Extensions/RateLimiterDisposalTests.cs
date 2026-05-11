@@ -42,7 +42,7 @@ public class RateLimiterDisposalTests
 
         // After disposal, the limiter should throw ObjectDisposedException.
         await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
-            await limiter.AcquireAsync(1).ConfigureAwait(false));
+            await limiter.AcquireAsync(1));
     }
 
     [Fact]
@@ -73,6 +73,6 @@ public class RateLimiterDisposalTests
         await provider.DisposeAsync();
 
         await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
-            await limiter.AcquireAsync(1).ConfigureAwait(false));
+            await limiter.AcquireAsync(1));
     }
 }

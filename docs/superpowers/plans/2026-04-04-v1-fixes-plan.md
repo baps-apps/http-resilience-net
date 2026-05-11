@@ -904,7 +904,7 @@ Update `ExecuteFallbackAsync` to accept and use the logger:
         if (customHandler is not null)
         {
             var context = new HttpFallbackContext(args.Outcome);
-            var customResponse = await customHandler.TryHandleAsync(context, args.Context.CancellationToken).ConfigureAwait(false);
+            var customResponse = await customHandler.TryHandleAsync(context, args.Context.CancellationToken);
             if (customResponse is not null)
                 return Outcome.FromResult(customResponse);
         }

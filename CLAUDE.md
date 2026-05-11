@@ -90,7 +90,7 @@ The default section name is `"HttpResilienceOptions"` (from `HttpResilienceConfi
 
 ### Sample project
 
-The sample (`samples/HttpResilience.NET.Sample/`) consumes the published `HttpResilience.NET` NuGet package (not a `ProjectReference`), so it exercises the same surface external consumers see. The `HttpResilience.NET` `PackageVersion` in `Directory.Packages.props` controls which version it pulls.
+The sample (`samples/HttpResilience.NET.Sample/`) uses a `ProjectReference` to `src/HttpResilience.NET/HttpResilience.NET.csproj`, so local source changes are exercised without a publish/restore cycle.
 
 ### Package management
 
