@@ -1,69 +1,128 @@
-using System.ComponentModel.DataAnnotations;
-using System.Text.Json.Serialization;
-
 namespace HttpResilience.NET.Options;
 
 /// <summary>
-/// Rate limiter options (standard pipeline only). Config key: "HttpResilienceOptions:RateLimiter".
+/// Outbound rate limiting: how fast this client may call a downstream. Off by default.
 /// </summary>
-public class RateLimiterOptions
+/// <remarks>
+/// Reach for this when a downstream publishes a quota you must not exceed, or when you are the noisy neighbour
+/// on a shared dependency. It answers a different question from <see cref="ConcurrencyLimiterOptions"/>, which
+/// bounds how much of <i>your</i> capacity may wait on one dependency.
+/// <para>
+/// <b>This limiter is process-local and cannot enforce a cluster-wide quota.</b> Each replica gets its own,
+/// so the fleet-wide rate is <c>replicas x PermitLimit</c> per window: 10 pods at 100/s permit 1,000/s in
+/// aggregate. There is a second multiplier -- the budget belongs to a <i>named client</i>, not to a
+/// downstream, so two clients calling the same host hold two independent budgets. Size
+/// <see cref="PermitLimit"/> as <c>quota / (replicas x clients that reach the host)</c>, or enforce the real
+/// quota at a gateway where it can actually be global.
+/// </para>
+/// <para>
+/// One permit covers one <b>logical request</b> including its retries or hedged attempts, so a retrying client
+/// puts up to <c>PermitLimit x (1 + Retry:MaxRetries)</c> requests on the wire per window. Size the budget
+/// with that multiplier in mind.
+/// </para>
+/// <para>
+/// Enabling this takes the platform handler's one limiter slot, which otherwise holds the concurrency
+/// backstop. The backstop is not lost: it is re-applied outside the rate limiter.
+/// </para>
+/// </remarks>
+/// <example>
+/// A downstream quota of 600 requests per minute across 6 replicas, one client:
+/// <code language="json">
+/// {
+///   "HttpResilience": {
+///     "Clients": {
+///       "Partner": {
+///         "RateLimiter": {
+///           "Enabled": true,
+///           "Algorithm": "SlidingWindow",
+///           "PermitLimit": 100,
+///           "Window": "00:01:00",
+///           "QueueLimit": 0
+///         }
+///       }
+///     }
+///   }
+/// }
+/// </code>
+/// </example>
+public sealed class RateLimiterOptions
 {
     /// <summary>
-    /// When true, limits how many requests can be sent per time window (standard pipeline only).
-    /// <para><b>Use case:</b> Enable when you must stay under a backend or quota limit. Default: false.</para>
+    /// Gets or sets a value indicating whether outbound rate limiting is applied. Defaults to
+    /// <see langword="false"/>.
     /// </summary>
+    /// <remarks>
+    /// Cannot be switched on after the client is registered -- it decides whether a limiter is built at all,
+    /// so a later change fails startup. Put it in configuration or in the <c>configure</c> parameter.
+    /// </remarks>
     public bool Enabled { get; set; }
 
     /// <summary>
-    /// Maximum number of requests allowed per window when <see cref="Enabled"/> is true.
-    /// <para><b>Use case:</b> Set to your allowed throughput (e.g. 1000/sec depending on window). Default: 1000.</para>
+    /// Gets or sets the algorithm. Defaults to <see cref="RateLimitAlgorithm.FixedWindow"/>.
     /// </summary>
-    [Range(1, 100_000, ErrorMessage = "PermitLimit must be between 1 and 100000.")]
-    public int PermitLimit { get; set; } = 1000;
-
-    /// <summary>
-    /// Length of the rate-limit window in seconds. For SlidingWindow, the window is split into <see cref="SegmentsPerWindow"/> segments.
-    /// <para><b>Use case:</b> 1 for per-second, 60 for per-minute. Default: 1.</para>
-    /// </summary>
-    [Range(1, 3600, ErrorMessage = "WindowSeconds must be between 1 and 3600.")]
-    public int WindowSeconds { get; set; } = 1;
-
-    /// <summary>
-    /// When rate limit is exceeded, how many requests can wait in queue (0 = no queue; requests fail immediately).
-    /// <para><b>Use case:</b> 0 for strict limiting; small value to smooth bursts. Default: 0.</para>
-    /// </summary>
-    [Range(0, 10_000, ErrorMessage = "QueueLimit must be between 0 and 10000.")]
-    public int QueueLimit { get; set; }
-
-    /// <summary>
-    /// Rate limit algorithm. Config key: "Algorithm".
-    /// <para><b>Options:</b> <see cref="RateLimitAlgorithm.FixedWindow"/> (default), <see cref="RateLimitAlgorithm.SlidingWindow"/>, <see cref="RateLimitAlgorithm.TokenBucket"/>.</para>
-    /// <para><b>Effect:</b> FixedWindow = X permits per window; SlidingWindow = smoother, avoids boundary spikes; TokenBucket = sustained average rate with burst capacity.</para>
-    /// </summary>
-    [JsonPropertyName("Algorithm")]
     public RateLimitAlgorithm Algorithm { get; set; } = RateLimitAlgorithm.FixedWindow;
 
     /// <summary>
-    /// Number of segments the window is split into for the SlidingWindow rate limiter only. Default: 2.
+    /// Gets or sets the permits allowed per <see cref="Window"/>, for
+    /// <see cref="RateLimitAlgorithm.FixedWindow"/> and <see cref="RateLimitAlgorithm.SlidingWindow"/>.
+    /// Required when <see cref="Enabled"/> is <see langword="true"/>.
     /// </summary>
-    [Range(1, 100, ErrorMessage = "SegmentsPerWindow must be between 1 and 100.")]
-    public int SegmentsPerWindow { get; set; } = 2;
+    /// <remarks>
+    /// No default, deliberately: this is a capacity contract with a specific downstream and no shared package
+    /// can guess it. Exceeding it throws <c>RateLimiterRejectedException</c> to the caller.
+    /// </remarks>
+    public int? PermitLimit { get; set; }
 
     /// <summary>
-    /// Maximum tokens in the bucket for the TokenBucket rate limiter only. Default: 1000.
+    /// Gets or sets the window length for <see cref="RateLimitAlgorithm.FixedWindow"/> and
+    /// <see cref="RateLimitAlgorithm.SlidingWindow"/>. Defaults to 1 second.
     /// </summary>
-    [Range(1, 100_000, ErrorMessage = "TokenBucketCapacity must be between 1 and 100000.")]
-    public int TokenBucketCapacity { get; set; } = 1000;
+    public TimeSpan Window { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Tokens added each replenishment period for the TokenBucket rate limiter only. Default: 1000.
+    /// Gets or sets the number of segments a sliding window is divided into. Defaults to 8. Higher is
+    /// smoother and costs a little more memory.
     /// </summary>
-    [Range(1, 100_000, ErrorMessage = "TokensPerPeriod must be between 1 and 100000.")]
-    public int TokensPerPeriod { get; set; } = 1000;
+    public int SegmentsPerWindow { get; set; } = 8;
 
     /// <summary>
-    /// Interval (seconds) between token replenishments for the TokenBucket rate limiter only. Default: 1.
+    /// Gets or sets the bucket capacity for <see cref="RateLimitAlgorithm.TokenBucket"/> -- the largest burst
+    /// an idle client may make. Required when that algorithm is selected.
     /// </summary>
-    [Range(1, 3600, ErrorMessage = "ReplenishmentPeriodSeconds must be between 1 and 3600.")]
-    public int ReplenishmentPeriodSeconds { get; set; } = 1;
+    public int? TokenLimit { get; set; }
+
+    /// <summary>
+    /// Gets or sets the tokens added each <see cref="ReplenishmentPeriod"/> for
+    /// <see cref="RateLimitAlgorithm.TokenBucket"/> -- the sustained rate, as opposed to the burst.
+    /// Required when that algorithm is selected.
+    /// </summary>
+    public int? TokensPerPeriod { get; set; }
+
+    /// <summary>
+    /// Gets or sets how often tokens are replenished for <see cref="RateLimitAlgorithm.TokenBucket"/>.
+    /// Defaults to 1 second.
+    /// </summary>
+    public TimeSpan ReplenishmentPeriod { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Gets or sets how many requests may wait for a permit. Defaults to 0, which fails fast. Capped at
+    /// 1,000.
+    /// </summary>
+    /// <remarks>
+    /// Keep this small, or leave it at 0. A queued request holds its
+    /// <see cref="System.Net.Http.HttpRequestMessage"/> and content buffer in memory while it waits, so a deep
+    /// queue of large uploads is a memory risk as well as a latency one -- and the wait happens outside
+    /// <see cref="TimeoutOptions.Total"/>, where no pipeline timeout can bound it. A persistently full queue
+    /// means the downstream needs more capacity or you need to shed load; it does not mean the queue should be
+    /// longer.
+    /// </remarks>
+    public int QueueLimit { get; set; }
+
+    /// <summary>
+    /// The configuration key that sizes this limiter's budget, for a rejection message that names the number
+    /// an operator would change rather than the exception type they already have.
+    /// </summary>
+    internal string PermitKey => Algorithm is RateLimitAlgorithm.TokenBucket
+        ? "RateLimiter:TokensPerPeriod"
+        : "RateLimiter:PermitLimit";
 }

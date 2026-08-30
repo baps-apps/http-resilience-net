@@ -10,7 +10,7 @@
 # - Requires GitHub PAT with 'delete:packages' permission
 
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$Version = "",
     [string]$GitHubPAT = $env:GITHUB_PAT
 )
@@ -28,9 +28,7 @@ try {
     if ($PSScriptRoot) {
         $RepoRoot = Split-Path -Parent $PSScriptRoot
     } else {
-        # If PSScriptRoot is not available, use current location
         $currentDir = (Get-Location).Path
-        # Check if we're in scripts directory
         if ((Split-Path -Leaf $currentDir) -eq "scripts") {
             $RepoRoot = Split-Path -Parent $currentDir
         } else {
@@ -41,7 +39,7 @@ try {
 
 # Configuration
 $PackageName = "HttpResilience.NET"
-$Namespace = $env:GITHUB_NAMESPACE ?? "http-resilience-net"
+$Namespace = $env:GITHUB_NAMESPACE ?? "baps-apps"
 $RepoName = "http-resilience-net"
 
 # Get GitHub PAT from argument or environment variable
@@ -57,7 +55,6 @@ if ([string]::IsNullOrEmpty($GitHubPAT)) {
 Write-Host "Deleting HttpResilience.NET v$Version from GitHub Packages" -ForegroundColor Yellow
 Write-Host ""
 
-# Function to check if package version exists using GitHub API
 function Test-PackageVersion {
     param(
         [string]$PackageName,
@@ -68,41 +65,39 @@ function Test-PackageVersion {
 
     try {
         $headers = @{
-            "Authorization" = "Bearer $Token"
-            "Accept" = "application/vnd.github+json"
+            "Authorization"        = "Bearer $Token"
+            "Accept"               = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
         }
 
         $versionsUrl = "https://api.github.com/orgs/$OrgName/packages/nuget/$PackageName/versions"
         $versionsResponse = Invoke-RestMethod -Uri $versionsUrl -Method Get -Headers $headers -ErrorAction Stop
 
-        # Find the version we're looking for
         $existingVersion = $versionsResponse | Where-Object { $_.name -eq $PackageVersion } | Select-Object -First 1
 
         if ($existingVersion) {
             return @{
-                Exists = $true
-                VersionId = $existingVersion.id
+                Exists      = $true
+                VersionId   = $existingVersion.id
                 VersionName = $existingVersion.name
             }
         } else {
             return @{
-                Exists = $false
-                VersionId = $null
+                Exists      = $false
+                VersionId   = $null
                 VersionName = $null
             }
         }
     } catch {
         Write-Host "  Could not check package version via API: $_" -ForegroundColor Yellow
         return @{
-            Exists = $null  # Unknown
-            VersionId = $null
+            Exists      = $null
+            VersionId   = $null
             VersionName = $null
         }
     }
 }
 
-# Function to delete package version using GitHub API
 function Remove-PackageVersion {
     param(
         [string]$PackageName,
@@ -114,8 +109,8 @@ function Remove-PackageVersion {
 
     try {
         $headers = @{
-            "Authorization" = "Bearer $Token"
-            "Accept" = "application/vnd.github+json"
+            "Authorization"        = "Bearer $Token"
+            "Accept"               = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
         }
 
@@ -130,7 +125,6 @@ function Remove-PackageVersion {
     }
 }
 
-# Step 1: Check if package version exists
 Write-Host "Step 1: Checking if package version exists..." -ForegroundColor Yellow
 $versionCheck = Test-PackageVersion -PackageName $PackageName -PackageVersion $Version -Token $GitHubPAT -OrgName $Namespace
 
@@ -138,7 +132,6 @@ if ($versionCheck.Exists -eq $true) {
     Write-Host "  Package version $Version found" -ForegroundColor Green
     Write-Host ""
 
-    # Step 2: Delete the package version
     Write-Host "Step 2: Deleting package version..." -ForegroundColor Yellow
     $deleted = Remove-PackageVersion -PackageName $PackageName -PackageVersion $Version -Token $GitHubPAT -OrgName $Namespace -VersionId $versionCheck.VersionId
 

@@ -2,59 +2,46 @@ using System.Collections.Concurrent;
 
 namespace HttpResilience.NET.Internal;
 
-/// <summary>
-/// Possible states for a circuit breaker.
-/// </summary>
-public enum CircuitState
+/// <summary>The state of a single circuit breaker instance.</summary>
+internal enum CircuitState
 {
-    /// <summary>Circuit is closed — requests flow normally.</summary>
+    /// <summary>Requests flow normally.</summary>
     Closed,
-    /// <summary>Circuit is open — requests are rejected.</summary>
+
+    /// <summary>Requests fail fast without reaching the dependency.</summary>
     Open,
-    /// <summary>Circuit is half-open — a trial request is allowed.</summary>
+
+    /// <summary>A trial request is allowed through to test recovery.</summary>
     HalfOpen
 }
 
-/// <summary>
-/// Thread-safe tracker for circuit breaker state per named HTTP client.
-/// Updated by Polly circuit breaker callbacks; read by health checks.
-/// </summary>
-public sealed class CircuitBreakerStateTracker
+/// <summary>Identifies one circuit breaker instance.</summary>
+/// <param name="Client">The named <see cref="HttpClient"/>.</param>
+/// <param name="Authority">
+/// The authority the breaker guards, or <see cref="PipelineKeySelector.SharedKey"/> when the client uses a
+/// single pipeline for every host.
+/// </param>
+internal readonly record struct CircuitKey(string Client, string Authority)
 {
-    private readonly ConcurrentDictionary<string, CircuitState> _states = new(StringComparer.OrdinalIgnoreCase);
+    public override string ToString() => $"{Client} -> {Authority}";
+}
 
-    /// <summary>Reports that the circuit breaker for the given client has opened.</summary>
-    public void ReportOpened(string clientName) => _states[clientName] = CircuitState.Open;
+/// <summary>
+/// Tracks the live state of every circuit breaker this library configures, so a health check can report it.
+/// </summary>
+/// <remarks>
+/// Keyed by client <b>and</b> authority. Under per-authority pipeline selection one client owns several
+/// breakers, and collapsing them onto the client name alone means the last callback to fire overwrites the
+/// others -- so one host recovering would mask another still being open.
+/// </remarks>
+internal sealed class CircuitBreakerStateTracker
+{
+    private readonly ConcurrentDictionary<CircuitKey, CircuitState> _states = new();
 
-    /// <summary>Reports that the circuit breaker for the given client is half-open.</summary>
-    public void ReportHalfOpen(string clientName) => _states[clientName] = CircuitState.HalfOpen;
+    public void Report(CircuitKey key, CircuitState state) => _states[key] = state;
 
-    /// <summary>Reports that the circuit breaker for the given client has closed.</summary>
-    public void ReportClosed(string clientName) => _states[clientName] = CircuitState.Closed;
+    public CircuitState GetState(CircuitKey key) =>
+        _states.TryGetValue(key, out CircuitState state) ? state : CircuitState.Closed;
 
-    /// <summary>Gets the current state for the given client. Returns <see cref="CircuitState.Closed"/> if unknown.</summary>
-    public CircuitState GetState(string clientName) =>
-        _states.TryGetValue(clientName, out var state) ? state : CircuitState.Closed;
-
-    /// <summary>Returns a snapshot of all tracked client states.</summary>
-    public Dictionary<string, CircuitState> GetAllStates() => new(_states, StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Enumerates the live state map without copying. Iteration is thread-safe per <see cref="ConcurrentDictionary{TKey,TValue}"/>.</summary>
-    public IEnumerable<KeyValuePair<string, CircuitState>> Enumerate() => _states;
-
-    /// <summary>True if any tracked circuit breaker is currently open.</summary>
-    public bool HasOpenCircuits
-    {
-        get
-        {
-            foreach (var kv in _states)
-            {
-                if (kv.Value == CircuitState.Open)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
+    public IEnumerable<KeyValuePair<CircuitKey, CircuitState>> Enumerate() => _states;
 }
