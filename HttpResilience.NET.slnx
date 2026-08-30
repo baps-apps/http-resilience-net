@@ -4,6 +4,9 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/HttpResilience.NET.Benchmarks/HttpResilience.NET.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/HttpResilience.NET.Sample/HttpResilience.NET.Sample.csproj" />
   </Folder>
@@ -13,5 +16,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/HttpResilience.NET.IntegrationTests/HttpResilience.NET.IntegrationTests.csproj" />
     <Project Path="tests/HttpResilience.NET.Tests/HttpResilience.NET.Tests.csproj" />
+    <Project Path="tests/HttpResilience.NET.AotSmoke/HttpResilience.NET.AotSmoke.csproj" />
   </Folder>
 </Solution>

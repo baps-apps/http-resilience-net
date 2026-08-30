@@ -1,89 +1,69 @@
-## Versioning and Compatibility Policy
+# Versioning
 
-This document describes how `HttpResilience.NET` is versioned and what compatibility guarantees it provides.
+HttpResilience.NET follows [Semantic Versioning](https://semver.org/).
 
----
+| Change | Version |
+| --- | --- |
+| Public API removal, rename, namespace move or signature change | MAJOR |
+| Configuration key renamed or removed | MAJOR |
+| Default value change that alters runtime behavior | MAJOR |
+| A new validation rule that rejects previously accepted configuration | MAJOR |
+| Pipeline ordering or strategy semantics change | MAJOR |
+| Exception type change for an existing failure | MAJOR |
+| New optional configuration key with a backwards-compatible default | MINOR |
+| New extension method or overload | MINOR |
+| New telemetry dimension | MINOR |
+| Bug fix with no behavior change for valid configuration | PATCH |
+| Documentation, tests, internal refactoring | PATCH |
 
-### Semantic versioning
+Two of these are easy to get wrong and are called out deliberately:
 
-The library follows **Semantic Versioning (SemVer)**:
+- **A default change is MAJOR.** Consumers inherit defaults without stating them, so changing one changes behavior in every service that did not override it — with no diff anywhere to show it.
+- **A new validation rule is MAJOR.** It turns a configuration that started yesterday into one that fails to start today, which for an operator is indistinguishable from a breaking change.
 
-- **MAJOR** version (X.y.z):
-  - May introduce **breaking changes**, such as:
-    - Public API changes (extensions, options classes, enums).
-    - Breaking changes to configuration schema or default behavior.
-- **MINOR** version (x.Y.z):
-  - Adds new features in a **backwards-compatible** way:
-    - New options with safe defaults.
-    - New overloads or extension methods.
-    - New documentation or samples.
-- **PATCH** version (x.y.Z):
-  - Bug fixes and internal improvements that do **not** change public APIs or documented behavior.
+## Enforcement
 
----
+**The public API is a build gate.** `Microsoft.CodeAnalysis.PublicApiAnalyzers` holds every public type and
+member in `src/HttpResilience.NET/PublicAPI.Shipped.txt` and `PublicAPI.Unshipped.txt`. Adding, removing or
+changing the signature of anything public fails the build until the corresponding line is edited, so the
+change is visible as a diff in review rather than at pack time. At release, move the contents of
+`PublicAPI.Unshipped.txt` into `PublicAPI.Shipped.txt` -- and that step is itself gated: on a tagged build CI
+runs `scripts/check-public-api-shipped.py`, which fails when anything is still listed as unshipped. Without
+it the move is a human step nothing checks, and skipping it once leaves every member "unshipped" for good.
 
-### Configuration compatibility
+`EnablePackageValidation` is on as a second check. Its baseline follows one rule:
+**`PackageValidationBaselineVersion` names the last published version within the same major.** It stays unset
+for the first release of a major, because a major exists precisely to make intentional breaks, and validating
+one against the previous major would report every deliberate removal as a failure and train everyone to
+ignore the gate. From the first patch or minor after a major, the baseline is set and the check is real.
+Until then the API analyzer above is the gate.
 
-Configuration compatibility is treated as part of the public contract.
+## Scheduled removals
 
-We guarantee that:
+One public member exists only to fail:
+`HttpResilience.NET.Options.RetryOptions.MaxAttempts`. It is `[Obsolete]`, it is bound so that a stale
+configuration file is refused rather than silently ignored, and it is read in exactly one place --
+`HttpResilienceOptionsValidator.ValidateRenamedKeys`. Keeping it is what turns a file written for 1.x into a
+startup failure with a message instead of a client quietly running three attempts where its author meant two.
 
-- **Valid configs stay valid**:
-  - A configuration file that is valid for version `1.y.z` remains valid for all `1.y+1.z+` versions.
-  - Validation rules (ranges, allowed values) may become stricter **only** to reject configurations that would not behave correctly at runtime.
-- **New options are additive**:
-  - New properties/options are added with **safe defaults**.
-  - If you do not set them, existing behavior remains unchanged.
+**It is removed in 3.0**, which is the next opportunity, because removing a public member is MAJOR by the
+table above. By then a 1.x configuration file is old enough that failing to bind it is no worse than failing
+to recognise it. Nothing else in the public surface is scheduled for removal; when something is, it is listed
+here at the same time as it is deprecated, so "what breaks next major" is answerable from one place.
 
-If a breaking config change is ever required (e.g. renaming keys or removing options), it will:
+## Namespaces
 
-- Only happen in a **major** version.
-- Be called out explicitly in the release notes and documentation.
+Registration extension methods live in `Microsoft.Extensions.DependencyInjection`, which is where the .NET
+convention puts extensions on `IServiceCollection` and `IHttpClientBuilder` -- so they appear in IntelliSense
+in any `Program.cs` without a package-specific `using`. The classes are prefixed (`HttpResilienceServiceCollectionExtensions`,
+not `ServiceCollectionExtensions`) because that namespace is shared: an unprefixed `ServiceCollectionExtensions`
+collides with the one almost every other package ships. Options and configuration types stay in
+`HttpResilience.NET.*`, which is theirs alone.
 
----
+## Target framework
 
-### Defaults and behavior changes
+`net10.0`. A TFM change is MAJOR.
 
-Defaults have a large impact on behavior and operations. We follow these rules:
+## Dependencies
 
-- **Within a major version**:
-  - Defaults will not change in ways that meaningfully alter behavior (e.g. significantly increasing retries or timeouts).
-  - If a tweak is unavoidable, it will be documented and released as a minor version, with clear upgrade notes.
-- **Across major versions**:
-  - Defaults may change to better recommendations (e.g. stronger timeouts, safer circuit breaker settings).
-  - Migration guidance will be provided.
-
----
-
-### Deprecation policy
-
-When an API or option is planned for removal:
-
-- It will be marked as **obsolete** (where applicable) and documented as such.
-- A recommended alternative will be provided.
-- Actual removal will occur in a **later major** version.
-
----
-
-### Upgrading guidance
-
-When upgrading:
-
-- **Patch updates** (e.g. 1.0.0 → 1.0.3):
-  - Safe to apply broadly after running tests; behavior is expected to be identical, except for bug fixes.
-- **Minor updates** (e.g. 1.0.0 → 1.2.0):
-  - Review release notes for:
-    - New features you may want to opt into.
-    - Any stricter validation that may reject previously-accepted misconfigurations.
-- **Major updates** (e.g. 1.x → 2.0):
-  - Review migration notes carefully.
-  - Plan for testing and potential configuration or code adjustments.
-
----
-
-### Support expectations
-
-- The library is intended for use on **current and supported .NET releases**.
-- For the **1.x** line, the primary target is `net10.0`; future major versions may add or adjust target frameworks in line with the .NET support lifecycle.
-- Within a given major version, bug fixes and non-breaking enhancements will continue as long as the underlying .NET version remains in mainstream support.
-
+The package depends only on first-party Microsoft packages and Polly. A major version bump of `Microsoft.Extensions.Http.Resilience` or Polly is treated as MAJOR here, because their behavior is this package's behavior.

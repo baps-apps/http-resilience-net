@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Release builds gate one more thing than branch builds: that the public surface accumulated in
+    # PublicAPI.Unshipped.txt was actually moved into PublicAPI.Shipped.txt as part of cutting the version.
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  # GITHUB_TOKEN needs this to read nuget.pkg.github.com. Without it the restore below returns 401
+  # and every gate in this workflow is skipped rather than failed.
+  packages: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # RedirectTests and Http2Tests run against real sockets and a real Kestrel deliberately, because
+        # TestServer's handler follows no redirects and could not fail. Socket behavior is the one thing
+        # in this repository that can differ by platform, so it is the one thing worth a matrix.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # NuGet does not read arbitrary environment variables, and setup-dotnet injects credentials only when
+      # given a source-url -- which also makes it write its own NuGet.config, dropping this repository's
+      # packageSourceMapping. So the credential goes onto the existing source instead, leaving the mapping
+      # (which is what stops a public package shadowing an internal name) authoritative.
+      #
+      # This step is why the workflow works at all: it previously set GITHUB_PAT as an env var that nothing
+      # consumed, so restore 401'd on CodeStyle.NET and no gate below had ever run.
+      - name: Authenticate to GitHub Packages
+        run: >
+          dotnet nuget update source baps-apps-packages
+          --username github-actions
+          --password "${{ secrets.GITHUB_TOKEN }}"
+          --store-password-in-clear-text
+          --configfile nuget.config
+
+      - name: Restore
+        run: dotnet restore
+
+      # A resilience package that multiplies outbound traffic is a poor place for a known-vulnerable
+      # transitive dependency. Fails the build rather than reporting.
+      #
+      # Structured output rather than grepping the table: the previous check matched severity words at
+      # end-of-line, so a change in column padding would have silently stopped failing on anything.
+      - name: Audit dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet list package --vulnerable --include-transitive --format json > audit.json
+          jq -e '
+            [ .projects[]?.frameworks[]?
+              | (.topLevelPackages // []) + (.transitivePackages // [])
+              | .[] | select((.vulnerabilities // []) | length > 0) ] as $vulnerable
+            | if ($vulnerable | length) == 0 then true
+              else ($vulnerable | map("\(.id) \(.resolvedVersion)") | join(", ") | halt_error(1))
+              end' audit.json
+
+      # Whitespace only, deliberately. The full `dotnet format` runs the compilation without the
+      # configuration binding source generator, so every intercepted Bind call reports IL2026 and IL3050 --
+      # warnings the real build and the Native AOT publish below do not produce. Analyzer and code-style
+      # regressions are already gated by TreatWarningsAsErrors and EnforceCodeStyleInBuild in the Build step.
+      - name: Verify formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet format whitespace --verify-no-changes --no-restore
+
+      # TreatWarningsAsErrors is on, so this also gates analyzer and XML-doc regressions.
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal
+
+      # `dotnet test` -- no arguments, the command in CLAUDE.md and README.md -- builds Debug. Running only
+      # Release meant a contributor's first command failed on a green branch for four days: an allocation
+      # ceiling calibrated against Release codegen, asserted in both. That test is now Release-only; this leg
+      # is what stops the next Debug-only failure from living in the repository unseen.
+      - name: Test (Debug)
+        run: dotnet test --configuration Debug --no-restore --verbosity normal
+
+      # docs/benchmarks/README.md quotes numbers from the raw reports checked in beside it, and says the
+      # reports are there so a claim can be re-derived rather than trusted. They drifted: every report said
+      # 1,032 B for the standard pipeline while the summary said 1,336 B, and nothing compared them.
+      # Allocation only -- it is deterministic, unlike a mean, so this can run on any machine.
+      - name: Verify benchmark documentation
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check-benchmark-docs.py
+
+      # The sample is the only executable example and the file most likely to be copied into a service.
+      # It shipped with a Connection:PooledConnectionIdleTimeout this package's own validator rejects, so
+      # it terminated on startup -- because nothing here ever started it. SampleConfigurationTests holds
+      # the configuration to the validator; this holds the program to actually running.
+      - name: Sample smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet run --project samples/HttpResilience.NET.Sample --configuration Release --no-build
+
+      # The package declares IsTrimmable and IsAotCompatible. Trimming a reflection-based binder does not
+      # fail loudly -- it leaves a client running on defaults it never configured -- so the claim is proven
+      # by publishing Native AOT and asserting the bound values at run time, not by a clean build.
+      - name: Native AOT smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet publish tests/HttpResilience.NET.AotSmoke --configuration Release -r linux-x64
+          ./tests/HttpResilience.NET.AotSmoke/bin/Release/net10.0/linux-x64/publish/HttpResilience.NET.AotSmoke
+
+      # The per-build public-API gate is PublicApiAnalyzers, in the Build step above: PublicAPI.*.txt lists
+      # every public member and an unrecorded change is a build error. What that cannot gate is the release
+      # step -- moving Unshipped into Shipped when a version ships -- which is a human one, and skipping it
+      # leaves every member 'unshipped' forever until the distinction means nothing. Tag builds only.
+      - name: Verify public API is marked shipped
+        if: matrix.os == 'ubuntu-latest' && startsWith(github.ref, 'refs/tags/')
+        run: python3 scripts/check-public-api-shipped.py
+
+      # PackageValidation also runs in Pack, but it compares against a baseline only from the first release
+      # within a major -- setting one for 2.0.0 would validate against 1.0.0 and report every deliberate 2.0
+      # removal. From 2.0.1 onwards PackageValidationBaselineVersion is set. See docs/VERSIONING.md.
+      - name: Pack
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet pack src/HttpResilience.NET/ --configuration Release --no-build --output ./artifacts
+
+      - name: Upload package
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: ./artifacts/*.nupkg

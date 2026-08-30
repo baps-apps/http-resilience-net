@@ -3,29 +3,35 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
   </PropertyGroup>
   <ItemGroup>
+    <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="CodeStyle.NET" Version="1.0.0" />
-    <PackageVersion Include="coverlet.collector" Version="10.0.0" />
-    <PackageVersion Include="HttpResilience.NET" Version="1.0.0" />
-    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.5.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Options.DataAnnotations" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.5.1" />
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.203" />
-    <PackageVersion Include="OpenTelemetry.NET" Version="1.0.0" />
-    <PackageVersion Include="Polly.Extensions" Version="8.6.6" />
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.9.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.400" />
+    <PackageVersion Include="Polly.Extensions" Version="8.7.0" />
+    <PackageVersion Include="Polly.RateLimiting" Version="8.7.0" />
+    <!-- Pinned explicitly: RateLimiterFactory constructs these BCL types directly, and left to the
+         transitive reference from Polly.RateLimiting the package resolved 8.0.0, two majors behind
+         everything else here and outside central package management's reach for patching. -->
+    <PackageVersion Include="System.Threading.RateLimiting" Version="10.0.11" />
     <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
   </ItemGroup>
 </Project>

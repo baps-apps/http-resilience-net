@@ -36,14 +36,14 @@ Publish the HttpResilience.NET NuGet package to GitHub Packages. The publish scr
 - **Package ID:** `HttpResilience.NET`
 - **Project:** `src/HttpResilience.NET/HttpResilience.NET.csproj`
 - **Output:** `nupkgs/` at repo root
-- **Namespace:** GitHub org or user that hosts the package (default: `http-resilience-net`). Override with `GITHUB_NAMESPACE` if your repo is under a different org/user (e.g. `baps-apps`).
+- **Namespace:** GitHub org that hosts the package (default: `baps-apps`, in both scripts). Override with `GITHUB_NAMESPACE` only if the repo moves to a different org or user.
 
 Ensure the project is packable: in `HttpResilience.NET.csproj` add (or adjust) for NuGet:
 
 ```xml
 <PropertyGroup>
   <PackageId>HttpResilience.NET</PackageId>
-  <Version>1.0.0</Version>
+  <Version>2.0.0</Version>
   <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   <!-- Optional: Description, Authors, PackageReadmeFile, etc. -->
 </PropertyGroup>

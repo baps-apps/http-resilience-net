@@ -164,7 +164,7 @@ function Test-PackageVersion {
     try {
         $headers = @{
             "Authorization" = "Bearer $Token"
-            "Accept" = "application/vnd.github+json"
+            "Accept"        = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
         }
         $versionsUrl = "https://api.github.com/orgs/$OrgName/packages/nuget/$PackageName/versions"
@@ -191,7 +191,7 @@ function Remove-PackageVersion {
     try {
         $headers = @{
             "Authorization" = "Bearer $Token"
-            "Accept" = "application/vnd.github+json"
+            "Accept"        = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
         }
         $deleteUrl = "https://api.github.com/orgs/$OrgName/packages/nuget/$PackageName/versions/$VersionId"
@@ -212,7 +212,7 @@ if ($versionCheck.Exists -eq $true) {
     if (-not $deleted) {
         Write-Host "Error: Could not delete existing package version" -ForegroundColor Red
         Write-Host "  1. Go to https://github.com/$Namespace/$RepoName/packages" -ForegroundColor Yellow
-        Write-Host "  2. Select HttpResilience.NET, delete version $actualVersion, then run this script again" -ForegroundColor Yellow
+        Write-Host "  2. Select $PackageName, delete version $actualVersion, then run this script again" -ForegroundColor Yellow
         exit 1
     }
     Start-Sleep -Seconds 2
@@ -332,20 +332,27 @@ try {
         "X-GitHub-Api-Version" = "2022-11-28"
     }
 
-    # Delete existing release if present, then recreate
-    $existingReleaseUrl = "https://api.github.com/repos/$Namespace/$RepoName/releases/tags/$tagName"
+    # Delete ALL existing releases for this tag, including drafts, then recreate.
+    # Deleting the remote tag above converts its published release into an orphan
+    # draft, and the by-tag endpoint (releases/tags/{tag}) never returns drafts —
+    # so list all releases and filter by tag_name instead.
     try {
-        $existingRelease = Invoke-RestMethod -Uri $existingReleaseUrl -Method Get -Headers $headers -ErrorAction Stop
-        Write-Host "  GitHub release for $tagName already exists, deleting to recreate..." -ForegroundColor Yellow
-        $deleteUrl = "https://api.github.com/repos/$Namespace/$RepoName/releases/$($existingRelease.id)"
-        try {
-            Invoke-RestMethod -Uri $deleteUrl -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
-            Write-Host "  Existing release deleted" -ForegroundColor Green
-        } catch {
-            Write-Host "  Warning: Could not delete existing release: $_" -ForegroundColor Yellow
+        $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Namespace/$RepoName/releases?per_page=100" `
+            -Method Get -Headers $headers -ErrorAction Stop
+        $staleReleases = @($allReleases | Where-Object { $_.tag_name -eq $tagName })
+        foreach ($stale in $staleReleases) {
+            $kind = if ($stale.draft) { "draft" } else { "release" }
+            Write-Host "  Existing $kind for $tagName found (id $($stale.id)), deleting to recreate..." -ForegroundColor Yellow
+            try {
+                Invoke-RestMethod -Uri "https://api.github.com/repos/$Namespace/$RepoName/releases/$($stale.id)" `
+                    -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
+                Write-Host "  Existing $kind deleted" -ForegroundColor Green
+            } catch {
+                Write-Host "  Warning: Could not delete existing ${kind}: $_" -ForegroundColor Yellow
+            }
         }
     } catch {
-        # Release does not exist; nothing to delete
+        Write-Host "  Warning: Could not list existing releases: $_" -ForegroundColor Yellow
     }
 
     $changelogPath = Join-Path $RepoRoot "CHANGELOG.md"

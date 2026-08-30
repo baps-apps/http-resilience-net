@@ -1,84 +1,104 @@
-using System.Text.Json.Serialization;
-using Microsoft.Extensions.Options;
-
 namespace HttpResilience.NET.Options;
 
 /// <summary>
-/// Configuration options for outgoing HTTP client resilience. Consumed by multiple applications that register
-/// HTTP clients with <c>AddHttpClientWithResilience</c>.
-/// Options are grouped by feature (Retry, CircuitBreaker, Timeout, etc.) for clear boundaries and separation.
-/// All properties are bindable from configuration under "HttpResilienceOptions"; nested sections use the property names (e.g. "Retry", "CircuitBreaker").
+/// The complete resilience configuration for one <see cref="System.Net.Http.HttpClient"/>, bound from the
+/// <c>HttpResilience</c> section.
 /// </summary>
-public class HttpResilienceOptions
+/// <remarks>
+/// Per-client overrides live at <c>HttpResilience:Clients:{name}</c> and are layered on top of the root
+/// values, so a client states only what it changes. Scalars override; the two lists in this schema
+/// (<see cref="RetryOptions.RetryableMethods"/> and <see cref="PipelineSelectionOptions.Authorities"/>)
+/// replace rather than accumulate, so a client can narrow an inherited allow-list.
+/// <para>
+/// The pipeline shape is fixed and is not configurable, because ordering is where resilience pipelines go
+/// wrong. Outermost to innermost:
+/// </para>
+/// <code>
+/// ConcurrencyLimiter   (optional) -- one slot per logical request
+///   +- RateLimiter     (optional) -- one permit per logical request
+///        +- Total timeout
+///             +- Retry
+///                  +- Circuit breaker
+///                       +- Attempt timeout
+///                            +- SocketsHttpHandler
+/// </code>
+/// <para>
+/// You can read this back at run time to see what a client is actually running:
+/// <c>IOptionsMonitor&lt;HttpResilienceOptions&gt;.Get("Orders")</c>. The pipeline is built from that same
+/// instance, so the values you read are the values in effect. Configuration is read once at startup;
+/// changing it needs a restart.
+/// </para>
+/// </remarks>
+/// <example>
+/// A minimal configuration, plus one client that needs a tighter budget:
+/// <code language="json">
+/// {
+///   "HttpResilience": {
+///     "Enabled": true,
+///     "Timeout": { "Total": "00:00:20", "Attempt": "00:00:05" },
+///     "Clients": {
+///       "Orders": { "Timeout": { "Total": "00:00:10", "Attempt": "00:00:03" } }
+///     }
+///   }
+/// }
+/// </code>
+/// <code language="csharp">
+/// builder.Services.AddHttpResilience(builder.Configuration);
+/// builder.Services.AddHttpClient("Orders").AddHttpResilience();
+/// </code>
+/// </example>
+public sealed class HttpResilienceOptions
 {
     /// <summary>
-    /// Master switch for HTTP resilience. When true, the resilience pipeline and primary handler are applied when you call
-    /// AddHttpClientWithResilience. When false or not set, the extension does nothing.
-    /// <para><b>Use case:</b> Set to true in appsettings (e.g. per environment) to enable resilience; set to false to disable without changing code. Default: false (opt-in).</para>
+    /// Gets or sets a value indicating whether the resilience pipeline is applied. Defaults to
+    /// <see langword="false"/>, so a client opts in.
     /// </summary>
-    public bool Enabled { get; set; } = false;
+    /// <remarks>
+    /// Off by default so that adding this package to a service never changes how its clients behave until
+    /// someone says so. The cost is that a forgotten key produces exactly the same run-time state as a
+    /// deliberate opt-out -- so a client registered with this <see langword="false"/> logs a <b>Warning</b>
+    /// naming the key at startup, before the service accepts traffic, where a deployment check will see it.
+    /// <para>
+    /// This governs the resilience pipeline only. <see cref="Connection"/> is applied independently, so
+    /// switching resilience off during an incident does not also discard connection-pool tuning.
+    /// </para>
+    /// </remarks>
+    public bool Enabled { get; set; }
+
+    /// <summary>Gets the timeout budgets: total, per attempt, and the outer <c>HttpClient</c> backstop.</summary>
+    public TimeoutOptions Timeout { get; } = new();
+
+    /// <summary>Gets the retry behavior. Only RFC 9110 safe methods are retried unless you say otherwise.</summary>
+    public RetryOptions Retry { get; } = new();
+
+    /// <summary>Gets the circuit breaker thresholds. Process-local: every replica keeps its own state.</summary>
+    public CircuitBreakerOptions CircuitBreaker { get; } = new();
 
     /// <summary>
-    /// Order of pipeline strategies from outermost to innermost. Allowed values: "Fallback", "Bulkhead", "RateLimiter", "Standard", "Hedging".
-    /// Must contain exactly one of "Standard" or "Hedging". Required when <see cref="Enabled"/> is true.
-    /// <para><b>Use case:</b> e.g. [ "Fallback", "Bulkhead", "RateLimiter", "Standard" ] or [ "Hedging" ]. Config key: "PipelineOrder".</para>
-    /// <para><b>Standard</b> = retry, circuit breaker, timeouts, optional rate limiting. <b>Hedging</b> = multiple requests, first success wins.</para>
+    /// Gets the connection-pool settings for the primary handler. Applied whether or not
+    /// <see cref="Enabled"/> is set.
     /// </summary>
-    [JsonPropertyName("PipelineOrder")]
-    public List<string>? PipelineOrder { get; set; }
+    public ConnectionOptions Connection { get; } = new();
 
     /// <summary>
-    /// Connection and connection-pool options for the primary SocketsHttpHandler. Config key: "HttpResilienceOptions:Connection".
+    /// Gets outbound rate limiting -- how fast this client may call a downstream. Process-local, so the
+    /// fleet-wide rate is <c>replicas x clients x PermitLimit</c>.
     /// </summary>
-    [ValidateObjectMembers]
-    public ConnectionOptions Connection { get; set; } = new();
+    public RateLimiterOptions RateLimiter { get; } = new();
 
     /// <summary>
-    /// Request timeout options (total and per-attempt). Config key: "HttpResilienceOptions:Timeout".
+    /// Gets the cap on concurrent in-flight requests, plus the backstop the platform always applies.
     /// </summary>
-    [ValidateObjectMembers]
-    public TimeoutOptions Timeout { get; set; } = new();
+    public ConcurrencyLimiterOptions ConcurrencyLimiter { get; } = new();
 
     /// <summary>
-    /// Retry strategy options. Config key: "HttpResilienceOptions:Retry".
+    /// Gets hedging behavior. Applies only to clients registered with <c>AddHedgedHttpResilience</c>;
+    /// ignored otherwise.
     /// </summary>
-    [ValidateObjectMembers]
-    public RetryOptions Retry { get; set; } = new();
+    public HedgingOptions Hedging { get; } = new();
 
     /// <summary>
-    /// Circuit breaker strategy options. Config key: "HttpResilienceOptions:CircuitBreaker".
+    /// Gets whether the client uses one pipeline or one per authority, and which authorities it may reach.
     /// </summary>
-    [ValidateObjectMembers]
-    public CircuitBreakerOptions CircuitBreaker { get; set; } = new();
-
-    /// <summary>
-    /// Rate limiter options (standard and hedging pipelines when enabled). Config key: "HttpResilienceOptions:RateLimiter".
-    /// </summary>
-    [ValidateObjectMembers]
-    public RateLimiterOptions RateLimiter { get; set; } = new();
-
-    /// <summary>
-    /// Fallback strategy options (both pipelines). Config key: "HttpResilienceOptions:Fallback".
-    /// </summary>
-    [ValidateObjectMembers]
-    public FallbackOptions Fallback { get; set; } = new();
-
-    /// <summary>
-    /// Hedging strategy options (used when PipelineOrder contains "Hedging"). Config key: "HttpResilienceOptions:Hedging".
-    /// </summary>
-    [ValidateObjectMembers]
-    public HedgingOptions Hedging { get; set; } = new();
-
-    /// <summary>
-    /// Bulkhead / concurrency limit options (both pipelines). Config key: "HttpResilienceOptions:Bulkhead".
-    /// </summary>
-    [ValidateObjectMembers]
-    public BulkheadOptions Bulkhead { get; set; } = new();
-
-    /// <summary>
-    /// Pipeline selection (e.g. per-authority). When Mode is "ByAuthority", a separate pipeline instance is used per request authority (scheme + host + port).
-    /// Config key: "HttpResilienceOptions:PipelineSelection".
-    /// </summary>
-    [ValidateObjectMembers]
-    public PipelineSelectionOptions PipelineSelection { get; set; } = new();
+    public PipelineSelectionOptions PipelineSelection { get; } = new();
 }

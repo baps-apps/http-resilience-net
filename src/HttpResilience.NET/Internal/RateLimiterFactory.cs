@@ -4,38 +4,31 @@ using HttpResilience.NET.Options;
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
-/// Creates <see cref="RateLimiter"/> instances from <see cref="RateLimiterOptions"/> for use in standard or hedging pipelines.
-/// Internal-only helper; not part of the public API.
+/// Builds a <see cref="RateLimiter"/> from configuration, using the BCL implementations directly.
 /// </summary>
 internal static class RateLimiterFactory
 {
-    /// <summary>
-    /// Creates a rate limiter from the given options (FixedWindow, SlidingWindow, or TokenBucket).
-    /// </summary>
-    public static RateLimiter CreateRateLimiter(RateLimiterOptions options)
+    public static RateLimiter Create(RateLimiterOptions options) => options.Algorithm switch
     {
-        return options.Algorithm switch
+        RateLimitAlgorithm.SlidingWindow => new SlidingWindowRateLimiter(new SlidingWindowRateLimiterOptions
         {
-            RateLimitAlgorithm.SlidingWindow => new SlidingWindowRateLimiter(new SlidingWindowRateLimiterOptions
-            {
-                PermitLimit = options.PermitLimit,
-                Window = TimeSpan.FromSeconds(options.WindowSeconds),
-                SegmentsPerWindow = options.SegmentsPerWindow,
-                QueueLimit = options.QueueLimit
-            }),
-            RateLimitAlgorithm.TokenBucket => new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
-            {
-                TokenLimit = options.TokenBucketCapacity,
-                TokensPerPeriod = options.TokensPerPeriod,
-                ReplenishmentPeriod = TimeSpan.FromSeconds(options.ReplenishmentPeriodSeconds),
-                QueueLimit = options.QueueLimit
-            }),
-            _ => new FixedWindowRateLimiter(new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = options.PermitLimit,
-                Window = TimeSpan.FromSeconds(options.WindowSeconds),
-                QueueLimit = options.QueueLimit
-            })
-        };
-    }
+            PermitLimit = options.PermitLimit!.Value,
+            Window = options.Window,
+            SegmentsPerWindow = options.SegmentsPerWindow,
+            QueueLimit = options.QueueLimit
+        }),
+        RateLimitAlgorithm.TokenBucket => new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = options.TokenLimit!.Value,
+            TokensPerPeriod = options.TokensPerPeriod!.Value,
+            ReplenishmentPeriod = options.ReplenishmentPeriod,
+            QueueLimit = options.QueueLimit
+        }),
+        _ => new FixedWindowRateLimiter(new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = options.PermitLimit!.Value,
+            Window = options.Window,
+            QueueLimit = options.QueueLimit
+        })
+    };
 }

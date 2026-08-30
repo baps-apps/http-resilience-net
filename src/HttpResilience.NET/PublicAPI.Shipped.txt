@@ -1,0 +1,140 @@
+#nullable enable
+HttpResilience.NET.Configuration.HttpResilienceConfigurationKeys
+HttpResilience.NET.Options.CircuitBreakerOptions
+HttpResilience.NET.Options.CircuitBreakerOptions.BreakDuration.get -> System.TimeSpan
+HttpResilience.NET.Options.CircuitBreakerOptions.BreakDuration.set -> void
+HttpResilience.NET.Options.CircuitBreakerOptions.CircuitBreakerOptions() -> void
+HttpResilience.NET.Options.CircuitBreakerOptions.FailureRatio.get -> double
+HttpResilience.NET.Options.CircuitBreakerOptions.FailureRatio.set -> void
+HttpResilience.NET.Options.CircuitBreakerOptions.MinimumThroughput.get -> int
+HttpResilience.NET.Options.CircuitBreakerOptions.MinimumThroughput.set -> void
+HttpResilience.NET.Options.CircuitBreakerOptions.SamplingDuration.get -> System.TimeSpan
+HttpResilience.NET.Options.CircuitBreakerOptions.SamplingDuration.set -> void
+HttpResilience.NET.Options.ConcurrencyLimiterOptions
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Backstop.get -> int
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Backstop.set -> void
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.ConcurrencyLimiterOptions() -> void
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Enabled.get -> bool
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Enabled.set -> void
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Limit.get -> int?
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.Limit.set -> void
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.QueueLimit.get -> int
+HttpResilience.NET.Options.ConcurrencyLimiterOptions.QueueLimit.set -> void
+HttpResilience.NET.Options.ConnectionOptions
+HttpResilience.NET.Options.ConnectionOptions.AllowAutoRedirect.get -> bool?
+HttpResilience.NET.Options.ConnectionOptions.AllowAutoRedirect.set -> void
+HttpResilience.NET.Options.ConnectionOptions.ConnectTimeout.get -> System.TimeSpan
+HttpResilience.NET.Options.ConnectionOptions.ConnectTimeout.set -> void
+HttpResilience.NET.Options.ConnectionOptions.ConnectionOptions() -> void
+HttpResilience.NET.Options.ConnectionOptions.EnableMultipleHttp2Connections.get -> bool
+HttpResilience.NET.Options.ConnectionOptions.EnableMultipleHttp2Connections.set -> void
+HttpResilience.NET.Options.ConnectionOptions.Enabled.get -> bool
+HttpResilience.NET.Options.ConnectionOptions.Enabled.set -> void
+HttpResilience.NET.Options.ConnectionOptions.MaxConnectionsPerServer.get -> int?
+HttpResilience.NET.Options.ConnectionOptions.MaxConnectionsPerServer.set -> void
+HttpResilience.NET.Options.ConnectionOptions.PooledConnectionIdleTimeout.get -> System.TimeSpan
+HttpResilience.NET.Options.ConnectionOptions.PooledConnectionIdleTimeout.set -> void
+HttpResilience.NET.Options.ConnectionOptions.PooledConnectionLifetime.get -> System.TimeSpan
+HttpResilience.NET.Options.ConnectionOptions.PooledConnectionLifetime.set -> void
+HttpResilience.NET.Options.HedgingOptions
+HttpResilience.NET.Options.HedgingOptions.Delay.get -> System.TimeSpan
+HttpResilience.NET.Options.HedgingOptions.Delay.set -> void
+HttpResilience.NET.Options.HedgingOptions.DisableForUnsafeHttpMethods.get -> bool
+HttpResilience.NET.Options.HedgingOptions.DisableForUnsafeHttpMethods.set -> void
+HttpResilience.NET.Options.HedgingOptions.HedgingOptions() -> void
+HttpResilience.NET.Options.HedgingOptions.MaxHedgedAttempts.get -> int
+HttpResilience.NET.Options.HedgingOptions.MaxHedgedAttempts.set -> void
+HttpResilience.NET.Options.HttpResilienceOptions
+HttpResilience.NET.Options.HttpResilienceOptions.CircuitBreaker.get -> HttpResilience.NET.Options.CircuitBreakerOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.ConcurrencyLimiter.get -> HttpResilience.NET.Options.ConcurrencyLimiterOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.Connection.get -> HttpResilience.NET.Options.ConnectionOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.Enabled.get -> bool
+HttpResilience.NET.Options.HttpResilienceOptions.Enabled.set -> void
+HttpResilience.NET.Options.HttpResilienceOptions.Hedging.get -> HttpResilience.NET.Options.HedgingOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.HttpResilienceOptions() -> void
+HttpResilience.NET.Options.HttpResilienceOptions.PipelineSelection.get -> HttpResilience.NET.Options.PipelineSelectionOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.RateLimiter.get -> HttpResilience.NET.Options.RateLimiterOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.Retry.get -> HttpResilience.NET.Options.RetryOptions!
+HttpResilience.NET.Options.HttpResilienceOptions.Timeout.get -> HttpResilience.NET.Options.TimeoutOptions!
+HttpResilience.NET.Options.PipelineSelectionMode
+HttpResilience.NET.Options.PipelineSelectionMode.ByAuthority = 1 -> HttpResilience.NET.Options.PipelineSelectionMode
+HttpResilience.NET.Options.PipelineSelectionMode.None = 0 -> HttpResilience.NET.Options.PipelineSelectionMode
+HttpResilience.NET.Options.PipelineSelectionOptions
+HttpResilience.NET.Options.PipelineSelectionOptions.Authorities.get -> System.Collections.Generic.List<string!>?
+HttpResilience.NET.Options.PipelineSelectionOptions.Authorities.set -> void
+HttpResilience.NET.Options.PipelineSelectionOptions.Mode.get -> HttpResilience.NET.Options.PipelineSelectionMode
+HttpResilience.NET.Options.PipelineSelectionOptions.Mode.set -> void
+HttpResilience.NET.Options.PipelineSelectionOptions.PipelineSelectionOptions() -> void
+HttpResilience.NET.Options.RateLimitAlgorithm
+HttpResilience.NET.Options.RateLimitAlgorithm.FixedWindow = 0 -> HttpResilience.NET.Options.RateLimitAlgorithm
+HttpResilience.NET.Options.RateLimitAlgorithm.SlidingWindow = 1 -> HttpResilience.NET.Options.RateLimitAlgorithm
+HttpResilience.NET.Options.RateLimitAlgorithm.TokenBucket = 2 -> HttpResilience.NET.Options.RateLimitAlgorithm
+HttpResilience.NET.Options.RateLimiterOptions
+HttpResilience.NET.Options.RateLimiterOptions.Algorithm.get -> HttpResilience.NET.Options.RateLimitAlgorithm
+HttpResilience.NET.Options.RateLimiterOptions.Algorithm.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.Enabled.get -> bool
+HttpResilience.NET.Options.RateLimiterOptions.Enabled.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.PermitLimit.get -> int?
+HttpResilience.NET.Options.RateLimiterOptions.PermitLimit.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.QueueLimit.get -> int
+HttpResilience.NET.Options.RateLimiterOptions.QueueLimit.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.RateLimiterOptions() -> void
+HttpResilience.NET.Options.RateLimiterOptions.ReplenishmentPeriod.get -> System.TimeSpan
+HttpResilience.NET.Options.RateLimiterOptions.ReplenishmentPeriod.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.SegmentsPerWindow.get -> int
+HttpResilience.NET.Options.RateLimiterOptions.SegmentsPerWindow.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.TokenLimit.get -> int?
+HttpResilience.NET.Options.RateLimiterOptions.TokenLimit.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.TokensPerPeriod.get -> int?
+HttpResilience.NET.Options.RateLimiterOptions.TokensPerPeriod.set -> void
+HttpResilience.NET.Options.RateLimiterOptions.Window.get -> System.TimeSpan
+HttpResilience.NET.Options.RateLimiterOptions.Window.set -> void
+HttpResilience.NET.Options.RetryBackoffType
+HttpResilience.NET.Options.RetryBackoffType.Constant = 0 -> HttpResilience.NET.Options.RetryBackoffType
+HttpResilience.NET.Options.RetryBackoffType.Exponential = 2 -> HttpResilience.NET.Options.RetryBackoffType
+HttpResilience.NET.Options.RetryBackoffType.Linear = 1 -> HttpResilience.NET.Options.RetryBackoffType
+HttpResilience.NET.Options.RetryOptions
+HttpResilience.NET.Options.RetryOptions.BackoffType.get -> HttpResilience.NET.Options.RetryBackoffType
+HttpResilience.NET.Options.RetryOptions.BackoffType.set -> void
+HttpResilience.NET.Options.RetryOptions.BaseDelay.get -> System.TimeSpan
+HttpResilience.NET.Options.RetryOptions.BaseDelay.set -> void
+HttpResilience.NET.Options.RetryOptions.DisableForUnsafeHttpMethods.get -> bool
+HttpResilience.NET.Options.RetryOptions.DisableForUnsafeHttpMethods.set -> void
+HttpResilience.NET.Options.RetryOptions.Enabled.get -> bool
+HttpResilience.NET.Options.RetryOptions.Enabled.set -> void
+HttpResilience.NET.Options.RetryOptions.MaxAttempts.get -> int?
+HttpResilience.NET.Options.RetryOptions.MaxAttempts.set -> void
+HttpResilience.NET.Options.RetryOptions.MaxRetries.get -> int
+HttpResilience.NET.Options.RetryOptions.MaxRetries.set -> void
+HttpResilience.NET.Options.RetryOptions.RetryOptions() -> void
+HttpResilience.NET.Options.RetryOptions.RetryableMethods.get -> System.Collections.Generic.List<string!>?
+HttpResilience.NET.Options.RetryOptions.RetryableMethods.set -> void
+HttpResilience.NET.Options.RetryOptions.UseJitter.get -> bool
+HttpResilience.NET.Options.RetryOptions.UseJitter.set -> void
+HttpResilience.NET.Options.RetryOptions.UseRetryAfterHeader.get -> bool
+HttpResilience.NET.Options.RetryOptions.UseRetryAfterHeader.set -> void
+HttpResilience.NET.Options.TimeoutOptions
+HttpResilience.NET.Options.TimeoutOptions.Attempt.get -> System.TimeSpan
+HttpResilience.NET.Options.TimeoutOptions.Attempt.set -> void
+HttpResilience.NET.Options.TimeoutOptions.Client.get -> System.TimeSpan?
+HttpResilience.NET.Options.TimeoutOptions.Client.set -> void
+HttpResilience.NET.Options.TimeoutOptions.TimeoutOptions() -> void
+HttpResilience.NET.Options.TimeoutOptions.Total.get -> System.TimeSpan
+HttpResilience.NET.Options.TimeoutOptions.Total.set -> void
+Microsoft.Extensions.DependencyInjection.HttpResilienceHealthCheckExtensions
+Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions
+Microsoft.Extensions.DependencyInjection.HttpResilienceServiceCollectionExtensions
+Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions
+const HttpResilience.NET.Configuration.HttpResilienceConfigurationKeys.ClientsSection = "Clients" -> string!
+const HttpResilience.NET.Configuration.HttpResilienceConfigurationKeys.RootSection = "HttpResilience" -> string!
+const Microsoft.Extensions.DependencyInjection.HttpResilienceHealthCheckExtensions.DependencyTag = "dependency" -> string!
+const Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions.MeterName = "HttpResilience.NET" -> string!
+const Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions.PollyMeterName = "Polly" -> string!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceHealthCheckExtensions.AddHttpResilience(this Microsoft.Extensions.DependencyInjection.IHealthChecksBuilder! builder, string! name = "http-resilience", System.Collections.Generic.IEnumerable<string!>? tags = null) -> Microsoft.Extensions.DependencyInjection.IHealthChecksBuilder!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceHealthCheckExtensions.AddHttpResilienceHealthChecks(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, string! name = "http-resilience", System.Collections.Generic.IEnumerable<string!>? tags = null) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions.AddHedgedHttpResilience(this Microsoft.Extensions.DependencyInjection.IHttpClientBuilder! builder, string? clientName = null, System.Action<HttpResilience.NET.Options.HttpResilienceOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.IHttpClientBuilder!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions.AddHttpResilience(this Microsoft.Extensions.DependencyInjection.IHttpClientBuilder! builder, string? clientName = null, System.Action<HttpResilience.NET.Options.HttpResilienceOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.IHttpClientBuilder!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceServiceCollectionExtensions.AddHttpResilience(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, Microsoft.Extensions.Configuration.IConfiguration! configuration) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceServiceCollectionExtensions.AddHttpResilience(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, Microsoft.Extensions.Configuration.IConfigurationSection! section) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceServiceCollectionExtensions.ValidateHttpResilienceClientsOnStart(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+static Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions.AddHttpResilienceTelemetry(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!

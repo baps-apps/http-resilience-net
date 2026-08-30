@@ -5,18 +5,50 @@
     <Nullable>enable</Nullable>
     <EnableSourceLink>true</EnableSourceLink>
     <PackageId>HttpResilience.NET</PackageId>
-    <Version>1.0.0</Version>
+    <Version>2.0.0</Version>
     <Authors>BAPS Dev Team</Authors>
-    <Description>Shared HTTP client resilience package: HttpResilienceOptions, SocketsHttpHandler factory, AddHttpResilienceOptions, AddHttpClientWithResilience.</Description>
+    <Description>Standardised HTTP client resilience for .NET services: a validated configuration schema, safe defaults (unsafe HTTP methods are never retried or hedged), connection-pool standardisation, bounded telemetry and a dependency health check, over Microsoft.Extensions.Http.Resilience and Polly.</Description>
     <PackageTags>http;resilience;polly;httpclient;retry;circuit-breaker</PackageTags>
     <PackageProjectUrl>https://github.com/baps-apps/http-resilience-net/</PackageProjectUrl>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) BAPS. All rights reserved.</Copyright>
+    <!-- Proprietary and internal, and now said so rather than left blank. PackageLicenseExpression is still
+         wrong here: an SPDX expression names an open-source grant, and nothing in this package is granted
+         outside the organization. What was wrong was shipping with no license metadata at all, which pack
+         does not warn about, so the nuspec asserted nothing and a consumer's legal or SCA review had nothing
+         to read but the copyright line. PackageLicenseFile carries the proprietary terms into the package
+         instead, where a dependency scanner and a person both find them.
+         Publishing target is nuget.pkg.github.com/baps-apps (see scripts/publish-package.ps1), never
+         nuget.org, and the license says so. -->
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <RepositoryUrl>https://github.com/baps-apps/http-resilience-net.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- Where a consumer hits the break is the NuGet page, not CHANGELOG.md. -->
+    <PackageReleaseNotes>2.0.0 is a rewrite with breaking changes. Removed: the configurable PipelineOrder (it was applied in reverse, silently inverting every multi-strategy pipeline), generic fallback and IHttpFallbackHandler, and the custom pipeline escape hatches. Renamed: Retry:MaxAttempts to Retry:MaxRetries, refused at startup rather than aliased. Moved: registration extension methods are now in the Microsoft.Extensions.DependencyInjection namespace, so replace 'using HttpResilience.NET.Extensions;' with 'using Microsoft.Extensions.DependencyInjection;'; options and configuration types are unchanged. New: unsafe HTTP methods are never retried or hedged without a per-client opt-in, neither guard may be switched off at the root section, and the root Retry:RetryableMethods allow-list may name only safe methods -- an unsafe entry there reached every client in the process, including ones registered later, and could silently override a client's own guard; a finite HttpClient.Timeout the platform handlers otherwise remove; a concurrency backstop that surfaces the standard handler's hidden 1,000-permit limiter; startup validation of unused client sections and of hedging keys on a standard client; a Warning at startup for every client that can repeat a mutating request, naming the section the allow-list is actually stated in; and an Information line stating the traffic each client's circuit breaker needs before it can open. Two changes land at the consumer boundary and will fail a service that previously started: every client this package configured is now created while the host starts, so a client whose handler chain cannot be built fails the deployment rather than a later request -- set HttpResilience:ValidateClientsOnStart to false to opt out; and an HttpClient.Timeout of exactly 100 seconds assigned through ConfigureHttpClient is refused like any other conflicting value instead of being silently replaced. Two connection-handler changes land here too: Connection:Enabled no longer reverses an AllowAutoRedirect of false that you set on your own SocketsHttpHandler (it was written from the resolved value, so a hardened handler had redirects switched back on by a connection-pool switch, and the runtime re-sends custom credential headers such as X-Api-Key across a redirect), and a redirect bound that cannot be applied at all, because the primary handler has no AllowAutoRedirect, now logs Warning event 13 instead of passing over in silence. Timeout:Client defaults to Timeout:Total plus 30 seconds rather than one minute. See CHANGELOG.md and docs/VERSIONING.md.</PackageReleaseNotes>
+
+    <!-- A shared package's public surface is a compatibility contract; validate it on every pack. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- The configuration binding source generator intercepts every Bind call in this assembly, so option
+         binding is generated code rather than reflection. That is what makes the trim and AOT declarations
+         below true rather than aspirational: with the analyzers on and TreatWarningsAsErrors, a reflective
+         binding call reintroduced here fails the build. tests/HttpResilience.NET.AotSmoke publishes Native
+         AOT and asserts the bound values at run time. -->
+    <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+    <IsTrimmable>true</IsTrimmable>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
   <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>HttpResilience.NET.Tests</_Parameter1>
@@ -24,17 +56,35 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>HttpResilience.NET.IntegrationTests</_Parameter1>
     </AssemblyAttribute>
+    <!-- The per-request cost of internal hot paths is measured, not assumed. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>HttpResilience.NET.Benchmarks</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="CodeStyle.NET" />
+    <!-- Analyzers only: PrivateAssets keeps them out of the dependency graph of every consumer. -->
+    <PackageReference Include="CodeStyle.NET" PrivateAssets="all" />
+    <!-- The public surface is a fleet-wide compatibility contract, and PackageValidation cannot gate it
+         until a baseline version exists on a feed. PublicAPI.Shipped.txt is that gate today: an accidental
+         addition or signature change fails the build and shows up as a diff in review. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <!-- AddMetrics/IMeterFactory. Referenced explicitly rather than taken transitively through
+         Http.Resilience: the meter's lifetime is a correctness property, not an incidental one. -->
+    <PackageReference Include="Microsoft.Extensions.Diagnostics" />
     <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" />
+    <!-- IHostedService, for the opt-in startup client probe. Referenced explicitly rather than taken
+         transitively through Diagnostics.HealthChecks: the package uses the type directly, and a transitive
+         reference that a future dependency trim removes would break the build with a confusing message. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
-    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
-    <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" />
     <PackageReference Include="Polly.Extensions" />
+    <PackageReference Include="Polly.RateLimiting" />
+    <PackageReference Include="System.Threading.RateLimiting" />
   </ItemGroup>
 </Project>
