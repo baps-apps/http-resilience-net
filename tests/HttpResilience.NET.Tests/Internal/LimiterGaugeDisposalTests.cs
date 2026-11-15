@@ -30,7 +30,7 @@ public class LimiterGaugeDisposalTests
     /// Production change that would make this fail: calling <c>GetStatistics()</c> without the disposal
     /// guard in <c>HttpResilienceMetrics.ObserveLimiters</c>.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ADisposedLimiter_DoesNotThrowOutOfTheGaugeCallback()
     {
         var services = new ServiceCollection();
@@ -40,6 +40,7 @@ public class LimiterGaugeDisposalTests
 
         using ServiceProvider provider = services.BuildServiceProvider();
         var metrics = provider.GetRequiredService<HttpResilienceMetrics>();
+        metrics.Publish();
 
         var limiter = new FixedWindowRateLimiter(new FixedWindowRateLimiterOptions
         {
@@ -55,7 +56,7 @@ public class LimiterGaugeDisposalTests
 
         // Fails with ObjectDisposedException without the guard.
         IReadOnlyList<Measurement> permits =
-            collector.Collect("http.resilience.limiter.available_permits");
+            collector.Collect("http_resilience.limiter.available_permits");
 
         Assert.Empty(permits);
     }
@@ -64,7 +65,7 @@ public class LimiterGaugeDisposalTests
     /// The guard must drop only the limiter that is gone. A container with one live client and one disposed
     /// limiter still has a number to report for the live one.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ALiveLimiter_IsStillReported_AlongsideADisposedOne()
     {
         var services = new ServiceCollection();
@@ -74,6 +75,7 @@ public class LimiterGaugeDisposalTests
 
         using ServiceProvider provider = services.BuildServiceProvider();
         var metrics = provider.GetRequiredService<HttpResilienceMetrics>();
+        metrics.Publish();
 
         using var live = new FixedWindowRateLimiter(new FixedWindowRateLimiterOptions
         {
@@ -96,9 +98,9 @@ public class LimiterGaugeDisposalTests
         using var collector = new GaugeCollector(provider);
 
         Measurement permits = Assert.Single(
-            collector.Collect("http.resilience.limiter.available_permits"));
+            collector.Collect("http_resilience.limiter.available_permits"));
 
         Assert.Equal(7, permits.Value);
-        Assert.Equal("live", permits.Tag("http.client.name"));
+        Assert.Equal("live", permits.Tag("http_resilience.client.name"));
     }
 }

@@ -6,7 +6,7 @@ namespace HttpResilience.NET.Tests.Behavior;
 
 public class RetryTests
 {
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RetriesTransientFailures_ThenReturnsSuccess()
     {
         var origin = new RecordingHandler((request, attempt, _) => Task.FromResult(
@@ -17,13 +17,13 @@ public class RetryTests
 
         await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled(), origin);
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(3, origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task StopsAtMaxRetries()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -32,34 +32,33 @@ public class RetryTests
                 // The budget must fit the schedule: 5 attempts of 10s needs a 50s total.
                 .Set("Timeout:Total", "00:01:00"));
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(5, harness.Origin.Count);
     }
 
     /// <summary>
-    /// Disabling retries is the most common request during an incident, so the supported spelling of it must
-    /// work. Setting the attempt count to zero is rejected at startup instead, because the underlying strategy
-    /// requires at least one.
+    /// <c>Retry:Enabled: false</c> is the supported way to disable retries. A retry count of zero is rejected
+    /// at startup, because the underlying strategy requires at least one.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Disabled_MakesExactlyOneAttempt()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled().Set("Retry:Enabled", "false"));
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(1, harness.Origin.Count);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Disabled_StillAppliesTimeoutsAndCircuitBreaker()
     {
         var origin = new RecordingHandler(async (_, _, cancellationToken) =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK);
         });
 
@@ -70,10 +69,10 @@ public class RetryTests
                 .Set("Timeout:Total", "00:00:02"),
             origin);
 
-        await Assert.ThrowsAsync<Polly.Timeout.TimeoutRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<Polly.Timeout.TimeoutRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData(HttpStatusCode.RequestTimeout)]
     [InlineData(HttpStatusCode.TooManyRequests)]
     [InlineData(HttpStatusCode.InternalServerError)]
@@ -85,12 +84,12 @@ public class RetryTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled(), new RecordingHandler(status));
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, harness.Origin.Count);
     }
 
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData(HttpStatusCode.BadRequest)]
     [InlineData(HttpStatusCode.Unauthorized)]
     [InlineData(HttpStatusCode.Forbidden)]
@@ -101,13 +100,13 @@ public class RetryTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled(), new RecordingHandler(status));
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(1, harness.Origin.Count);
         Assert.Equal(status, response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RetriesHttpRequestException_AndSurfacesItWhenAttemptsAreExhausted()
     {
         var origin = new RecordingHandler((_, _, _) =>
@@ -116,13 +115,13 @@ public class RetryTests
         await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled(), origin);
 
         // The original exception reaches the caller; it is not wrapped in a package-specific type.
-        HttpRequestException exception = await Assert.ThrowsAsync<HttpRequestException>(() => harness.GetAsync());
+        HttpRequestException exception = await Assert.ThrowsAsync<HttpRequestException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
 
         Assert.Equal("connection refused", exception.Message);
         Assert.Equal(3, origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HonoursRetryAfterHeader()
     {
         var origin = new RecordingHandler((request, attempt, _) =>
@@ -145,7 +144,7 @@ public class RetryTests
             Settings.Enabled().Set("Retry:BaseDelay", "00:00:00"), origin);
 
         long start = Environment.TickCount64;
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
         long elapsed = Environment.TickCount64 - start;
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -155,7 +154,7 @@ public class RetryTests
         Assert.True(elapsed >= 300, $"Expected the Retry-After delay to be honoured, waited {elapsed}ms.");
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RetryAfterHeader_CanBeIgnored()
     {
         var origin = new RecordingHandler((request, attempt, _) =>
@@ -181,7 +180,7 @@ public class RetryTests
             origin);
 
         long start = Environment.TickCount64;
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.True(Environment.TickCount64 - start < 5_000, "A 30 second Retry-After should have been ignored.");
     }

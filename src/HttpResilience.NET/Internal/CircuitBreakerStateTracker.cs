@@ -27,13 +27,8 @@ internal readonly record struct CircuitKey(string Client, string Authority)
 }
 
 /// <summary>
-/// Tracks the live state of every circuit breaker this library configures, so a health check can report it.
+/// Tracks the live state of every circuit breaker this library configures, so the state gauge can report it.
 /// </summary>
-/// <remarks>
-/// Keyed by client <b>and</b> authority. Under per-authority pipeline selection one client owns several
-/// breakers, and collapsing them onto the client name alone means the last callback to fire overwrites the
-/// others -- so one host recovering would mask another still being open.
-/// </remarks>
 internal sealed class CircuitBreakerStateTracker
 {
     private readonly ConcurrentDictionary<CircuitKey, CircuitState> _states = new();

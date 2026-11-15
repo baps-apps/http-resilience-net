@@ -1,0 +1,23 @@
+# Owners are requested for review on every pull request that touches their paths; with branch protection's
+# "Require review from Code Owners", their approval is required to merge. The last matching pattern wins.
+#
+# Prefer an organization team to a person, so reviews do not stop when one person is away, for example
+# `* @baps-apps/platform-engineering`. The team needs write access to the repository.
+
+# Everything.
+* @contactvpatel
+
+# Release and supply chain: what is published, from which feed, and with which dependencies.
+/scripts/                    @contactvpatel
+/nuget.config                @contactvpatel
+/Directory.Packages.props    @contactvpatel
+/Directory.Build.props       @contactvpatel
+/src/HttpResilience.NET/HttpResilience.NET.csproj  @contactvpatel
+
+# The public API surface and the guarantees the package makes about unsafe methods and destinations.
+/src/HttpResilience.NET/PublicAPI.*.txt                    @contactvpatel
+/src/HttpResilience.NET/Internal/HttpMethodPredicates.cs   @contactvpatel
+/src/HttpResilience.NET/Internal/RootSectionRules.cs       @contactvpatel
+/src/HttpResilience.NET/Internal/AuthorityAllowListHandler.cs  @contactvpatel
+/SECURITY.md                 @contactvpatel
+/docs/SECURITY-GOVERNANCE.md @contactvpatel

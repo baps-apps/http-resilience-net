@@ -1,6 +1,5 @@
 using System.Collections;
 using System.Reflection;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Tests.Internal;
 
@@ -9,17 +8,9 @@ namespace HttpResilience.NET.Tests.Internal;
 /// the root's.
 /// </summary>
 /// <remarks>
-/// Scalars override because the binder assigns only keys that are present. Collections do not: the binder
-/// <i>adds</i> to a non-null collection rather than replacing it, so a client section that states a list of
-/// its own accumulates the root's entries on top of it. Both of the schema's lists are allow-lists, so that
-/// is the unsafe direction, and <c>HttpClientBuilderExtensions.ResetListsStatedBy</c> clears each one the
-/// client actually states.
-/// <para>
-/// That method names its two paths as literals, which means a third list added to the schema would inherit
-/// the original defect in silence. Reflection rather than a hand-maintained list, for the same reason
-/// <c>OptionsCopierTests</c> uses it: a hand-maintained list needs the same edit the fix needs, so it would
-/// be forgotten at the same moment.
-/// </para>
+/// The binder adds to an existing collection instead of replacing it, so
+/// <c>HttpClientBuilderExtensions.ResetListsStatedBy</c> clears each list a client states. It names its paths
+/// as literals, so this uses reflection to catch a new list added to the schema.
 /// </remarks>
 public class ListOverrideCoverageTests
 {
@@ -35,7 +26,7 @@ public class ListOverrideCoverageTests
     /// <summary>
     /// Fails when a collection property is added to the schema without being cleared for a client override.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void EveryCollectionInTheSchema_IsClearedBeforeAClientSectionIsBound()
     {
         List<string> collections = [];
@@ -50,7 +41,7 @@ public class ListOverrideCoverageTests
             "than replace them. Add each to HttpClientBuilderExtensions.ResetListsStatedBy and to the " +
             $"_handled list here: {string.Join(", ", unhandled)}");
 
-        // The reverse direction too: a path here that no longer exists means the fix stopped matching.
+        // The reverse direction too: a listed path that no longer exists in the schema.
         string[] stale = [.. _handled.Except(collections, StringComparer.Ordinal)];
 
         Assert.True(stale.Length == 0,

@@ -1,40 +1,20 @@
 # Recipes
 
-> A retried request must carry **replayable** content. A retry re-sends the same `HttpRequestMessage`, so
-> `StringContent`, `ByteArrayContent` and `JsonContent` replay correctly and a single-pass stream does not:
-> measured against a real endpoint, a `StreamContent` over a non-seekable stream retried three times delivers
-> the body once and then an empty body twice, without throwing. Buffer it with
-> `await content.LoadIntoBufferAsync()`, or build fresh content per attempt. This matters for any client with
-> a mutating method in `Retry:RetryableMethods`.
+Every recipe assumes `builder.Services.AddHttpResilience(builder.Configuration);` once in `Program.cs`.
 
 ## Internal API, ordinary traffic
 
-Root defaults are already this. Nothing per-client is needed.
-
-```json
-{
-  "HttpResilience": {
-    "Enabled": true,
-    "Timeout": { "Total": "00:00:20", "Attempt": "00:00:05" },
-    "Retry": { "MaxRetries": 2, "BaseDelay": "00:00:00.500" }
-  }
-}
-```
+The defaults: 20 s total, 5 s per attempt, 2 retries from 500 ms with jitter, safe methods only. Nothing to
+configure.
 
 ```csharp
-builder.Services.AddHttpResilience(builder.Configuration);
-builder.Services.AddHttpClient<IOrdersApi, OrdersApi>().AddHttpResilience();
+builder.Services.AddHttpClient<IOrdersApi, OrdersApi>().AddHttpResilienceHandler("Orders");
 ```
 
-> A typed client's section name comes from `IHttpClientFactory`, not from this schema, and for the
-> two-generic overload it is `TClient`: the registration above reads `HttpResilience:Clients:IOrdersApi`.
-> Nothing is needed here because this recipe states no per-client section — but the moment one is wanted,
-> pass the name (`AddHttpResilience("Orders")`) rather than guessing it. A section no client reads fails
-> startup, so a wrong guess is loud rather than silent.
+Passing `"Orders"` makes the client read `HttpResilience:Clients:Orders`; without it a typed client reads
+`Clients:IOrdersApi`.
 
 ## A slow endpoint (reports, exports)
-
-The retry schedule has to fit the total budget or startup fails, so widen both.
 
 ```json
 {
@@ -50,33 +30,28 @@ The retry schedule has to fit the total budget or startup fails, so widen both.
 }
 ```
 
-`SamplingDuration` must be at least double `Timeout:Attempt`. A low-traffic client also needs a lower `MinimumThroughput`, or its breaker never engages.
+`SamplingDuration` must be at least 2 × `Attempt`. A quiet client needs a low `MinimumThroughput`, or its
+breaker never opens.
 
 ## Retrying a POST safely
 
-Only when the endpoint deduplicates on an idempotency key.
+Only when the endpoint deduplicates on an idempotency key:
 
 ```json
-{
-  "HttpResilience": {
-    "Clients": {
-      "Payments": {
-        "Retry": { "MaxRetries": 2, "RetryableMethods": [ "GET", "POST" ] }
-      }
-    }
-  }
-}
+{ "HttpResilience": { "Clients": { "Payments": { "Retry": { "RetryableMethods": [ "GET", "POST" ] } } } } }
 ```
-
-Set the key on the request, not in resilience configuration:
 
 ```csharp
 request.Headers.TryAddWithoutValidation("Idempotency-Key", operationId.ToString());
 ```
 
+Only the listed methods are retried, so HEAD, OPTIONS and TRACE are not, here. The client logs startup Warning
+event 10. This belongs in the client's section; the root may list only safe methods. Retried content must be
+replayable: buffer a `StreamContent` with `LoadIntoBufferAsync()`.
+
 ## Respecting a third-party quota
 
-A vendor allows 300 requests per minute and you run 6 replicas.
+A vendor allows 300 requests per minute; you run 6 replicas:
 
 ```json
 {
@@ -85,10 +60,10 @@ A vendor allows 300 requests per minute and you run 6 replicas.
       "Vendor": {
         "RateLimiter": {
           "Enabled": true,
-          "Algorithm": "TokenBucket",
-          "TokenLimit": 50,
-          "TokensPerPeriod": 50,
-          "ReplenishmentPeriod": "00:01:00",
+          "Algorithm": "SlidingWindow",
+          "PermitLimit": 50,
+          "Window": "00:01:00",
+          "SegmentsPerWindow": 6,
           "QueueLimit": 10
         }
       }
@@ -97,32 +72,27 @@ A vendor allows 300 requests per minute and you run 6 replicas.
 }
 ```
 
-`300 ÷ 6 replicas = 50` per replica per minute. If the replica count changes, this number is wrong — it is a deploy-time constant, not a global quota. `TokenBucket` smooths bursts; `FixedWindow` allows a double burst across a window boundary.
+`300 ÷ 6 = 50` per replica. **The limiter is process-local and cannot enforce a cluster-wide quota**: if the
+replica count changes or a second client calls the vendor, this number is wrong. Enforce a true global quota at
+a gateway. `SlidingWindow` avoids `FixedWindow`'s double burst across a window boundary. Queued requests wait
+outside `Timeout:Total`.
 
 ## Protecting your own capacity
 
-Stop one slow dependency from consuming all your outbound concurrency.
+Stop one slow dependency from tying up all your outbound concurrency:
 
 ```json
-{
-  "HttpResilience": {
-    "Clients": {
-      "Legacy": {
-        "ConcurrencyLimiter": { "Enabled": true, "Limit": 20, "QueueLimit": 50 }
-      }
-    }
-  }
-}
+{ "HttpResilience": { "Clients": { "Legacy": { "ConcurrencyLimiter": { "Enabled": true, "Limit": 20, "QueueLimit": 50 } } } } }
 ```
 
-Keep `QueueLimit` small — it is capped at 1,000, and long before that a queue stops being backpressure. Queued requests hold their content buffers in memory for as long as they wait, and the wait is outside `Timeout:Total`.
+One slot covers a request and its retries. `Limit` must be at most `ConcurrencyLimiter:Backstop` (1,000). Keep
+`QueueLimit` small: the wait is outside `Timeout:Total`. Watch
+`http_resilience.limiter.queued_requests{http_resilience.limiter.kind="concurrency"}`.
 
-`ConcurrencyLimiter:Limit` must be at most `ConcurrencyLimiter:Backstop` (1,000 by default). The backstop is the platform's own limiter, applied inside the handler, so a `Limit` above it is never reached — the excess would be rejected there rather than queued here. Startup validation rejects that combination, and that rule is also what makes it safe to skip the separate backstop handler when a client enables both a rate limiter and a cap of its own: the cap is then the tighter bound.
-
-## Tail latency on a replicated read
+## Tail latency on a replicated read (hedging)
 
 ```csharp
-builder.Services.AddHttpClient("Search").AddHedgedHttpResilience();
+builder.Services.AddHttpClient("Search").AddHttpResilienceHedgingHandler();
 ```
 
 ```json
@@ -132,18 +102,16 @@ builder.Services.AddHttpClient("Search").AddHedgedHttpResilience();
       "Search": {
         "Timeout": { "Total": "00:00:06", "Attempt": "00:00:02" },
         "Hedging": { "Delay": "00:00:00.300", "MaxHedgedAttempts": 1 },
-        "PipelineSelection": {
-          "Authorities": [ "https://search.internal" ]
-        }
+        "PipelineSelection": { "Authorities": [ "https://search.internal" ] }
       }
     }
   }
 }
 ```
 
-Set `Delay` above your p50 so the primary attempt usually wins outright. A `Delay` of zero issues every attempt at once and multiplies load unconditionally.
-
-`Authorities` is required here. The hedging handler keeps a circuit breaker, a concurrency limiter and a metric series per authority for the life of the process, so the set of destinations has to be fixed at deploy time; a request to an unlisted authority is rejected before it reaches the pipeline.
+Set `Delay` near the dependency's p95, so only slow requests are hedged (zero hedges every request).
+`Timeout:Total` must be at least `Delay × MaxHedgedAttempts + Attempt`. Only safe methods are hedged,
+redirects are not followed, and unlisted hosts are refused.
 
 ## One client, several hosts
 
@@ -162,9 +130,9 @@ Set `Delay` above your p50 so the primary attempt usually wins outright. A `Dela
 }
 ```
 
-Each listed authority gets its own circuit breaker. Anything unlisted shares one pipeline, which is what keeps the pipeline count fixed regardless of what hosts requests are aimed at.
-
-Limits are not partitioned this way: `RateLimiter` and `ConcurrencyLimiter` budgets are per client and shared across authorities, because they bound this process's own capacity rather than one host's health.
+Each listed host gets its own circuit breaker; unlisted hosts share one pipeline. Rate and concurrency limits
+stay per client. Without a rate limiter the backstop is per pipeline, so two hosts allow up to 3 × `Backstop`
+in flight.
 
 ## Turning resilience off during an incident
 
@@ -172,23 +140,26 @@ Limits are not partitioned this way: `RateLimiter` and `ConcurrencyLimiter` budg
 { "HttpResilience": { "Enabled": false } }
 ```
 
-Requests then pass straight through with no retries, timeouts or breaker. Connection settings still apply — `Connection` is independent of `Enabled`, so you do not silently lose connection-pool tuning at the same time.
+The root kill switch overrides every client section and code delegate; each client logs startup Warning event
+6. Requests pass straight through (no retries, timeouts, breaker or limiters; `HttpClient.Timeout` is back to
+its 100 s default). `Connection` settings, including a hedged client's redirect bound, still apply. For one
+client, use `HttpResilience:Clients:{name}:Enabled: false`.
 
-To keep timeouts and the circuit breaker but stop amplifying load, disable only retries:
+To keep timeouts and the breaker but stop adding load, disable only retries:
 
 ```json
 { "HttpResilience": { "Retry": { "Enabled": false } } }
 ```
 
-Both require a restart.
+Both need a restart.
 
 ## Something the schema does not cover
 
-Use the platform API directly. It is already referenced.
+Add a platform handler after this package's; it sits inside this pipeline:
 
 ```csharp
 builder.Services.AddHttpClient("Legacy")
-    .AddHttpResilience()
+    .AddHttpResilienceHandler()
     .AddResilienceHandler("legacy-quirk", pipeline =>
         pipeline.AddRetry(new HttpRetryStrategyOptions
         {
@@ -197,106 +168,103 @@ builder.Services.AddHttpClient("Legacy")
         }));
 ```
 
-Handlers added after `AddHttpResilience` sit inside its pipeline.
+What you add is yours: this package's validation and safe-method guard do not apply, so the retry above repeats
+a POST too. **Use `AddResilienceHandler`, never `AddStandardResilienceHandler`**: the latter nests a second
+pipeline (9 origin calls instead of 3, total timeout applied twice) and is only reported (event 12).
 
-**`AddResilienceHandler`, not `AddStandardResilienceHandler`.** The names are one word apart and the outcomes
-are not:
+## A .NET Aspire service (ServiceDefaults)
+
+ServiceDefaults add the platform's standard handler to every client via `ConfigureHttpClientDefaults`. Keep
+them as they are. On each client this package configures, that handler is replaced by this package's pipeline
+(event 17, Information, once per client), so the two never nest; every other client keeps it. No extra call is
+needed, and registration order does not matter:
 
 ```csharp
-// DO NOT. Nests a second pipeline: retries multiply rather than add, so three configured
-// attempts become NINE origin calls, and the total timeout is applied twice. Nothing throws.
-builder.Services.AddHttpClient("Legacy")
-    .AddHttpResilience()
-    .AddStandardResilienceHandler();
+builder.AddServiceDefaults();
+builder.Services.AddHttpResilience(builder.Configuration);
+
+builder.Services.AddHttpClient("Orders").AddHttpResilienceHandler();
 ```
 
-A second `AddHttpResilience` fails at startup; the platform call above does not, because the package cannot
-tell it from the recommended line — both add a `ResilienceHandler`, and the difference is an internal field. It
-is reported at Information (event 12), naming both possibilities.
+This package's pipeline takes the replaced handler's place, so service discovery, which ServiceDefaults add
+inside it, stays inside: every retry and hedged attempt is resolved again (and can reach another endpoint), and
+`PipelineSelection:Authorities` lists the logical names the code calls (`https://catalog`), not resolved
+addresses. Keep `AddStandardResilienceHandler()` in ServiceDefaults for that reason. Removing it while keeping
+`AddServiceDiscovery()` leaves nothing to replace, so the resolver stays outside this package's pipeline: every
+retry goes to the endpoint resolved once, and a hedged client refuses the resolved address.
+
+A client with `Enabled: false` (or the root kill switch) loses the defaults' handler too (event 19), so it has
+no resilience at all: the platform's standard handler retries every method, POST included, so falling back to
+it would make the kill switch repeat mutations. `RemoveAllResilienceHandlers()` is unnecessary: before
+`AddHttpResilienceHandler()` it is harmless; after it, it removes this package's pipeline (event 16).
+
+## Migrating from Microsoft.Extensions.Http.Polly (Polly v7)
+
+Remove `AddPolicyHandler`, `AddTransientHttpErrorPolicy` and `AddPolicyHandlerFromRegistry` from every client
+this package configures, including any in `ConfigureHttpClientDefaults`. They are not replaced: a v7 retry left
+in place nests with this package's pipeline (one failing GET reaches the origin twelve times with a v7 retry
+of three) and its predicate retries POST. Each such client logs startup **Warning event 20**.
+
+| Polly v7 policy | Here |
+| --- | --- |
+| `RetryAsync` / `WaitAndRetryAsync` | `Retry:MaxRetries`, `BaseDelay`, `BackoffType`, `UseJitter` |
+| `TimeoutAsync` | `Timeout:Attempt` (per attempt) or `Timeout:Total` |
+| `CircuitBreakerAsync` / `AdvancedCircuitBreakerAsync` | `CircuitBreaker:*` |
+| `BulkheadAsync` | `ConcurrencyLimiter:Limit` and `QueueLimit` |
+| anything else | `AddResilienceHandler` after `AddHttpResilienceHandler` |
 
 ## Adjusting one value in code
 
 ```csharp
 builder.Services.AddHttpClient("Orders")
-    .AddHttpResilience(configure: options => options.Retry.MaxRetries = 1);
+    .AddHttpResilienceHandler(options => options.Retry.MaxRetries = 1);
 ```
 
-The delegate runs after configuration binding, and the result is validated like any other configuration.
+Runs after configuration binding and is validated like configuration. It can change anything, including
+`Enabled` and the limiter switches.
 
-`services.Configure<HttpResilienceOptions>("Orders", …)` and `services.PostConfigure<HttpResilienceOptions>("Orders", …)` work too, and reach the pipeline: it reads these options when it is built, which is after every configuration stage has run. The `configure` parameter above is still the clearest place to put it, because the change sits on the line that registers the client.
+## One configuration file shared by many services
 
-The exception is a setting that decides **which handlers the client has** — `Enabled`, `RateLimiter:Enabled`, `ConcurrencyLimiter:Enabled`, `PipelineSelection:Mode`, `Connection:Enabled`, and `Connection:AllowAutoRedirect` when it resolves to `false`. A client's handler chain is composed while the service collection is being built, so a later change to one of those would be reported without being in effect. Startup fails instead, with a message naming the setting. Use the `configure` parameter or the configuration section for those.
+An organization-wide file, a config server or a shared Helm values file usually lists more clients than any one
+service registers, and is read by services on different versions of this package. Both fail startup by default
+(an unused `Clients` section, a key an older version does not know).
 
-## Setting `HttpClient.Timeout`
-
-Use `Timeout:Client`. Setting it in code fails at client creation:
-
-```csharp
-// Fails: "State it as Timeout:Client instead."
-builder.Services.AddHttpClient("Reports")
-    .AddHttpResilience()
-    .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromMinutes(5));
-```
+State the version the file was written for, and allow unused sections. A service on an older minor version
+then starts and logs the keys it does not know yet (Warning event 18, naming each), while a misspelled key in a
+file written for that service's own version still fails startup. A file stating a newer major fails startup:
+keep one file per major during a major upgrade.
 
 ```json
 {
   "HttpResilience": {
+    "SchemaVersion": "3.1",
+    "AllowUnusedClientSections": true,
+    "Timeout": { "Total": "00:00:20", "Attempt": "00:00:05" },
     "Clients": {
-      "Reports": {
-        "Timeout": { "Total": "00:02:00", "Attempt": "00:00:30", "Client": "00:05:00" }
-      }
+      "Orders":   { "Timeout": { "Total": "00:00:10" } },
+      "Payments": { "Retry": { "RetryableMethods": [ "GET", "POST" ] } }
     }
   }
 }
 ```
 
-The reason is that `Timeout:Client` is validated to be strictly greater than `Timeout:Total`, and a value set in
-code is outside the schema where validation cannot see it. At or below the total budget it truncates the
-pipeline instead of backing it up, with a bare `TaskCanceledException` carrying none of the pipeline's context.
+Raise `SchemaVersion` only when the file starts using a key a newer version added: until then every service keeps
+full typo checking. While it is ahead, on the older services a misspelled key in that file is only a warning,
+and a misnamed section configures nothing. Keep each service's own overrides in its own `appsettings.json`,
+where the checks stay on, and review the shared file. A value out of range fails startup either way.
 
-Every other use of `ConfigureHttpClient` — a default header, a base address — is untouched.
+`AllowUnknownKeys: true` (in configuration, or `options.AllowUnknownKeys = true` on
+`HttpResilienceStartupOptions` in code) turns the unknown-key check off entirely, warning included. Prefer
+`SchemaVersion`.
 
-## Exporting any of this to a collector
+## Setting `HttpClient.Timeout`
 
-The package references no OpenTelemetry package. It publishes on a `Meter` and an `ILogger`, and nothing leaves
-the process until the service wires an SDK — with none wired, everything below is silent and no error says so.
+Use `Timeout:Client`; it must be greater than `Timeout:Total`:
 
-```csharp
-builder.Services.AddHttpResilienceTelemetry();   // the error.type tag. Registers no meter.
-
-builder.Services.AddOpenTelemetry()
-    .WithMetrics(metrics => metrics
-        .AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName)  // "Polly"
-        .AddMeter(HttpResilienceTelemetryExtensions.MeterName)       // "HttpResilience.NET"
-        .AddHttpClientInstrumentation()
-        .AddOtlpExporter())
-    .WithTracing(tracing => tracing
-        .AddHttpClientInstrumentation()   // one span per attempt; this package adds none
-        .AddOtlpExporter());
-
-builder.Logging.AddOpenTelemetry(logging => logging.AddOtlpExporter());
+```json
+{ "HttpResilience": { "Clients": { "Reports": { "Timeout": { "Total": "00:02:00", "Attempt": "00:00:15", "Client": "00:05:00" } } } } }
 ```
 
-Services on `OpenTelemetry.NET` package call `AddObservability(configuration)` instead. From **2.7.0**
-both meter names are registered by default, so there is nothing to configure; on **2.6.x or earlier** add them to
-`OpenTelemetryOptions:Meters`. `AddHttpResilienceTelemetry()` is its own call at every version. Signal-by-signal
-detail is in [OPERATIONS.md](OPERATIONS.md#the-packages-own-instruments).
-
-## Watching a limiter fill up before it rejects
-
-```csharp
-metrics.AddMeter(HttpResilienceTelemetryExtensions.MeterName);
-```
-
-```text
-http.resilience.limiter.available_permits{http.client.name="Orders", http.resilience.limiter.kind="concurrency"}
-http.resilience.limiter.queued_requests{http.client.name="Orders", http.resilience.limiter.kind="concurrency"}
-```
-
-`kind` is `rate`, `concurrency` or `backstop`. Graph `queued_requests` for any client with a `QueueLimit` above
-0: that wait happens **outside** `Timeout:Total`, so it is latency no pipeline timeout explains.
-
-The `backstop` series exists only when a rate limiter has displaced the backstop into a handler of its own. In
-the ordinary case Polly builds it inside its own limiter slot, one per pipeline — which is what makes it per
-authority under `ByAuthority` — so there is no instance to read. Set `ConcurrencyLimiter:Limit` if you need a
-concurrency number you can watch.
+`.ConfigureHttpClient(c => c.Timeout = ...)` with a different value fails client creation. A typed client's
+constructor that sets `Timeout` is not detected and can truncate the pipeline. Other `ConfigureHttpClient`
+settings (headers, base address) are untouched.

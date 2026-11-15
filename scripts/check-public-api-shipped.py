@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """Fails when PublicAPI.Unshipped.txt still holds API on a tagged (release) build.
 
-PublicApiAnalyzers gates *changes* to the public surface on every build: an addition that is not recorded in
-one of the two files is a build error. What it does not gate is the release step -- moving the accumulated
-Unshipped entries into Shipped when a version ships. That step is a human one, and if it is skipped the two
-files stop meaning anything: everything lives in Unshipped forever, and "this member has shipped" becomes
-unanswerable from the repository.
-
-So this runs only on a tag. `docs/VERSIONING.md` says the contents of PublicAPI.Unshipped.txt move into
-PublicAPI.Shipped.txt at release; this is what makes that sentence enforced rather than remembered.
+PublicApiAnalyzers gates changes to the public surface on every build; this gates the release step of moving
+Unshipped entries into Shipped (see docs/VERSIONING.md). Runs only on tags.
 """
 
 import pathlib

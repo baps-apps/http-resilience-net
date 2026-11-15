@@ -1,0 +1,3 @@
+# Raw BenchmarkDotNet reports are generated verbatim: their two trailing spaces are markdown line breaks.
+docs/benchmarks/*.md -whitespace
+docs/benchmarks/README.md whitespace

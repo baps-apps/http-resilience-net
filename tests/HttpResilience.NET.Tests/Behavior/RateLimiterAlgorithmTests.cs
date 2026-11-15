@@ -7,15 +7,9 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// Every algorithm the schema offers is driven to genuine exhaustion.
 /// </summary>
 /// <remarks>
-/// <c>RateLimiterFactory</c> maps the schema onto three BCL limiter types, and only <c>FixedWindow</c> was
-/// ever exercised end to end. The two remaining branches carry the mistake a factory of this shape invites:
-/// <c>TokenBucketRateLimiterOptions</c> has two adjacent <c>int</c> properties, <c>TokenLimit</c> (capacity)
-/// and <c>TokensPerPeriod</c> (refill rate), and transposing them compiles, passes every other test, and
-/// gives a client a sustained rate it never asked for.
-/// <para>
-/// Every budget here is spent inside a window long enough that no replenishment can occur during the test,
-/// so the assertions are counts rather than timings.
-/// </para>
+/// <c>RateLimiterFactory</c> maps the schema onto three BCL limiter types. <c>TokenLimit</c> (capacity) and
+/// <c>TokensPerPeriod</c> (refill rate) are adjacent <c>int</c> properties; transposing them would compile.
+/// Each budget is spent within a window too long to replenish, so assertions are counts, not timings.
 /// </remarks>
 public class RateLimiterAlgorithmTests
 {
@@ -36,7 +30,7 @@ public class RateLimiterAlgorithmTests
     /// Fails for any algorithm whose budget key is mapped to the wrong property: the request count admitted
     /// before the first rejection is the configured capacity, whichever algorithm is selected.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("FixedWindow")]
     [InlineData("SlidingWindow")]
     [InlineData("TokenBucket")]
@@ -46,10 +40,10 @@ public class RateLimiterAlgorithmTests
 
         for (int i = 0; i < 3; i++)
         {
-            (await harness.GetAsync()).Dispose();
+            (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
         }
 
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(3, harness.Origin.Count);
     }
 
@@ -58,7 +52,7 @@ public class RateLimiterAlgorithmTests
     /// the assertion that separates them: with a capacity of 3 and a refill of 1 per hour, three requests are
     /// admitted immediately. Transposed, the bucket would hold one token and only one would get through.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TokenBucket_TakesItsCapacityFromTokenLimit_NotFromTokensPerPeriod()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -73,18 +67,17 @@ public class RateLimiterAlgorithmTests
 
         for (int i = 0; i < 3; i++)
         {
-            (await harness.GetAsync()).Dispose();
+            (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
         }
 
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(3, harness.Origin.Count);
     }
 
     /// <summary>
-    /// A queue is honoured on every algorithm, not just the one that was tested: a request that arrives with
-    /// the budget spent waits for a permit rather than being rejected outright.
+    /// A queue is honoured on every algorithm: a request arriving with the budget spent waits for a permit.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("SlidingWindow")]
     [InlineData("TokenBucket")]
     public async Task EveryAlgorithm_QueuesUpToItsQueueLimit_BeforeRejecting(string algorithm)
@@ -92,14 +85,14 @@ public class RateLimiterAlgorithmTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Budget(algorithm, permits: 1).Set("RateLimiter:QueueLimit", "1"));
 
-        (await harness.GetAsync()).Dispose();
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
 
         // The budget is spent and the replenishment period is an hour away, so the queued request waits
         // until the caller gives up rather than being rejected. The one after it has nowhere to wait.
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         Task<HttpResponseMessage> queued = harness.GetAsync(cancellationToken: cts.Token);
 
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
 
         Assert.Equal(1, harness.Origin.Count);

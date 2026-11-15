@@ -1,18 +1,21 @@
 using HttpResilience.NET.Internal;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Tests.Internal;
 
 public class PipelineKeySelectorTests
 {
-    private static Func<HttpRequestMessage, string> Selector(params string[] authorities) =>
-        PipelineKeySelector.Create(new PipelineSelectionOptions
+    private static Func<HttpRequestMessage, string> Selector(params string[] authorities)
+    {
+        var selection = new HttpResiliencePipelineSelectionOptions { Mode = HttpResiliencePipelineSelectionMode.ByAuthority };
+        foreach (string authority in authorities)
         {
-            Mode = PipelineSelectionMode.ByAuthority,
-            Authorities = [.. authorities]
-        });
+            selection.Authorities.Add(authority);
+        }
 
-    [Fact]
+        return PipelineKeySelector.Create(selection);
+    }
+
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AllowListedAuthority_GetsItsOwnKey()
     {
         Func<HttpRequestMessage, string> selector = Selector("https://orders.internal");
@@ -22,7 +25,7 @@ public class PipelineKeySelectorTests
             selector(new HttpRequestMessage(HttpMethod.Get, "https://orders.internal/v1/orders")));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void NonDefaultPort_IsPartOfTheKey()
     {
         Func<HttpRequestMessage, string> selector = Selector("https://billing.internal:8443");
@@ -36,7 +39,7 @@ public class PipelineKeySelectorTests
     /// The whole point of the allow-list: no amount of request traffic to novel hosts can create additional
     /// pipeline keys, so pipelines, circuit breakers and metric series stay bounded by configuration.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("https://attacker.example/x")]
     [InlineData("https://orders.internal.attacker.example/x")]
     [InlineData("http://orders.internal/x")]
@@ -48,7 +51,7 @@ public class PipelineKeySelectorTests
         Assert.Equal(PipelineKeySelector.SharedKey, selector(new HttpRequestMessage(HttpMethod.Get, url)));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void KeysAreBounded_ByTheAllowListSize()
     {
         Func<HttpRequestMessage, string> selector = Selector("https://a.test", "https://b.test");
@@ -62,7 +65,7 @@ public class PipelineKeySelectorTests
         Assert.Equal([PipelineKeySelector.SharedKey], keys);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void MatchingIsCaseInsensitiveOnHost()
     {
         Func<HttpRequestMessage, string> selector = Selector("https://Orders.Internal");
@@ -72,7 +75,7 @@ public class PipelineKeySelectorTests
             selector(new HttpRequestMessage(HttpMethod.Get, "https://ORDERS.INTERNAL/x")));
     }
 
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("https://orders.internal", true)]
     [InlineData("https://orders.internal:8443", true)]
     [InlineData("not a url", false)]
@@ -83,7 +86,7 @@ public class PipelineKeySelectorTests
         Assert.Equal(expected, PipelineKeySelector.TryNormalizeAuthority(value, out _));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TrackingKey_IsConstant_WhenSelectionIsOff()
     {
         Func<HttpRequestMessage?, string> key = PipelineKeySelector.CreateForTracking(new HttpResilienceOptions(), PipelineKind.Standard);

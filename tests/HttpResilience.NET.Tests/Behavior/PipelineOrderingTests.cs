@@ -16,7 +16,7 @@ public class PipelineOrderingTests
     /// retry loop, a single request with a permit limit of one would exhaust its own budget and surface a
     /// <see cref="RateLimiterRejectedException"/> instead of the origin's response.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiter_ChargesOnePermitPerLogicalRequest_NotPerAttempt()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -26,13 +26,13 @@ public class PipelineOrderingTests
                 .Set("RateLimiter:Window", "00:01:00")
                 .Set("RateLimiter:QueueLimit", "0"));
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         Assert.Equal(3, harness.Origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiter_StillRejects_WhenTheBudgetIsGenuinelyExhausted()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -43,9 +43,9 @@ public class PipelineOrderingTests
                 .Set("RateLimiter:Window", "00:01:00")
                 .Set("RateLimiter:QueueLimit", "0"));
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(1, harness.Origin.Count);
     }
 
@@ -54,7 +54,7 @@ public class PipelineOrderingTests
     /// it would release and re-acquire between attempts, so the cap would apply to attempts rather than to the
     /// callers it is meant to bound.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ConcurrencyLimiter_CapsConcurrentLogicalRequests()
     {
         var gate = new TaskCompletionSource();
@@ -73,11 +73,7 @@ public class PipelineOrderingTests
 
         Task<HttpResponseMessage>[] inFlight = [.. Enumerable.Range(0, 12).Select(_ => harness.GetAsync())];
 
-        // Give the limiter time to admit everything it is going to admit before releasing the origin.
-        while (harness.Origin.Count < 2)
-        {
-            await Task.Yield();
-        }
+        await harness.Origin.WaitForCountAsync(2);
 
         Assert.Equal(2, harness.Origin.Count);
         gate.SetResult();
@@ -87,7 +83,7 @@ public class PipelineOrderingTests
         Assert.Equal(2, harness.Origin.MaxConcurrent);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ConcurrencyLimiter_HoldsOneSlotAcrossRetries()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -97,7 +93,7 @@ public class PipelineOrderingTests
                 .Set("ConcurrencyLimiter:QueueLimit", "0"));
 
         // A single caller retrying must never be rejected by its own concurrency cap.
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         Assert.Equal(3, harness.Origin.Count);
@@ -108,7 +104,7 @@ public class PipelineOrderingTests
     /// attempt must never be the thing that gets rejected, because the caller would then see a
     /// <see cref="RateLimiterRejectedException"/> in place of the real outcome.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiter_ChargesOnePermitPerLogicalRequest_OnTheHedgingPipelineToo()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -121,16 +117,16 @@ public class PipelineOrderingTests
                 .Set("RateLimiter:QueueLimit", "0"),
             hedged: true);
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         Assert.Equal(3, harness.Origin.Count);
 
         // The budget is spent, so the next logical request is refused before it reaches the wire at all.
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(3, harness.Origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiter_IsActuallyWired_OnTheHedgingPipeline()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -144,9 +140,9 @@ public class PipelineOrderingTests
                 .Set("RateLimiter:QueueLimit", "0"),
             hedged: true);
 
-        await harness.GetAsync();
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<RateLimiterRejectedException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 }

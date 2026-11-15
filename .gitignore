@@ -44,3 +44,6 @@ coverage*.info
 
 # BenchmarkDotNet output
 BenchmarkDotNet.Artifacts/
+
+## Local code-index tooling (CodeGraph): per machine, never committed
+.codegraph/

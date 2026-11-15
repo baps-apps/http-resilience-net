@@ -1,8 +1,9 @@
 #!/usr/bin/env pwsh
+#Requires -Version 7.0
 # Cross-platform script to delete HttpResilience.NET package version from GitHub Packages
-# Works on both Windows and macOS/Linux
+# Works on Windows, macOS and Linux with PowerShell 7 (pwsh). Windows PowerShell 5.1 is not supported:
+# the script uses the ?? operator, and the #Requires line above refuses 5.1 up front.
 # Usage: pwsh scripts/delete-package.ps1 [VERSION] [GITHUB_PAT]
-#        or: powershell scripts/delete-package.ps1 [VERSION] [GITHUB_PAT]
 #        or: ./scripts/delete-package.ps1 [VERSION] [GITHUB_PAT] (if executable)
 #
 # Features:

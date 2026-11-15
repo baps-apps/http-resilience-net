@@ -9,15 +9,9 @@ namespace HttpResilience.NET.Benchmarks;
 /// What the limiters cost when more than one thread is asking at once.
 /// </summary>
 /// <remarks>
-/// Every other benchmark here is single-threaded, which is the one shape in which a lock is free. A limiter
-/// is a shared mutable object on the request path of every client that enables one, so the number that
-/// matters to a service at scale is the one taken under contention -- and it was not being taken.
-/// <para>
-/// One operation is <see cref="Concurrency"/> requests issued together and awaited, so the arms are directly
-/// comparable and the per-request cost is the reported mean divided by that figure. Budgets are large enough
-/// that nothing is ever rejected: what is being measured is the cost of acquiring a permit, not of refusing
-/// one.
-/// </para>
+/// A limiter is shared mutable state on the request path, so it is measured under contention. One operation
+/// is <see cref="Concurrency"/> requests issued together and awaited; per-request cost is the mean divided
+/// by that. Budgets are large enough that nothing is rejected.
 /// </remarks>
 [MemoryDiagnoser]
 [HideColumns("Job")]
@@ -91,7 +85,7 @@ public class LimiterContentionBenchmarks
 
             // Above anything this benchmark can reach, so no arm is ever rejected or queued. A rejection
             // would be measured as a cheap failure and would make the limiter look faster than no limiter.
-            ["HttpResilience:ConcurrencyLimiter:Backstop"] = "100000"
+            ["HttpResilience:ConcurrencyLimiter:Backstop"] = "10000"
         };
 
         if (rateLimiter)
@@ -104,7 +98,7 @@ public class LimiterContentionBenchmarks
         if (concurrencyLimiter)
         {
             settings["HttpResilience:ConcurrencyLimiter:Enabled"] = "true";
-            settings["HttpResilience:ConcurrencyLimiter:Limit"] = "100000";
+            settings["HttpResilience:ConcurrencyLimiter:Limit"] = "10000";
             settings["HttpResilience:ConcurrencyLimiter:QueueLimit"] = "1000";
         }
 
@@ -119,7 +113,7 @@ public class LimiterContentionBenchmarks
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         services.AddHttpClient("bench")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => new NoOpOrigin());
 
         return services.BuildServiceProvider();

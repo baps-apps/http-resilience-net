@@ -1,32 +1,35 @@
-using HttpResilience.NET.Options;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
-/// Validates one client's options at startup, against the rules for the pipeline that client actually uses,
-/// and against the handler composition its registration already fixed.
+/// Validates one client's options when they are first built, against the rules for the pipeline that client
+/// uses. Runs at host start under <c>ValidateOnStart</c>, and otherwise when the client is first created.
 /// </summary>
-/// <remarks>
-/// A shared validator cannot do this: it sees an options name but not whether that client was registered with
-/// the standard or the hedging pipeline, and the two have different budget rules -- retry options are bound
-/// but never used on the hedging path. Registering one validator per client keeps every rule accurate and
-/// keeps every message pointed at the configuration section an operator would edit.
-/// </remarks>
 internal sealed class NamedPipelineOptionsValidator : IValidateOptions<HttpResilienceOptions>
 {
     private readonly string _optionsName;
+    private readonly string _sectionName;
     private readonly string _scope;
     private readonly PipelineKind _kind;
-    private readonly StructuralDecisions _structural;
+    private readonly HttpResilienceRegistration _registration;
+    private readonly IOptions<HttpResilienceStartupOptions> _startup;
 
     public NamedPipelineOptionsValidator(
-        string optionsName, string scope, PipelineKind kind, StructuralDecisions structural)
+        string optionsName,
+        string sectionName,
+        string scope,
+        PipelineKind kind,
+        HttpResilienceRegistration registration,
+        IOptions<HttpResilienceStartupOptions> startup)
     {
         _optionsName = optionsName;
+        _sectionName = sectionName;
         _scope = scope;
         _kind = kind;
-        _structural = structural;
+        _registration = registration;
+        _startup = startup;
     }
 
     public ValidateOptionsResult Validate(string? name, HttpResilienceOptions options)
@@ -38,42 +41,104 @@ internal sealed class NamedPipelineOptionsValidator : IValidateOptions<HttpResil
             return ValidateOptionsResult.Skip;
         }
 
+        IConfigurationSection root = _registration.RequireSection(_optionsName);
+
         List<string> failures = [.. HttpResilienceOptionsValidator.Collect(options, _scope, _kind)];
-        failures.AddRange(UnreachableChanges(options));
+        failures.AddRange(CollectInertConfiguration(root, options));
+
+        // Every client inherits the root, so a root rule violation fails every client that would inherit it.
+        if (RootSectionRules.CollectUnsafeMethodGuardFailures(root) is { } rootFailures)
+        {
+            failures.AddRange(rootFailures);
+        }
+
+        if (OptionsComposition.RootDelegateFailuresOf(options) is { } delegateFailures)
+        {
+            failures.AddRange(delegateFailures);
+        }
+
+        failures.AddRange(RenamedKeyRules.Collect(root));
+        IConfigurationSection? client = string.IsNullOrEmpty(_sectionName)
+            ? null
+            : root.GetSection(HttpResilienceConfigurationKeys.ClientsSection).GetSection(_sectionName);
+
+        if (client is not null)
+        {
+            failures.AddRange(RenamedKeyRules.Collect(client));
+        }
+
+        // A file written for a newer minor may hold keys this version lacks: event 18 reports them instead.
+        if (!_startup.Value.AllowUnknownKeys && !SchemaVersionRules.IsNewerMinor(root))
+        {
+            failures.AddRange(UnknownKeyRules.Collect(root, isRoot: true, root.Path));
+            if (client is not null)
+            {
+                failures.AddRange(UnknownKeyRules.Collect(client, isRoot: false, root.Path));
+            }
+        }
 
         return failures.Count > 0 ? ValidateOptionsResult.Fail(failures) : ValidateOptionsResult.Success;
     }
 
     /// <summary>
-    /// Reports a change to a decision the registration has already acted on and cannot revisit.
+    /// Reports keys in the client's own section that its pipeline never reads.
     /// </summary>
     /// <remarks>
-    /// Values reach the pipeline on their own: it reads <c>IOptionsMonitor</c> when it is built, which is
-    /// after every <c>Configure</c> and <c>PostConfigure</c>, so a consumer changing a timeout changes what
-    /// runs and there is nothing to detect. Handler composition is different -- it was settled while the
-    /// service collection was being built -- so a change to one of these would be reported without being in
-    /// effect. That fails startup rather than being tolerated, for the same reason the whole snapshot
-    /// comparison used to: reporting a number a service is not using is worse than refusing to start.
+    /// Only the client's section is checked. Root values are shared by standard and hedged clients alike.
     /// </remarks>
-    private IEnumerable<string> UnreachableChanges(HttpResilienceOptions options)
+    private IEnumerable<string> CollectInertConfiguration(IConfigurationSection root, HttpResilienceOptions options)
     {
-        StructuralDecisions current = StructuralDecisions.From(options);
-        if (current == _structural)
+        if (string.IsNullOrEmpty(_sectionName))
         {
             yield break;
         }
 
-        foreach (string difference in current.Differences(_structural))
+        IConfigurationSection client = root
+            .GetSection(HttpResilienceConfigurationKeys.ClientsSection)
+            .GetSection(_sectionName);
+
+        if (_kind is PipelineKind.Hedging && client.GetSection("Retry").Exists())
         {
             yield return
-                $"{_scope} -- {difference}: this setting decides which handlers the client is built from, " +
-                "and a client's handlers are fixed when the service collection is built. Something changed " +
-                "it afterwards -- a Configure or PostConfigure registered after the client -- so the value " +
-                "would be reported without being in effect. Every other setting does reach the pipeline " +
-                "this way; only the ones that add or remove a handler cannot. Move this one to the " +
-                "'configure' parameter on AddHttpResilience or AddHedgedHttpResilience, or to the " +
-                "configuration section itself.";
+                $"{_scope} -- Retry: this client uses AddHttpResilienceHedgingHandler, which has no retry strategy, so " +
+                "these keys are bound and never read. Remove them or use AddHttpResilienceHandler. To control " +
+                "duplicate mutating requests on this pipeline, use Hedging:DisableForUnsafeHttpMethods.";
+        }
+
+        if (_kind is not PipelineKind.Standard)
+        {
+            yield break;
+        }
+
+        if (client.GetSection("Hedging").Exists())
+        {
+            yield return
+                $"{_scope} -- Hedging: this client uses AddHttpResilienceHandler, which has no hedging strategy, so " +
+                "these keys are bound and never read. Remove them or use AddHttpResilienceHedgingHandler. To control " +
+                "duplicate mutating requests on this pipeline, use Retry:DisableForUnsafeHttpMethods.";
+        }
+
+        if (client.GetSection("PipelineSelection:Authorities").Exists() &&
+            options.PipelineSelection.Mode is HttpResiliencePipelineSelectionMode.None)
+        {
+            yield return
+                $"{_scope} -- PipelineSelection:Authorities: the client lists authorities but " +
+                "PipelineSelection:Mode is None, so per-authority circuit breaker isolation silently does not " +
+                "happen. Set Mode to ByAuthority or remove the list. A list inherited from " +
+                $"{HttpResilienceConfigurationKeys.RootSection}:PipelineSelection:Authorities is allowed.";
+        }
+
+        if (client.GetSection("Retry:DisableForUnsafeHttpMethods").Exists() &&
+            options.Retry.DisableForUnsafeHttpMethods &&
+            options.Retry.RetryableMethods is { Count: > 0 } inForce)
+        {
+            yield return
+                $"{_scope} -- Retry:DisableForUnsafeHttpMethods: Retry:RetryableMethods replaces this flag, so " +
+                $"it is bound and never read; the methods actually retried are {string.Join(", ", inForce)}. " +
+                "The list may be inherited from " +
+                $"{HttpResilienceConfigurationKeys.RootSection}:Retry:RetryableMethods. State " +
+                "Retry:RetryableMethods on this client (an empty list restores GET, HEAD, OPTIONS and TRACE), " +
+                "or remove the flag.";
         }
     }
-
 }

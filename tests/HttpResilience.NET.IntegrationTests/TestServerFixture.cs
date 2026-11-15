@@ -14,7 +14,14 @@ internal sealed class TestServerFixture : IAsyncDisposable
 {
     private readonly IHost _host;
     private int _flakyCalls;
+    private int _orderDeliveries;
     private int _slowOrderDeliveries;
+    private int _slowFirstArrivals;
+    private int _heldInFlight;
+    private int _maxHeldInFlight;
+    private readonly TaskCompletionSource _releaseHeld = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _slowArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _slowAborted = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private TestServerFixture(IHost host)
     {
@@ -28,17 +35,35 @@ internal sealed class TestServerFixture : IAsyncDisposable
 
     public Func<HttpMessageHandler> CreateHandler { get; }
 
-    /// <summary>Requests that reached each route, so tests can count what actually crossed the wire.</summary>
-    public Dictionary<string, int> Calls { get; } = [];
+    /// <summary>How many requests reached <c>/orders</c>, counted as they arrive.</summary>
+    public int OrderDeliveries => Volatile.Read(ref _orderDeliveries);
+
+    /// <summary>Bodies delivered to <c>/orders</c>, in arrival order.</summary>
+    public List<string> OrderBodies { get; } = [];
+
+    /// <summary>How many requests reached <c>/slow-first</c>.</summary>
+    public int SlowFirstArrivals => Volatile.Read(ref _slowFirstArrivals);
 
     /// <summary>Bodies delivered to <c>/slow-orders</c>, in arrival order.</summary>
     public List<string> SlowOrderBodies { get; } = [];
 
-    /// <summary>Bodies delivered to <c>/echo-orders</c>, in arrival order.</summary>
-    public List<string> EchoedOrderBodies { get; } = [];
-
     /// <summary>How many requests reached <c>/slow-orders</c>, counted as they arrive rather than complete.</summary>
     public int SlowOrderDeliveries => Volatile.Read(ref _slowOrderDeliveries);
+
+    /// <summary>Requests currently held at <c>/held</c>.</summary>
+    public int HeldInFlight => Volatile.Read(ref _heldInFlight);
+
+    /// <summary>The most requests held at <c>/held</c> at the same time.</summary>
+    public int MaxHeldInFlight => Volatile.Read(ref _maxHeldInFlight);
+
+    /// <summary>Completes once a request has reached <c>/slow</c>.</summary>
+    public Task SlowArrived => _slowArrived.Task;
+
+    /// <summary>Completes once the server has seen a <c>/slow</c> request aborted by its caller.</summary>
+    public Task SlowAborted => _slowAborted.Task;
+
+    /// <summary>Lets every request held at <c>/held</c>, and every later one, complete.</summary>
+    public void ReleaseHeld() => _releaseHeld.TrySetResult();
 
     public static async Task<TestServerFixture> StartAsync()
     {
@@ -55,19 +80,29 @@ internal sealed class TestServerFixture : IAsyncDisposable
                     app.UseEndpoints(endpoints =>
                     {
                         endpoints.MapGet("/ok", () => Results.Ok(new { status = "ok" }));
-                        endpoints.MapPost("/orders", () => Results.StatusCode(500));
-                        // Records what each attempt actually delivered, so a retry that replays an
-                        // exhausted request stream shows up as an empty body rather than as a bare count.
-                        endpoints.MapPost("/echo-orders", async (HttpContext context) =>
+                        endpoints.MapPost("/orders", async (HttpContext context) =>
                         {
+                            Interlocked.Increment(ref fixture!._orderDeliveries);
                             using var reader = new StreamReader(context.Request.Body);
                             string body = await reader.ReadToEndAsync(context.RequestAborted);
-                            lock (fixture!.EchoedOrderBodies)
+                            lock (fixture.OrderBodies)
                             {
-                                fixture.EchoedOrderBodies.Add(body);
+                                fixture.OrderBodies.Add(body);
                             }
 
                             return Results.StatusCode(500);
+                        });
+                        // The first request stalls; every later one answers at once with a different body,
+                        // so a response saying "hedge" can only have come from a hedged attempt.
+                        endpoints.MapGet("/slow-first", async (HttpContext context) =>
+                        {
+                            if (Interlocked.Increment(ref fixture!._slowFirstArrivals) == 1)
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(5), context.RequestAborted);
+                                return Results.Text("primary");
+                            }
+
+                            return Results.Text("hedge");
                         });
                         endpoints.MapGet("/error", () => Results.StatusCode(503));
                         endpoints.MapGet("/flaky", () =>
@@ -90,12 +125,42 @@ internal sealed class TestServerFixture : IAsyncDisposable
                             await Task.Delay(TimeSpan.FromSeconds(2), context.RequestAborted);
                             return Results.Ok();
                         });
-                        // Honours the request abort token so a cancelled request tears down immediately
-                        // instead of holding the test host open until the delay elapses.
+                        // Records arrival and the caller's abort, so cancellation is asserted on the server side.
                         endpoints.MapGet("/slow", async (HttpContext context) =>
                         {
-                            await Task.Delay(TimeSpan.FromSeconds(30), context.RequestAborted);
+                            fixture!._slowArrived.TrySetResult();
+                            try
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(30), context.RequestAborted);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                fixture._slowAborted.TrySetResult();
+                                throw;
+                            }
+
                             return Results.Ok();
+                        });
+                        // Holds every request until ReleaseHeld, counting how many are in flight at once, so a
+                        // concurrency limit is visible at the server.
+                        endpoints.MapGet("/held", async (HttpContext context) =>
+                        {
+                            int now = Interlocked.Increment(ref fixture!._heldInFlight);
+                            int seen;
+                            while (now > (seen = Volatile.Read(ref fixture._maxHeldInFlight)) &&
+                                   Interlocked.CompareExchange(ref fixture._maxHeldInFlight, now, seen) != seen)
+                            {
+                            }
+
+                            try
+                            {
+                                await fixture._releaseHeld.Task.WaitAsync(context.RequestAborted);
+                                return Results.Ok();
+                            }
+                            finally
+                            {
+                                Interlocked.Decrement(ref fixture._heldInFlight);
+                            }
                         });
                     });
                 });
@@ -108,6 +173,8 @@ internal sealed class TestServerFixture : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // A test that fails while requests are held must not wait for them in shutdown.
+        ReleaseHeld();
         await _host.StopAsync();
         _host.Dispose();
     }

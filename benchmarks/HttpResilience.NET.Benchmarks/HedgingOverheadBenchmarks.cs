@@ -6,23 +6,13 @@ using Microsoft.Extensions.DependencyInjection;
 namespace HttpResilience.NET.Benchmarks;
 
 /// <summary>
-/// The hedging pipeline, which nothing measured until now.
+/// The hedging pipeline's own overhead.
 /// </summary>
 /// <remarks>
-/// Two pieces of this package's own work sit on the hedged request path and on no other. The authority
-/// allow-list handler runs once per logical request; the <c>ActionGenerator</c> guard that closes the timer
-/// path runs once per <i>supplementary attempt considered</i>, and it reads
-/// <c>IOptionsMonitor&lt;HttpResilienceOptions&gt;.Get(name)</c> when it does -- a concurrent-dictionary
-/// probe on the attempt path rather than at pipeline build.
-/// <para>
-/// Both arms use a <b>slow</b> origin. An origin that answers immediately never starts a hedged attempt at
-/// all, so a fast-origin benchmark would measure the pipeline with its distinguishing feature switched off --
-/// the same mistake that let a suite of hedging tests pass while POST bodies arrived four times.
-/// </para>
-/// <para>
-/// The delay is what dominates the wall clock here, so read the <b>allocation</b> columns and the difference
-/// between the safe and suppressed arms rather than the means. That is the number this package controls.
-/// </para>
+/// This package adds the authority allow-list handler (once per request) and the <c>ActionGenerator</c>
+/// method guard (once per supplementary attempt considered). Both arms use a <b>slow</b> origin, because a
+/// fast one never starts a hedged attempt. The delay dominates the wall clock, so compare the
+/// <b>allocation</b> columns.
 /// </remarks>
 [MemoryDiagnoser]
 [HideColumns("Job")]
@@ -104,7 +94,7 @@ public class HedgingOverheadBenchmarks
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         services.AddHttpClient("bench")
-            .AddHedgedHttpResilience()
+            .AddHttpResilienceHedgingHandler()
             .ConfigurePrimaryHttpMessageHandler(() => new SlowOrigin(_originDelay));
 
         return services.BuildServiceProvider();
@@ -123,7 +113,7 @@ public class HedgingOverheadBenchmarks
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         services.AddHttpClient("bench")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => new SlowOrigin(_originDelay));
 
         return services.BuildServiceProvider();

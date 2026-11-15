@@ -1,246 +1,196 @@
 # Operations
 
-## Resilience is process-local
+## Everything is per process
 
-Every control in this package acts inside one process. Nothing here coordinates across replicas.
+Nothing coordinates across replicas.
 
 | Control | Scope | Fleet-wide effect |
 | --- | --- | --- |
-| Retry | per process | outbound traffic multiplied in every replica independently |
-| Circuit breaker | per process, per pipeline | each replica must independently observe `MinimumThroughput` **attempts** before it can open |
-| Rate limiter | per process, per client | actual rate is `replicas × clients × PermitLimit` per window |
-| Concurrency limiter | per process, per client | actual concurrency is `replicas × clients × Limit` |
-| Concurrency backstop | per process, per pipeline — one per client, or one **per authority** when the client is hedged or uses `PipelineSelection:Mode = ByAuthority`. Enabling a rate limiter displaces it into a handler of its own, which is **per client again** even under `ByAuthority` | always in force; actual concurrency is `replicas × pipelines × Backstop` |
+| Retry | per process | **outbound load multiplied in every replica independently** |
+| Circuit breaker | per process, per pipeline | each replica must see `MinimumThroughput` **attempts** before it can open |
+| Rate limiter | per process, per client | `replicas × clients × PermitLimit` per window. **Cannot enforce a cluster-wide quota** |
+| Concurrency limiter | per process, per client | `replicas × clients × Limit` |
+| Concurrency backstop | per pipeline (see below) | `replicas × pipelines × Backstop` |
 | Hedging | per process | fan-out multiplied in every replica |
 
-Size every one of these by dividing the real budget by the expected replica count, or enforce the real budget at a gateway or service mesh where it can actually be global.
+Backstop scope. Standard client: one per pipeline (one per client, or one per listed authority plus `shared`
+under `ByAuthority`); one per client once a rate limiter is enabled; none when the rate limiter and
+`ConcurrencyLimiter` are both enabled (`Limit` is the bound). Hedged client: one per listed authority.
 
-Note the second multiplier on both limiters: the budget belongs to a *named client*, not to a downstream. Two clients calling the same host hold two independent budgets — an ordinary shape when a typed client is split by concern, or when a shared library registers its own client against a host the application also calls. Count the clients that reach the host, not the hosts.
+Budgets belong to a **named client**, not a downstream: two clients calling one host have two budgets. Divide
+real budgets by `replicas × clients`, or enforce them at a gateway.
 
-## The circuit breaker is per replica, and needs traffic to work
-
-`MinimumThroughput` (default 100) must be observed **in one replica** within `SamplingDuration` (default 30 s) before `FailureRatio` is even evaluated.
-
-**It counts attempts, not caller requests.** The breaker sits inside the retry loop — total timeout, retry, circuit breaker, attempt timeout — so each retry is its own observation. At the default `Retry:MaxRetries` of 2 a fully-failing caller request contributes three. That makes the breaker more sensitive than the number reads, not less, but the arithmetic below is what capacity planning uses. Pinned by `BreakerThroughputScopeTests`.
-
-Three consequences:
-
-```text
-low-traffic client:  100 attempts / 30 s = 3.3 attempts per second per replica
-                     ~1.1 failing caller requests per second at MaxRetries=2;
-                     below that the breaker can never open — the client
-                     effectively has no circuit breaker at all
-
-20 replicas:         20 x 100 = >=2,000 failing ATTEMPTS fleet-wide
-                     (~670 caller requests at MaxRetries=2)
-                     before the fleet stops calling a dead dependency
-```
-
-Size `MinimumThroughput` against **per-replica attempt** traffic, not fleet request traffic. A client that gets a request a minute needs a much lower value, or it needs to accept that timeouts are its only protection.
+Limiters sit outside retries, so one permit covers a request and all its attempts. A downstream counts
+attempts: at `MaxRetries: 2` a failing dependency can see 3x the permitted rate.
 
 ## Retry amplification
 
-The arithmetic to do before raising `Retry:MaxRetries`:
-
-**The two multipliers do not compound on one client.** A client is registered with `AddHttpResilience` *or*
-`AddHedgedHttpResilience`, never both: the hedging pipeline has no retry strategy at all, and a hedged client
-that states `Retry:*` keys of its own fails at registration. So there are two independent ceilings, not one
-combined one. An earlier revision of this page multiplied them together and quoted a twelve-times worst case
-that this package cannot produce.
+Do this arithmetic before raising `Retry:MaxRetries`. Only GET, HEAD, OPTIONS and TRACE are repeated unless a
+client opts in.
 
 ```text
-20 pods × 100 RPS = 2,000 RPS steady state
-Dependency degrades to 100% 5xx.
+20 pods × 100 RPS = 2,000 RPS; the dependency starts returning 100% 5xx.
 
-A retrying client (AddHttpResilience):
+Retrying client:  MaxRetries 1 → 4,000 RPS (2x)    MaxRetries 2 → 6,000 RPS (3x, default)
+                  MaxRetries 3 → 8,000 RPS (4x)    MaxRetries 10 → 22,000 RPS (11x, the cap)
 
-  MaxRetries = 1   outbound = 2,000 × 2  =  4,000 RPS   2.0×
-  MaxRetries = 2   outbound = 2,000 × 3  =  6,000 RPS   3.0×   (default)
-  MaxRetries = 3   outbound = 2,000 × 4  =  8,000 RPS   4.0×
-  MaxRetries = 10  outbound = 2,000 × 11 = 22,000 RPS  11.0×   (the cap)
-
-A hedged client (AddHedgedHttpResilience), for the requests slow enough
-to start a supplementary attempt:
-
-  MaxHedgedAttempts = 1   ×2    (default)
-  MaxHedgedAttempts = 2   ×3
-  MaxHedgedAttempts = 10  ×11   (the cap)
+Hedged client:    MaxHedgedAttempts 1 → 2x (default) ... 10 → 11x (the cap).
+                  A failed attempt starts the next at once, so a failing dependency sees the full multiplier.
 ```
 
-Where they *do* compound is across clients, not within one: a service whose retrying client and whose hedged
-client both call the same dependency puts both multipliers on that dependency at once. Count the clients that
-reach the host.
+A client retries **or** hedges, never both. Different clients calling the same dependency add up. Keep
+`UseJitter` on so retries do not arrive as one wave.
 
-Circuit breakers damp this, but not before the surge:
+**Nested pipelines square the multiplier.** A bare `AddStandardResilienceHandler()` added after this package's
+handler shares the client's options, so each of its attempts runs this package's attempts: (MaxRetries + 1)²
+origin calls per request. It is reported (event 12, Information), not prevented:
 
 ```text
-MinimumThroughput = 100 attempts, per pod, per pipeline.
-20 pods × 100 = 2,000 failed requests minimum before the fleet stops.
-Under ByAuthority, that threshold applies per authority as well as per pod.
+Nested:           MaxRetries 2 → 9x (default)    MaxRetries 10 → 121x (the cap)
+                  20 pods × 100 RPS at the cap: 242,000 RPS against a failing dependency.
 ```
 
-Keep `UseJitter` on. Without it every replica retries on the same schedule and the retries arrive as a wave rather than a spread.
+Both figures are measured (`ConsumerBoundaryTests`) with failures and backoff that fit inside `Timeout:Total`; a
+slower failure is cut off earlier by the two total timeouts. Treat every event 12 as a possible nesting until
+the registration shows it came from `AddResilienceHandler`.
+
+## The circuit breaker needs traffic
+
+`MinimumThroughput` (20) attempts must occur **in one replica** within `SamplingDuration` (30 s) before
+`FailureRatio` (0.5) is evaluated. Each retry is an attempt.
+
+```text
+per replica:   20 attempts / 30 s = 0.67 failing attempts/s ≈ 0.22 failing requests/s at MaxRetries 2
+               (about 7 fully failing requests in 30 s). Below that, the breaker never opens.
+20 replicas:   ≥ 400 failing attempts (~135 requests) fleet-wide before every breaker is open.
+               Under ByAuthority and on hedged clients, per authority as well.
+```
+
+Size `MinimumThroughput` from **one replica's** attempt rate; startup event 11 states the rate each client
+needs. New pods start with closed breakers, so a rollout during an incident sends another surge.
 
 ## Metrics
 
-None of this leaves the process until the consuming service wires an exporter. The package references no
-OpenTelemetry package and registers no meter with an SDK — it publishes on a `Meter` and stops there. Register
-both meter names, plus HTTP client instrumentation:
+Wire the SDK as in [README.md](../README.md#telemetry). **A missing `AddMeter` fails silently**: run each query
+below and see data before alerting on it. Dimensions are bounded; do not add any from URLs, tenants, users,
+correlation IDs or exception messages.
 
-```csharp
-builder.Services.AddHttpResilienceTelemetry();   // the error.type tag. Registers no meter.
-
-builder.Services.AddOpenTelemetry().WithMetrics(metrics => metrics
-    .AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName)  // "Polly"
-    .AddMeter(HttpResilienceTelemetryExtensions.MeterName)       // "HttpResilience.NET"
-    .AddHttpClientInstrumentation()
-    .AddOtlpExporter());
-```
-
-Under `OpenTelemetry.NET` package **2.7.0 or later**, both meters are registered by
-`AddObservability(...)` already and nothing needs configuring. On **2.6.x or earlier**, put the two names in
-`OpenTelemetryOptions:Meters`. `AddHttpResilienceTelemetry()` is called in `Program.cs` either way. Full wiring,
-including traces and logs, is in [README.md](../README.md#telemetry).
-
-**The failure mode is silence.** The SDK drops every measurement from a meter name it was not given: a missing
-`AddMeter` produces an empty dashboard, no log line and no exception. Confirm every instrument below returns
-a series before you write an alert on it.
-
-| Metric | Instrument | Source | Useful dimensions |
+| Metric | Type | Source | Useful dimensions |
 | --- | --- | --- | --- |
-| `resilience.polly.strategy.events` | counter | Polly | `pipeline.name`, `pipeline.instance`, `strategy.name`, `event.name`, `event.severity`, `error.type` |
-| `resilience.polly.strategy.attempt.duration` | histogram | Polly | `pipeline.name`, `strategy.name`, `attempt.number`, `attempt.handled`, `error.type` |
-| `resilience.polly.pipeline.duration` | histogram | Polly | `pipeline.name`, `pipeline.instance`, `error.type` |
-| `http.client.request.duration` | histogram | `System.Net.Http` | `server.address`, `http.request.method`, `http.response.status_code` |
+| `resilience.polly.strategy.events` | counter | Polly | `pipeline.name`, `pipeline.instance`, `strategy.name`, `event.name`, `event.severity`, `exception.type`, `error.type` |
+| `resilience.polly.strategy.attempt.duration` | histogram (ms) | Polly | the above, plus `attempt.number`, `attempt.handled` |
+| `resilience.polly.pipeline.duration` | histogram (ms) | Polly | `pipeline.name`, `pipeline.instance`, `exception.type`, `error.type` |
+| `http.client.request.duration` | histogram (s) | `System.Net.Http` | `server.address`, `server.port`, `http.request.method`, `http.response.status_code`, `error.type` |
 
-Retries are the `resilience.polly.strategy.events` counter filtered to `event.name = OnRetry`; breaker transitions are the same counter filtered to the `OnCircuit*` event names. There is no separate attempts counter, and `error.type` appears on all three Polly instruments.
+- `event.name`: `OnRetry`, `OnHedging`, `OnTimeout`, `OnRateLimiterRejected`, `OnCircuitOpened`,
+  `OnCircuitHalfOpened`, `OnCircuitClosed`. `strategy.name` separates `Standard-AttemptTimeout` from
+  `Standard-TotalRequestTimeout`.
+- `pipeline.instance` is empty for a single-pipeline client; under `ByAuthority` and on hedged clients it is
+  the authority (`https://host[:port]`), or `shared` for unlisted hosts.
+- `error.type` is set by the platform to the status code of **every** response, successes included (`"200"`):
+  filter on the value. For exceptions, `AddHttpResilienceTelemetry()` adds the exception's full type name
+  (`System.Net.Http.HttpRequestException`); without it, exceptions carry only `exception.type`.
+- `http.client.request.duration` is per attempt and stops at response headers.
 
-`pipeline.instance` is empty for a standard client and carries the request authority for a hedged one, which is why a hedged client has to declare the authorities it may call.
+Prometheus names: dots become underscores, counters gain `_total`, `ms`/`s` become `_milliseconds`/`_seconds`
+(`resilience_polly_strategy_events_total`, `http_resilience_circuit_breaker_state`).
 
-`error.type` carries the status code (`"503"`) when a response is the failure and the exception type name
-(`"System.Net.Http.HttpRequestException"`) when an exception is. The status half comes from
-`Microsoft.Extensions.Http.Resilience` itself; `AddHttpResilienceTelemetry()` supplies the exception half,
-which nothing else does. Without it, `sum by (error.type)` silently omits every connection failure and
-timeout. Every dimension above is bounded by construction.
+### The package's gauges (meter `HttpResilience.NET`)
 
-Do not add dimensions derived from request URIs, tenant identifiers, correlation IDs or exception messages. A metric dimension whose cardinality is the number of hosts a process happens to call will eventually evict everything else in the backend.
+Observable gauges, read per collection, never on the request path. Published when the first handler chain is
+built. The meter version is the package version.
 
-### The package's own instruments
-
-Three `ObservableGauge`s, read once per collection and never on the request path. They exist because Polly
-counts breaker transition *events* — which answers "did it open" but not "is it open" once a scrape is
-missed — and because limiter statistics exist on `RateLimiter` and are otherwise never read. The meter comes
-from `IMeterFactory`, so it is scoped to the container and disposed with it.
-
-| Instrument | Unit | Dimensions | Cardinality |
-| --- | --- | --- | --- |
-| `http.resilience.circuit_breaker.state` | `{state}` — 0 closed, 1 open, 2 half-open | `http.client.name`, `http.resilience.authority`, `server.address`, `server.port` | LOW — clients x allow-listed authorities, both fixed at deploy time |
-| `http.resilience.limiter.available_permits` | `{permit}` | `http.client.name`, `http.resilience.limiter.kind` | LOW — at most two series per client |
-| `http.resilience.limiter.queued_requests` | `{request}` | `http.client.name`, `http.resilience.limiter.kind` | LOW — same |
-
-The breaker gauge carries `server.address` and `server.port` as well as the authority string, because those
-are the semantic-convention pair `System.Net.Http` tags *its* series with — so breaker state joins to request
-duration without splitting `scheme://host:port` in the query. They add no series: both are functionally
-determined by the authority already present, and a key that is not an authority (the shared pipeline) carries
-neither rather than a placeholder. `http.client.name` has no semantic-convention equivalent, so it stays this
-package's own dimension.
-
-Both limiter gauges carry `http.resilience.limiter.kind` rather than splitting into separate instruments,
-because the operator's question is "how close is this client to shedding load" and the answer is whichever
-limiter is nearest its bound. One query covers all three:
-
-| `kind` | Present when | What it measures |
+| Instrument | Values | Dimensions |
 | --- | --- | --- |
-| `rate` | `RateLimiter:Enabled` | The configured permit budget, and the queue waiting for one. |
-| `concurrency` | `ConcurrencyLimiter:Enabled` | The client's own concurrency cap. **`queued_requests` here is the number worth watching** — that wait is outside `Timeout:Total`. |
-| `backstop` | `RateLimiter:Enabled` **and** `ConcurrencyLimiter:Enabled` false | The concurrency backstop, in the handler it gets when a rate limiter takes the platform's slot. With both limiters enabled that handler is skipped — the client's own `Limit` is the tighter bound — so this series is absent and `kind=concurrency` is the one to watch. `queued_requests` is always 0; it has no queue. |
+| `http_resilience.circuit_breaker.state` | 1 for the breaker's current state, 0 for the other two | `http_resilience.circuit_breaker.state` (`closed`, `open`, `half_open`), `http_resilience.client.name`, `http_resilience.authority`, plus `server.address` / `server.port` for a listed authority |
+| `http_resilience.limiter.available_permits` | permits free now | `http_resilience.client.name`, `http_resilience.limiter.kind`, plus `http_resilience.authority` on a per-authority backstop, with `server.address` / `server.port` for a listed authority |
+| `http_resilience.limiter.queued_requests` | requests waiting | same |
 
-One gap to know about: the `backstop` series exists only when a rate limiter has displaced the backstop into a
-handler of its own. In the ordinary case it lives inside the platform's limiter slot, where Polly builds it
-per pipeline — which is what makes it per authority under `ByAuthority`. Reading its statistics would mean
-supplying a single instance and turning that per-authority bound into a per-client one, which is the worse
-trade. If you need a concurrency number you can watch on a client with no rate limiter, set
-`ConcurrencyLimiter:Limit`.
+- **Every breaker of every enabled client is reported from the first collection**, as `closed`, so a missing
+  series means a missing client, not a healthy one. Three series per breaker (the OpenTelemetry state-metric
+  shape): select a state with the attribute, for example
+  `http_resilience_circuit_breaker_state{http_resilience_circuit_breaker_state="open"} == 1`, and count breakers
+  in a state with `sum`. `http_resilience.authority` is `shared` for a single-pipeline client and for a
+  `ByAuthority` client's unlisted hosts; a hedged client has one breaker per listed authority.
+- A limiter's series appears once the limiter exists (the limiter-slot backstop: on its first request). `kind`
+  is `rate` (`RateLimiter:Enabled`), `concurrency` (`ConcurrencyLimiter:Enabled`) or `backstop` (scope above;
+  per authority on hedged clients and on `ByAuthority` clients without a rate limiter). The backstop never
+  queues.
 
 ## Alerts worth having
 
-| Alert | Condition | Why |
+| Alert | Condition | Meaning |
 | --- | --- | --- |
-| Retry rate elevated | retry attempts / total requests > 10% for 5 min | A dependency is degrading, and you are amplifying load on it. |
-| Circuit breaker open | `http.resilience.circuit_breaker.state` > 0 for > 2 min, or the dependency health check Degraded | A dependency is failing fast. The gauge is tagged `http.client.name`, `http.resilience.authority`, `server.address` and `server.port`, so it names which one without a health endpoint and joins to `http.client.request.duration` without string-splitting. |
-| Breaker thrashing | more than 3 open transitions in 10 min | `MinimumThroughput` or `BreakDuration` is mistuned for this traffic level. |
-| Rate limiter rejections | event ID 8, or `http.resilience.limiter.available_permits{kind="rate"}` at 0 | Either the downstream contract changed, or `PermitLimit` was not divided by replica count. The log line names the key to raise. |
-| Concurrency limiter rejections | event ID 9 | This client is already waiting on the dependency as much as it is allowed to. Usually the dependency slowed down. Raising the queue instead of the limit only moves the latency outside `Timeout:Total`, where nothing in this package can bound it. |
-| Limiter approaching saturation | `http.resilience.limiter.queued_requests` > 0 sustained, any `kind` | Requests are waiting for a permit or a slot. That wait is **outside** `Timeout:Total` — only `Timeout:Client` and caller cancellation bound it. Alert on the instrument without filtering `kind`: the concurrency limiter's queue is the one that can be 1,000 deep. |
-| Concurrency limiter approaching saturation | `http.resilience.limiter.available_permits{kind="concurrency"}` at 0 | Every slot is in use, so the next request queues. Precedes event ID 9 rather than following it, which is the difference between an alert and a post-mortem. |
-| Two nested pipelines | event ID 12 at Information, at client construction | This client has a resilience handler the package did not add. Expected if it came from `AddResilienceHandler`. If it came from `AddStandardResilienceHandler` on a client that already has `AddHttpResilience`, retries **multiply** — three configured attempts become nine origin calls — and the total timeout is applied twice. Check which. Information rather than Warning because the correct case produces it too; see the note under the alert table. |
-| Backstop rejections | event ID 7, or `RateLimiterRejectedException` on a client with `RateLimiter:Enabled = false` | Concurrency reached `ConcurrencyLimiter:Backstop` (1,000 by default). Nothing is queued above it. Either the dependency slowed down and requests are piling up, or this client genuinely needs more concurrency than the backstop allows. The log line names the current value and the key to raise, because the exception type alone is indistinguishable from a configured rate limit. |
-| Mutating methods repeatable | event ID 10 at Warning, at startup | This client can deliver a POST, PUT, PATCH, DELETE or unrecognized method to its origin more than once. Legitimate when the endpoint deduplicates on an idempotency key — the alert exists so the set of such clients is a list somebody maintains rather than a property nobody can enumerate. Inventory it per deploy; page on a client appearing that was not on the list. |
-| Resilience disabled | event ID 6 at Warning, at startup | A client has no pipeline at all. Deliberate during an incident; otherwise a forgotten `Enabled` key, and the client has no retries, no timeouts and no circuit breaker. Alert on this in non-production too — it is cheapest to catch in the deployment that introduced it. |
-| Attempt timeouts | attempt timeout rate rising | `Timeout:Attempt` is tighter than the dependency's real latency. |
-| Client-timeout cancellations | bare `TaskCanceledException` with no `TimeoutRejectedException` alongside it | `Timeout:Client` fired, so either a long limiter queue wait or a response body that stopped arriving. Neither is visible to the pipeline's own timeouts, because both happen outside them — **and neither opens the circuit breaker**, see below. |
+| Breaker open | `http_resilience.circuit_breaker.state{http_resilience.circuit_breaker.state="open"}` = 1 for 2 min | A dependency is failing fast. Tags name the client and host. |
+| Breaker thrashing | > 3 `OnCircuitOpened` (or log event 2) in 10 min | Thresholds do not fit the traffic. |
+| Retry rate | `OnRetry` events ÷ `resilience.polly.pipeline.duration` count, per `pipeline.name`, > 10% for 5 min | A dependency is degrading and retries add load. |
+| Attempt timeouts rising | `OnTimeout` with `strategy.name = Standard-AttemptTimeout` (`StandardHedging-AttemptTimeout` when hedged) | `Timeout:Attempt` is tighter than real latency. |
+| Limiter rejections | log events 7 (backstop), 8 (rate), 9 (concurrency); or `available_permits` at 0 | Budget exhausted. The log names the key to raise. |
+| Limiter queueing | `queued_requests` > 0, sustained | Requests wait **outside** `Timeout:Total`. |
+| Client timeouts | `TaskCanceledException` with inner `TimeoutException`, no `TimeoutRejectedException` | `Timeout:Client` fired: long queue wait or stalled body. |
+| Unsafe methods repeatable | startup event 10 | A client can send a mutating request twice. Keep an inventory; alert on new entries. |
+| Resilience disabled | startup event 6 | A client has no pipeline. The message names the key (check for a forgotten kill switch). |
+| Extra resilience handler | event 12 (Information) | Fine from `AddResilienceHandler`; from `AddStandardResilienceHandler` retries multiply, (MaxRetries + 1)² up to 121x. Review. |
+| Resilience handlers removed | event 16 (Warning) | The client runs without its pipeline. Usually `RemoveAllResilienceHandlers()` called after `AddHttpResilienceHandler`; remove the call. |
 
-## The failure the resilience signals cannot see
+## Stalled response bodies
 
-A dependency that returns response headers promptly and then trickles or stalls the body degrades every call to the full `Timeout:Client` budget while every resilience signal stays green.
+A dependency that sends headers quickly and then stalls the body pins callers at `Timeout:Client` while every
+resilience signal stays green: the pipeline returned at the headers (a fast success), and `Timeout:Client`
+cancels the body read outside every strategy (never retried, never a breaker failure).
+`http.client.request.duration` and Polly's durations stop at headers too.
 
-`Timeout:Client` does bound it — that is what a finite `HttpClient.Timeout` is for. But the pipeline sees that deadline as **caller cancellation**, and caller cancellation is deliberately excluded from the transient-failure predicate: it must not be, or a cancelled request would open a circuit. So a stalled body is never retried, never counted by the breaker, never surfaces as `TimeoutRejectedException`, and Polly's attempt histogram records each one as a *fast success* — the handler chain really did return quickly, with headers.
-
-```text
-symptom     p99 pinned at Timeout:Client, flat retry rate, circuit closed, health check Healthy
-watch       http.client.request.duration  (System.Net.Http), not the Polly instruments
-confirm     bare TaskCanceledException with no TimeoutRejectedException alongside it
-mitigate    HttpCompletionOption.ResponseHeadersRead plus your own deadline on reading the stream
-```
-
-Nothing in a `DelegatingHandler` can fix this: under the default `HttpCompletionOption.ResponseContentRead` the body is buffered by `HttpClient` after the chain has returned. Owning that would mean owning response streaming, which is out of scope for a package that configures the platform. What is in scope is saying so.
+- **Watch** the calling service's own latency (for example `http.server.request.duration`).
+- **Confirm**: `TaskCanceledException` with an inner `TimeoutException`, no `TimeoutRejectedException`.
+- **Mitigate**: `HttpCompletionOption.ResponseHeadersRead` plus your own deadline on reading the stream.
 
 ## Logs
 
-Structured, source-generated, no request or response content:
+Source-generated, never request or response content. Categories: `HttpResilience.NET.Configuration` (6,
+10–21), `HttpResilience.NET.Pipeline` (1–5), `HttpResilience.NET.Limiter` (7–9; 7 and 8 from the platform
+handler's limiter slot are logged under `.Pipeline`).
 
-Polly's own telemetry already logs every retry twice at Warning, carrying the pipeline name, the outcome and the attempt number. This package adds only what those lines do not have, at levels that do not compete with them:
-
-| Event ID | Level | Message |
+| ID | Level | When |
 | --- | --- | --- |
-| 1 | Debug | retry attempt, with the computed delay, status and exception type |
-| 2 | Warning | circuit breaker opened, with authority and break duration |
-| 3 | Information | circuit breaker half-open |
-| 4 | Information | circuit breaker closed |
-| 5 | Debug | hedging attempt started |
-| 6 | **Warning** | resilience registered but disabled for a client, with the key that would enable it. Emitted once per client at startup, when the host materializes its options — not on first use, because a rarely-exercised client would report it hours or days after the deploy that caused it. |
-| 7 | Warning | the concurrency backstop rejected a request, with the current value and the key to raise |
-| 8 | Warning | the rate limiter rejected a request, with the permit key to raise and the replicas x clients arithmetic |
-| 9 | Warning | the concurrency limiter rejected a request, with the limit, the queue depth and the key to raise |
-| 10 | **Warning** | this client may repeat a mutating request, with the methods and the key that allowed it. Emitted once per client at startup, for both mechanisms — the `DisableForUnsafeHttpMethods` flag and an explicit `RetryableMethods` allow-list — because the hazard at the origin is identical and only the review trail differs. Alerting on this event ID gives you a fleet inventory of every client that can duplicate a mutation. |
-| 11 | Information | the failing-attempt rate, per replica, that this client's circuit breaker needs before it can open — and the caller-request rate that corresponds to at its retry count. Emitted once per client at startup. Not a defect: a busy client meets the rate easily. It is there because the arithmetic is invisible, and a client with the default thresholds and a few requests a second per replica has a breaker in its configuration, a breaker in its runbook, and no breaker in effect. |
-| 13 | **Warning** | the redirect bound could not be applied to this client, because its primary handler is neither a `SocketsHttpHandler` nor an `HttpClientHandler` and has no `AllowAutoRedirect` to set. Emitted once per client. A stub or in-memory handler resolves no redirects and is unaffected — which is why this is a Warning and not the exception the `Connection:Enabled` path throws. A handler wrapping a `SocketsHttpHandler` of its own does resolve them, and then a 3xx from a listed authority reaches a destination the hedged client's allow-list never sees. |
-| 12 | Information | this client carries more resilience handlers than the package added, with both counts. Emitted once per client, at the first construction of its handler chain — once, not once per handler rotation, or it would repeat every two minutes for the life of the process. Information rather than Warning because the state is frequently correct: `AddResilienceHandler`, the documented escape hatch, produces it too, and the package cannot tell that apart from a second `AddStandardResilienceHandler` nesting a pipeline. Treat every line as a review item. |
+| 1 | Debug | retry attempt: delay, status, exception type (Polly already logs each retry at Warning) |
+| 2 | Warning | circuit opened: client, authority, break duration |
+| 3 / 4 | Information | circuit half-open / closed |
+| 5 | Debug | hedged attempt started |
+| 6 | Warning | startup: client disabled, naming the key (its own `Enabled` or the root kill switch) |
+| 7 | Warning | concurrency backstop rejected a request; names the value and key |
+| 8 | Warning | rate limiter rejected a request; names the permit key |
+| 9 | Warning | concurrency limiter rejected a request; names limit, queue and key |
+| 10 | Warning | startup: client may repeat unsafe methods; names the methods and the key |
+| 11 | Information | startup: failing-attempt and request rate the breaker needs, per replica |
+| 12 | Information | first chain build: more resilience handlers than the package added |
+| 13 | Warning | first chain build: redirect bound not applied (primary handler has no `AllowAutoRedirect`) |
+| 14 | Warning | startup: worst-case retry schedule exceeds `Timeout:Total` |
+| 15 | Information | startup: one-line summary of each enabled client's effective settings |
+| 16 | Warning | first chain build: a later registration removed resilience handlers this package added |
+| 17 | Information | first chain build: resilience handlers registered before this package's (such as .NET Aspire's) were replaced |
+| 18 | Warning | startup, once: `HttpResilience:SchemaVersion` names a newer minor version, and the file holds keys this version ignores (listed) |
+| 19 | Information | first chain build: a disabled client's resilience handlers from `ConfigureHttpClientDefaults` (such as .NET Aspire's) were removed |
+| 20 | Warning | first chain build: the client also has a Polly v7 handler (`Microsoft.Extensions.Http.Polly`), whose retry nests with this package's |
+| 21 | Warning | startup: a hedged client's `Hedging:Delay` is below 10 ms, so nearly every request is sent `MaxHedgedAttempts` + 1 times; names the key |
+
+- Startup notices are logged once, from final options, after validation and before any hosted service starts.
+  A bare `ServiceProvider` without a host logs none.
+- Events 7–9 are throttled to one per limiter per 10 s, with `SuppressedCount`. Count rejections from
+  `resilience.polly.strategy.events` with `event.name = OnRateLimiterRejected`.
+- Debug events are off by default: `"Logging": { "LogLevel": { "HttpResilience.NET.Pipeline": "Debug" } }`.
 
 ## Health checks
 
-```csharp
-app.MapHealthChecks("/healthz/live",  new() { Predicate = _ => false });
-app.MapHealthChecks("/healthz/ready", new() { Predicate = r => !r.Tags.Contains("dependency") });
-app.MapHealthChecks("/healthz/deps",  new() { Predicate = r =>  r.Tags.Contains("dependency") });
-```
+**Never gate a liveness or readiness probe on circuit breaker state.** An open circuit means a dependency is
+unhealthy, not this process; restarting pods cuts capacity mid-outage and resets every breaker. Alert on the
+gauge instead. The package registers no health check.
 
-The resilience check reports Degraded at worst -- never Unhealthy -- and is tagged `dependency` by default.
-The Degraded ceiling is the part that holds unconditionally; the tag is routing, and passing your own
-`tags` to `AddHttpResilienceHealthChecks` replaces it rather than adding to it.
+## Kubernetes
 
-**Degraded is HTTP 200.** ASP.NET Core's default `ResultStatusCodes` maps Healthy and Degraded both to `200`; only Unhealthy maps to `503`. So an alert on the *status code* of `/healthz/deps` never fires, however many circuits are open. Alert on `http.resilience.circuit_breaker.state` — the row above — and read the endpoint's `data` payload during triage. If you want the diagnostic endpoint to answer 503, opt in explicitly with `ResultStatusCodes`, and only on that endpoint; see README.md.
-
-**Never gate liveness or readiness on it.** An open circuit means a downstream is unhealthy, not that this process is. Restarting the pod or removing it from the load balancer sheds capacity during a dependency outage and amplifies it — you would be converting a partial degradation into a self-inflicted one.
-
-## Kubernetes and EKS
-
-- **Connection lifetime.** `PooledConnectionLifetime` (default 2 minutes) is what bounds DNS staleness. When `Connection:Enabled` is true the package sets the `IHttpClientFactory` handler lifetime to infinite, because running both rotation mechanisms would cycle connection pools twice as often for no benefit. With `Connection:Enabled` false a client keeps what the factory gives it, which on .NET 10 is a `SocketsHttpHandler` with a two-minute pooled lifetime rotated every two minutes — already sound, so this section is for the settings the factory does not express and for making the pool's age a number you state rather than inherit.
-- **Rolling deployments.** New pods start with empty circuit breaker state, so they will send `MinimumThroughput` requests to a failing dependency before their breaker can open. Expect a small surge on every rollout during a dependency incident.
-- **Scaling.** Every process-local budget above scales linearly with replica count. Autoscaling multiplies your outbound rate limit.
-- **Hedged clients.** The authorities a hedged client may call are fixed at deploy time. Adding a downstream host means a configuration change and a restart, the same as any other resilience change.
-- **Shutdown.** Caller cancellation propagates through the pipeline and stops retries immediately, so in-flight requests do not survive a pod's grace period doing retry backoff.
-
-## Changing configuration
-
-Resilience configuration is read once at startup. Changing it requires a restart — see [ARCHITECTURE.md](ARCHITECTURE.md#configuration-reload).
+- **DNS.** With `Connection:Enabled`, `PooledConnectionLifetime` (2 min) bounds connection age. Without it,
+  the factory's 2-minute handler rotation does.
+- **Autoscaling** multiplies every per-process budget.
+- **Hedged clients'** authorities are fixed at deploy time; adding one needs a config change and restart.
+- **Shutdown.** Pass a token cancelled at shutdown (the request's, or the host's stopping token): cancellation
+  stops retries immediately, so requests do not spend the grace period in backoff.
+- **Configuration changes need a restart.**

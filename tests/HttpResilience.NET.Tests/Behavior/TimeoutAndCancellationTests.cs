@@ -1,62 +1,80 @@
 using System.Net;
 using HttpResilience.NET.Tests.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
 using Polly.Timeout;
 
 namespace HttpResilience.NET.Tests.Behavior;
 
 public class TimeoutAndCancellationTests
 {
-    private static RecordingHandler SlowOrigin(TimeSpan delay) =>
+    /// <summary>An origin that answers only when the request is cancelled.</summary>
+    private static RecordingHandler HangingOrigin() =>
         new(async (request, _, cancellationToken) =>
         {
-            await Task.Delay(delay, cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK) { RequestMessage = request };
         });
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task AttemptTimeout_CutsOffASlowAttempt_AndTheAttemptIsRetried()
     {
-        RecordingHandler origin = SlowOrigin(TimeSpan.FromSeconds(30));
+        var time = new FakeTimeProvider();
+        RecordingHandler origin = HangingOrigin();
 
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled()
                 .Set("Timeout:Attempt", "00:00:00.200")
                 .Set("Timeout:Total", "00:00:10"),
-            origin);
+            origin,
+            timeProvider: time);
 
-        await Assert.ThrowsAsync<TimeoutRejectedException>(() => harness.GetAsync());
+        Task<HttpResponseMessage> request = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            await origin.WaitForCountAsync(attempt);
+            time.Advance(TimeSpan.FromMilliseconds(200));
+        }
+
+        await Assert.ThrowsAsync<TimeoutRejectedException>(() => request);
 
         // The attempt timeout is transient, so every configured attempt was made.
         Assert.Equal(3, origin.Count);
     }
 
-    [Fact]
-    public async Task TotalTimeout_BoundsTheWholeLogicalRequest()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task TotalTimeout_EndsTheLogicalRequest_MidRetry()
     {
-        RecordingHandler origin = SlowOrigin(TimeSpan.FromSeconds(30));
+        var time = new FakeTimeProvider();
+        RecordingHandler origin = HangingOrigin();
 
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled()
                 .Set("Retry:MaxRetries", "2")
-                .Set("Timeout:Attempt", "00:00:00.200")
-                .Set("Timeout:Total", "00:00:00.700"),
-            origin);
+                .Set("Timeout:Attempt", "00:00:01")
+                .Set("Timeout:Total", "00:00:01.500"),
+            origin,
+            timeProvider: time);
 
-        long start = Environment.TickCount64;
-        await Assert.ThrowsAnyAsync<Exception>(() => harness.GetAsync());
-        long elapsed = Environment.TickCount64 - start;
+        Task<HttpResponseMessage> request = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.True(elapsed < 5_000, $"The total timeout should have bounded the request, took {elapsed}ms.");
-        Assert.True(origin.Count <= 3, $"No more attempts than configured should be made, saw {origin.Count}.");
+        await origin.WaitForCountAsync(1);
+        time.Advance(TimeSpan.FromSeconds(1));
+        await origin.WaitForCountAsync(2);
+        time.Advance(TimeSpan.FromMilliseconds(500));
+
+        await Assert.ThrowsAsync<TimeoutRejectedException>(() => request);
+
+        // Three attempts were configured; the total budget ended the request during the second.
+        Assert.Equal(2, origin.Count);
     }
 
     /// <summary>
-    /// HttpClient.Timeout sits outside the resilience pipeline. Left at its 100-second default it would
-    /// silently truncate any longer total budget; set to infinite it would leave the response body read with
-    /// no bound at all. It is therefore derived from the total budget, comfortably above it.
+    /// HttpClient.Timeout sits outside the pipeline: at 100 seconds it would truncate a longer total budget,
+    /// and infinite would leave the body unbounded. It is derived from the total budget.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void HttpClientTimeout_DefaultsToTheTotalBudgetPlusABodyAllowance()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -75,7 +93,7 @@ public class TimeoutAndCancellationTests
     /// An explicit client budget is used verbatim, for a client whose queue wait or download is longer than
     /// the derived allowance.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void HttpClientTimeout_UsesTheConfiguredValue_WhenOneIsGiven()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -87,16 +105,13 @@ public class TimeoutAndCancellationTests
     }
 
     /// <summary>
-    /// Timeout:Total stops applying when response headers arrive: content is buffered by HttpClient after the
-    /// resilience handler has already returned. HttpClient.Timeout is the only thing that bounds that, which
-    /// is why it is not infinite.
+    /// Timeout:Total stops at response headers; HttpClient buffers the body afterwards, bounded only by
+    /// HttpClient.Timeout.
     /// </summary>
     /// <remarks>
-    /// Fails if HttpClient.Timeout goes back to <see cref="Timeout.InfiniteTimeSpan"/>: the request then runs
-    /// for as long as the origin cares to trickle the body, holding a connection and an inbound request, and
-    /// the pipeline's own telemetry reports a fast successful attempt.
+    /// Fails if HttpClient.Timeout becomes <see cref="Timeout.InfiniteTimeSpan"/>.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task StalledResponseBody_IsBoundedByTheClientTimeout_NotByTotal()
     {
         var origin = new RecordingHandler((request, _, _) =>
@@ -116,13 +131,12 @@ public class TimeoutAndCancellationTests
             origin);
 
         // Default HttpCompletionOption.ResponseContentRead, so HttpClient buffers the body.
-        await Assert.ThrowsAsync<TaskCanceledException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<TaskCanceledException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     /// <summary>Sends response headers immediately and then never finishes the body.</summary>
     /// <remarks>
-    /// Observes the cancellation token, as a real response stream read does -- the point of the test is which
-    /// deadline cancels it, not whether the transport is interruptible.
+    /// Observes the cancellation token, as a real stream read does; the test is about which deadline fires.
     /// </remarks>
     private sealed class StalledContent : HttpContent
     {
@@ -134,7 +148,7 @@ public class TimeoutAndCancellationTests
             TransportContext? context,
             CancellationToken cancellationToken)
         {
-            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             await stream.WriteAsync(new byte[] { 1 }, cancellationToken);
         }
 
@@ -145,23 +159,27 @@ public class TimeoutAndCancellationTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CallerCancellation_StopsImmediately_AndDoesNotRetry()
     {
-        RecordingHandler origin = SlowOrigin(TimeSpan.FromSeconds(30));
+        RecordingHandler origin = HangingOrigin();
 
         await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled(), origin);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        using var cts = new CancellationTokenSource();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.GetAsync(cancellationToken: cts.Token));
+        Task<HttpResponseMessage> request = harness.GetAsync(cancellationToken: cts.Token);
+        await origin.WaitForCountAsync(1);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
 
         Assert.Equal(1, origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CallerCancellation_IsNotCountedAsACircuitBreakerFailure()
     {
-        RecordingHandler origin = SlowOrigin(TimeSpan.FromSeconds(30));
+        RecordingHandler origin = HangingOrigin();
 
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled()
@@ -171,15 +189,17 @@ public class TimeoutAndCancellationTests
                 .Set("CircuitBreaker:SamplingDuration", "00:00:30"),
             origin);
 
-        for (int i = 0; i < 6; i++)
+        for (int i = 1; i <= 6; i++)
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => harness.GetAsync(cancellationToken: cts.Token));
+            using var cts = new CancellationTokenSource();
+            Task<HttpResponseMessage> request = harness.GetAsync(cancellationToken: cts.Token);
+            await origin.WaitForCountAsync(i);
+            await cts.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
         }
 
         // A caller giving up says nothing about the dependency's health, so the circuit must still be closed.
-        Assert.Empty(HealthState.NotClosed(harness.Services));
+        Assert.Empty(BreakerState.NotClosed(harness.Services));
     }
 
     /// <summary>
@@ -187,14 +207,10 @@ public class TimeoutAndCancellationTests
     /// the origin.
     /// </summary>
     /// <remarks>
-    /// Named <c>CallerCancellation_CancelsAQueuedRateLimiterWait</c> until a review noticed it configures a
-    /// <c>ConcurrencyLimiter</c> and never touches the rate limiter. The two are different strategy
-    /// configurations -- this one is Polly's <c>DefaultRateLimiterOptions</c>, the other is a
-    /// <c>RateLimiter</c> instance this package supplies -- so the misnamed test left the rate-limiter queue
-    /// looking covered when nothing exercised it. See
+    /// The concurrency limiter path. The rate-limiter queue is covered by
     /// <see cref="CallerCancellation_CancelsAQueuedRateLimiterPermitWait"/>.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CallerCancellation_CancelsAQueuedConcurrencySlotWait()
     {
         var gate = new TaskCompletionSource();
@@ -212,11 +228,8 @@ public class TimeoutAndCancellationTests
                 .Set("ConcurrencyLimiter:QueueLimit", "10"),
             origin);
 
-        Task<HttpResponseMessage> holder = harness.GetAsync();
-        while (origin.Count < 1)
-        {
-            await Task.Yield();
-        }
+        Task<HttpResponseMessage> holder = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await origin.WaitForCountAsync(1);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         Task<HttpResponseMessage> queued = harness.GetAsync(cancellationToken: cts.Token);
@@ -233,19 +246,12 @@ public class TimeoutAndCancellationTests
     /// its own cancellation token.
     /// </summary>
     /// <remarks>
-    /// A different code path from the concurrency slot above. The concurrency limiter is Polly's
-    /// <c>DefaultRateLimiterOptions</c>, built by the strategy; the rate limiter is a
-    /// <see cref="System.Threading.RateLimiting.RateLimiter"/> instance this package constructs and hands to
-    /// the strategy as <c>args => limiter.AcquireAsync(1, args.Context.CancellationToken)</c>. Whether that
-    /// token is the caller's is the thing being asserted, and passing the wrong one is a one-word change
-    /// nothing else would catch.
-    /// <para>
-    /// Production change that would make this fail: passing <see cref="CancellationToken.None"/> to
-    /// <c>AcquireAsync</c> in <c>StandardPipelineConfigurator</c>. The queued request would then wait for
-    /// the window to roll -- an hour here -- with the caller already gone.
-    /// </para>
+    /// The rate limiter is an instance this package passes to the strategy as
+    /// <c>args => limiter.AcquireAsync(1, args.Context.CancellationToken)</c>. Fails if
+    /// <see cref="CancellationToken.None"/> is passed to <c>AcquireAsync</c> in
+    /// <c>StandardPipelineConfigurator</c>: the queued request would wait an hour for the window.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CallerCancellation_CancelsAQueuedRateLimiterPermitWait()
     {
         var gate = new TaskCompletionSource();
@@ -265,27 +271,22 @@ public class TimeoutAndCancellationTests
                 .Set("RateLimiter:QueueLimit", "10"),
             origin);
 
-        Task<HttpResponseMessage> holder = harness.GetAsync();
-        while (origin.Count < 1)
-        {
-            await Task.Yield();
-        }
+        Task<HttpResponseMessage> holder = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await origin.WaitForCountAsync(1);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         Task<HttpResponseMessage> queued = harness.GetAsync(cancellationToken: cts.Token);
 
-        // Bounded, because the regression this guards does not fail -- it hangs. Passing
-        // CancellationToken.None to AcquireAsync leaves the queued request waiting for the window to roll,
-        // an hour away, and a test run that never finishes is a worse CI signal than one that fails.
-        // Measured: 278 ms with the caller's token, no result at all without it.
+        // Bounded, because the regression hangs rather than fails: with CancellationToken.None the queued
+        // request waits for the window to roll, an hour away.
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => queued.WaitAsync(TimeSpan.FromSeconds(10)));
+            () => queued.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
 
         gate.SetResult();
         await holder;
 
         // The cancelled request never took a permit and never reached the origin.
         Assert.Equal(1, origin.Count);
-        Assert.Empty(HealthState.NotClosed(harness.Services));
+        Assert.Empty(BreakerState.NotClosed(harness.Services));
     }
 }

@@ -1,37 +1,79 @@
 <Project>
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!-- Tests, samples and benchmarks run against the versions below, including transitive ones. -->
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+
+    <!-- Minimum versions the published package depends on. The library compiles against these, so a
+         consumer is never forced onto a newer patch than it needs. Raise only when an API requires it. -->
+    <ExtensionsMinimumVersion>10.0.0</ExtensionsMinimumVersion>
+    <HttpResilienceMinimumVersion>10.0.0</HttpResilienceMinimumVersion>
+    <PollyMinimumVersion>8.4.2</PollyMinimumVersion>
+    <!-- Polly 9 is commercially licensed: the package accepts only Polly 8.x. -->
+    <PollyVersionRange>[$(PollyMinimumVersion), 9.0.0)</PollyVersionRange>
+
+    <!-- Versions tests, samples and benchmarks run on: the latest by default. With
+         -p:TestMinimumDependencies=true they run on the minimums above instead, so the oldest combination a
+         consumer can resolve is tested too. -->
+    <ExtensionsTestVersion>10.0.15</ExtensionsTestVersion>
+    <HttpResilienceTestVersion>10.11.0</HttpResilienceTestVersion>
+    <!-- The latest Polly 8.x; never 9.x (commercially licensed). -->
+    <PollyTestVersion>8.9.1</PollyTestVersion>
+    <!-- .NET Aspire's service discovery, tests only. 10.11.0 needs Extensions 10.0.13 or later. -->
+    <ServiceDiscoveryTestVersion>10.11.0</ServiceDiscoveryTestVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TestMinimumDependencies)' == 'true'">
+    <ExtensionsTestVersion>$(ExtensionsMinimumVersion)</ExtensionsTestVersion>
+    <HttpResilienceTestVersion>$(HttpResilienceMinimumVersion)</HttpResilienceTestVersion>
+    <PollyTestVersion>$(PollyMinimumVersion)</PollyTestVersion>
+    <!-- Needs nothing above Extensions 10.0.0. -->
+    <ServiceDiscoveryTestVersion>10.0.0</ServiceDiscoveryTestVersion>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- ASP.NET Core packages target only their own .NET version, so the platform-drift run
+         (.github/workflows/platform-drift.yml), which moves the Extensions packages to a newer major, keeps
+         TestHost on one that runs on net10.0. -->
+    <AspNetCoreTestVersion Condition="'$(AspNetCoreTestVersion)' == ''">$(ExtensionsTestVersion)</AspNetCoreTestVersion>
   </PropertyGroup>
   <ItemGroup>
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="CodeStyle.NET" Version="1.0.0" />
-    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.11" />
+    <PackageVersion Include="coverlet.collector" Version="10.1.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="$(AspNetCoreTestVersion)" />
     <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Diagnostics" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.9.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.400" />
-    <PackageVersion Include="Polly.Extensions" Version="8.7.0" />
-    <PackageVersion Include="Polly.RateLimiting" Version="8.7.0" />
-    <!-- Pinned explicitly: RateLimiterFactory constructs these BCL types directly, and left to the
-         transitive reference from Polly.RateLimiting the package resolved 8.0.0, two majors behind
-         everything else here and outside central package management's reach for patching. -->
-    <PackageVersion Include="System.Threading.RateLimiting" Version="10.0.11" />
-    <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Http" Version="$(ExtensionsTestVersion)" />
+    <!-- Tests only: Polly v7's handler, to prove it is reported when it nests with this package's pipeline.
+         Ships with ASP.NET Core, so it follows the TestHost version. It brings the deprecated
+         Polly.Extensions.Http (AddTransientHttpErrorPolicy): the stack event 20 detects, so the tests need the
+         real one. The deprecated-package gate checks the shipped project only for this reason. -->
+    <PackageVersion Include="Microsoft.Extensions.Http.Polly" Version="$(AspNetCoreTestVersion)" />
+    <!-- Its Polly v7 dependency, pinned to v8's legacy package, which shares Polly.Core's exception types
+         (BrokenCircuitException, TimeoutRejectedException) instead of defining its own copies. -->
+    <PackageVersion Include="Polly" Version="$(PollyTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="$(HttpResilienceTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="$(ExtensionsTestVersion)" />
+    <!-- Tests only: .NET Aspire's service discovery, to prove handler order under ServiceDefaults. -->
+    <PackageVersion Include="Microsoft.Extensions.ServiceDiscovery" Version="$(ServiceDiscoveryTestVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="$(HttpResilienceTestVersion)" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+    <!-- Referenced by the library (capped, PollyVersionRange); listed so tests pin it to the same 8.x as
+         Polly.Extensions. -->
+    <PackageVersion Include="Polly.Core" Version="$(PollyTestVersion)" />
+    <PackageVersion Include="Polly.Extensions" Version="$(PollyTestVersion)" />
+    <PackageVersion Include="Polly.RateLimiting" Version="$(PollyTestVersion)" />
+    <PackageVersion Include="System.Threading.RateLimiting" Version="$(ExtensionsTestVersion)" />
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
   </ItemGroup>
 </Project>

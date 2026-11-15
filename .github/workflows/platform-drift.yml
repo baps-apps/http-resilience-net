@@ -1,0 +1,150 @@
+# Platform drift: the test suite against the newest Microsoft.Extensions.* / Microsoft.Extensions.Http.Resilience /
+# Polly releases, every week.
+#
+# The handler-group mechanism relies on IHttpClientFactory running HttpMessageHandlerBuilderActions and
+# HttpClientActions in list order, which it does but does not document (CLAUDE.md, rule 7). The package declares
+# minimum versions with no upper bound, so a consumer can resolve a platform release this repository has never
+# run. This workflow runs it first: ConsumerBoundaryTests, EveryPipelineShape_TalliesItsOwnHandlers and
+# PlatformSelfCheckTests fail if the order changes. A failed scheduled run opens (or comments on) an issue labelled
+# platform-drift. A consumer who resolves the release before this run sees it is covered at run time instead:
+# PlatformSelfCheck runs the same mechanism at host start and fails the start, naming the versions.
+#
+# Channels:
+#   pinned   the versions in Directory.Packages.props: the control, so a failure in the others is drift
+#   current  the newest stable release within the global.json .NET major: the graph most consumers resolve
+#   latest   the newest stable release of each package, a newer .NET major included
+#   preview  the newest release including prereleases (the next .NET major's previews, when published)
+
+name: Platform drift
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-drift
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read # CodeStyle.NET from the baps-apps GitHub Packages feed
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [pinned, current, latest, preview]
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+      CI: "true"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET (global.json)
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+
+      # The repository's GITHUB_TOKEN reads the organization feed when the CodeStyle.NET package grants this
+      # repository read access (package settings, "Manage Actions access"). Otherwise set PACKAGES_READ_TOKEN to a
+      # token with read:packages. Written to the runner's copy of nuget.config only.
+      - name: Authenticate the baps-apps-packages feed
+        env:
+          FEED_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          FEED_USER: ${{ github.actor }}
+        run: >
+          dotnet nuget update source baps-apps-packages --configfile nuget.config
+          --username "$FEED_USER" --password "$FEED_TOKEN" --store-password-in-clear-text
+
+      - name: Resolve platform versions
+        id: versions
+        run: python3 -I scripts/resolve-platform-versions.py "${{ matrix.channel }}"
+
+      # The versions arrive in an environment variable and are word-split by the shell on purpose: one -p: per
+      # property. The resolver accepts only NuGet version characters, so nothing else can reach the command line.
+      - name: Build
+        env:
+          VERSION_ARGS: ${{ steps.versions.outputs.args }}
+        run: dotnet build -c Release $VERSION_ARGS
+
+      # Release is the suite of record: Debug skips the allocation ceilings ([ReleaseOnlyFact]).
+      - name: Test
+        env:
+          VERSION_ARGS: ${{ steps.versions.outputs.args }}
+        run: >
+          dotnet test -c Release --no-build $VERSION_ARGS
+          --logger "trx;LogFilePrefix=${{ matrix.channel }}" --results-directory TestResults
+
+      # Read from the assets file the Build step's restore wrote with this channel's versions: `dotnet list package`
+      # takes no -p: arguments, so it would report the pinned versions or fail. A missing file means restore did
+      # not run, which the Build step has already reported.
+      - name: Record the resolved package graph
+        if: always()
+        run: |
+          mkdir -p TestResults
+          python3 -I - tests/HttpResilience.NET.Tests/obj/project.assets.json TestResults/packages.txt <<'EOF'
+          import json, pathlib, sys
+          assets, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          if not assets.exists():
+              out.write_text(f"{assets} not found: restore did not run\n")
+              sys.exit(0)
+          data = json.loads(assets.read_text())
+          lines = []
+          for framework, libraries in data["targets"].items():
+              lines.append(f"# {framework}")
+              lines += sorted(name.replace("/", " ") for name, lib in libraries.items() if lib.get("type") == "package")
+          out.write_text("\n".join(lines) + "\n")
+          print(out.read_text())
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.channel }}
+          path: TestResults/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  report:
+    name: Report drift
+    needs: test
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the platform-drift issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create platform-drift --color B60205 \
+            --description "The test suite fails on a newer platform release" 2>/dev/null || true
+
+          body="The weekly platform-drift run failed: $RUN_URL
+
+          If the **pinned** channel passed, a newer Microsoft.Extensions / Http.Resilience / Polly release breaks
+          this package or its tests, and consumers can resolve that release today. Start with the failing channel's
+          test results and packages.txt artifacts. If **pinned** failed too, the cause is not drift."
+
+          existing=$(gh issue list --label platform-drift --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Platform drift: tests fail on a newer platform release" \
+              --label platform-drift --body "$body"
+          fi

@@ -1,8 +1,8 @@
-using HttpResilience.NET.Options;
 using HttpResilience.NET.Tests.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Polly;
@@ -13,16 +13,8 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// What happens when a <i>consumer</i> also does something to a client this package configured.
 /// </summary>
 /// <remarks>
-/// A standing test axis rather than a set of one-off cases, for the same reason "the origin is slow" became
-/// one in <c>HedgingSafetyTests</c>. Every guard in this package was written against its own API, and a
-/// review found four defects in a row at this boundary instead: a consumer calling the platform's
-/// <c>AddStandardResilienceHandler</c> on the same client, a consumer setting <c>HttpClient.Timeout</c> in
-/// code, a consumer's <c>PostConfigure</c> reaching a value the package had captured. All four passed a
-/// 319-test suite, because no test had a consumer in it.
-/// <para>
-/// The rule for adding here: name what a consumer plausibly writes, then assert the outcome at the origin or
-/// on the constructed client -- not that registration threw.
-/// </para>
+/// Guards are written against this package's API, so these tests add a consumer to the same client and
+/// assert the outcome at the origin or on the constructed client -- not that registration threw.
 /// </remarks>
 public class ConsumerBoundaryTests
 {
@@ -46,7 +38,7 @@ public class ConsumerBoundaryTests
 
         var origin = new RecordingHandler();
         IHttpClientBuilder builder = services.AddHttpClient(name);
-        _ = hedged ? builder.AddHedgedHttpResilience() : builder.AddHttpResilience();
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
         builder.ConfigurePrimaryHttpMessageHandler(() => origin);
 
         return (services, builder, origin);
@@ -60,21 +52,15 @@ public class ConsumerBoundaryTests
     /// pipelines, and the package says so.
     /// </summary>
     /// <remarks>
-    /// This test pins a defect the package cannot prevent, which is why it asserts the damage as well as the
-    /// notice. Measured: one GET makes <b>nine</b> origin calls -- three configured attempts, each retried
-    /// three times by the outer pipeline -- and the total timeout is applied twice. Nothing throws.
+    /// The package cannot prevent this, so the test asserts the damage as well as the notice: one GET makes
+    /// <b>nine</b> origin calls. The supported <c>AddResilienceHandler</c> adds a handler to the same chain,
+    /// so the excess is not attributable through public API (see <c>ResilienceHandlerCountFilter</c>).
     /// <para>
-    /// It is not prevented because the excess is not attributable through public API: the escape hatch this
-    /// package documents, <c>AddResilienceHandler</c>, adds a handler to the same chain and is correct. See
-    /// <c>ResilienceHandlerCountFilter</c> for the alternatives that were measured and rejected. So the guard
-    /// reports at Information and the docs carry the warning.
-    /// </para>
-    /// <para>
-    /// Fails if the notice stops being emitted, or if the nesting arithmetic changes -- in which case the
-    /// number quoted in README.md and ARCHITECTURE.md is wrong and should be re-measured here first.
+    /// If the arithmetic changes, update the number quoted in README.md, ARCHITECTURE.md, OPERATIONS.md and
+    /// RUNBOOK.md.
     /// </para>
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task AConsumersOwnStandardHandler_NestsTwoPipelines_AndSaysSo()
     {
         var logs = new ListLoggerProvider();
@@ -85,7 +71,7 @@ public class ConsumerBoundaryTests
         await using ServiceProvider provider = services.BuildServiceProvider();
         HttpClient client = Create(provider);
 
-        (await client.GetAsync("http://origin.test/x")).Dispose();
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
 
         // Three configured attempts, retried three times by the outer pipeline. This is the damage.
         Assert.Equal(9, origin.Count);
@@ -97,21 +83,592 @@ public class ConsumerBoundaryTests
     }
 
     /// <summary>
+    /// The nested pipelines share the client's platform options, so the damage grows as the square of the
+    /// configured attempts: at the largest <c>Retry:MaxRetries</c> the schema accepts, 11 × 11 = <b>121</b>
+    /// origin calls for one failing GET.
+    /// </summary>
+    /// <remarks>
+    /// The figure OPERATIONS.md and RUNBOOK.md quote as the worst case. It assumes failures and backoff fit inside
+    /// <c>Timeout:Total</c>, as they do here (instant failures, no backoff).
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AConsumersOwnStandardHandler_AtTheMaximumRetries_Makes121OriginCalls()
+    {
+        (ServiceCollection services, IHttpClientBuilder builder, RecordingHandler origin) =
+            Client(Settings.Enabled().Set("Retry:MaxRetries", "10"));
+        builder.AddStandardResilienceHandler();
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        HttpClient client = Create(provider);
+
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(121, origin.Count);
+    }
+
+    /// <summary>
+    /// .NET Aspire's ServiceDefaults add the platform's standard handler to every client through
+    /// <c>ConfigureHttpClientDefaults</c>. This package replaces it on the clients it configures, with no call
+    /// from the consumer, whichever is registered first.
+    /// </summary>
+    /// <remarks>
+    /// Without the replacement the defaults' pipeline is outermost and its four attempts each run this package's
+    /// three: twelve origin calls. Fails if the defaults' handler survives (twelve calls, or four for hedging),
+    /// if the finite client timeout is lost, or if the replacement is not reported once.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task AnAspireStyleDefaultHandler_IsReplaced_WithNoCallFromTheConsumer(bool defaultsFirst, bool hedged)
+    {
+        var logs = new ListLoggerProvider();
+        var services = new ServiceCollection();
+        services.AddLogging(logging => logging.AddProvider(logs));
+        services.AddHttpResilience(Configuration(Settings.Hedged().Set("Hedging:Delay", "00:00:10")));
+
+        // The platform's defaults (three retries), with no delay so a surviving handler would not stall the test.
+        void AddDefaults() => services.ConfigureHttpClientDefaults(defaults => defaults
+            .AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+
+        if (defaultsFirst)
+        {
+            AddDefaults();
+        }
+
+        var origin = new RecordingHandler();
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
+        builder.ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        if (!defaultsFirst)
+        {
+            AddDefaults();
+        }
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        HttpClient client = Create(provider);
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+        RebuildHandlerChain(provider, "test");
+
+        // Standard: three attempts. Hedged: the primary and one hedged attempt after the 500.
+        Assert.Equal(hedged ? 2 : 3, origin.Count);
+        Assert.Equal(TimeSpan.FromSeconds(30) + TimeSpan.FromSeconds(30), client.Timeout);
+        Assert.DoesNotContain(logs.Records, r => r.Contains("resilience handlers;", StringComparison.Ordinal));
+
+        LogEntry notice = Assert.Single(logs.WithEvent(HttpResilience.NET.Internal.HttpResilienceLogging.ConfigurationCategory, 17));
+        Assert.Equal(LogLevel.Information, notice.Level);
+        Assert.Contains("'test'", notice.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// .NET Aspire's ServiceDefaults add service discovery <i>inside</i> the standard handler they add. This
+    /// package's pipeline takes the replaced handler's place, so the resolver stays inside it: every attempt is
+    /// resolved again, and the allow-list sees the logical authority the caller used.
+    /// </summary>
+    /// <remarks>
+    /// Defaults actions run before a named client's, so appending this package's handlers put the resolver
+    /// outside them. Fails if it is: the standard client's three attempts all reach one endpoint, and the hedged
+    /// client's allow-list sees <c>http://10.0.0.x:8080</c> and refuses the request.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task AspireServiceDefaults_KeepServiceDiscoveryInsideThePipeline(bool defaultsFirst, bool hedged)
+    {
+        (ServiceCollection services, List<string> reached) = ServiceDiscoveryClient(
+            hedged,
+            defaults =>
+            {
+                // The ServiceDefaults template's two calls, in its order.
+                defaults.AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero);
+                defaults.AddServiceDiscovery();
+            },
+            defaultsFirst);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider, "catalog").GetAsync("http://catalog/x", TestContext.Current.CancellationToken))
+            .Dispose();
+
+        // Standard: three attempts. Hedged: the primary and one hedged attempt after the 500.
+        Assert.Equal(hedged ? 2 : 3, reached.Count);
+        Assert.All(reached, authority => Assert.StartsWith("http://10.0.0.", authority, StringComparison.Ordinal));
+
+        // Resolved per attempt, so the round-robin selector spreads them over both endpoints.
+        Assert.Equal(2, reached.Distinct(StringComparer.Ordinal).Count());
+
+        List<string> chain = HandlerChain(provider, "catalog");
+        Assert.True(
+            chain.IndexOf("ResolvingHttpDelegatingHandler") > chain.IndexOf(nameof(Microsoft.Extensions.Http.Resilience.ResilienceHandler)),
+            $"The resolver must sit inside this package's pipeline: {string.Join(" > ", chain)}");
+    }
+
+    /// <summary>
+    /// Damage the package cannot prevent: ServiceDefaults that keep service discovery but drop the standard
+    /// handler leave nothing for this package to replace, so the resolver stays outermost, where it was put.
+    /// </summary>
+    /// <remarks>
+    /// A defaults handler and a client's own cannot be told apart through public API, so the rule stays
+    /// positional. All three attempts reach the one endpoint resolved before the pipeline ran. The documentation
+    /// says to keep <c>AddStandardResilienceHandler</c> in ServiceDefaults for this reason.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ServiceDiscoveryWithoutADefaultsHandler_StaysOutermost_AndPinsRetriesToOneEndpoint()
+    {
+        (ServiceCollection services, List<string> reached) = ServiceDiscoveryClient(
+            hedged: false,
+            defaults => defaults.AddServiceDiscovery(),
+            defaultsFirst: true);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider, "catalog").GetAsync("http://catalog/x", TestContext.Current.CancellationToken))
+            .Dispose();
+
+        Assert.Equal(3, reached.Count);
+        Assert.Single(reached.Distinct(StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// A client named <c>catalog</c> whose logical authority service discovery resolves, from configuration, to
+    /// two endpoints. Records the authority each attempt reached.
+    /// </summary>
+    private static (ServiceCollection Services, List<string> Reached) ServiceDiscoveryClient(
+        bool hedged,
+        Action<IHttpClientBuilder> addDefaults,
+        bool defaultsFirst)
+    {
+        Dictionary<string, string?> values = Settings.Enabled()
+            .Set("PipelineSelection:Authorities:0", "http://catalog")
+            .Set("Hedging:Delay", "00:00:10")
+            .Build();
+        values["services:catalog:http:0"] = "http://10.0.0.1:8080";
+        values["services:catalog:http:1"] = "http://10.0.0.2:8080";
+        IConfigurationRoot configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddServiceDiscovery();
+        services.AddHttpResilience(configuration);
+
+        var reached = new List<string>();
+        var origin = new RecordingHandler((request, _, _) =>
+        {
+            lock (reached)
+            {
+                reached.Add(request.RequestUri!.GetLeftPart(UriPartial.Authority));
+            }
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError));
+        });
+
+        if (defaultsFirst)
+        {
+            services.ConfigureHttpClientDefaults(addDefaults);
+        }
+
+        IHttpClientBuilder builder = services.AddHttpClient("catalog");
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
+        builder.ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        if (!defaultsFirst)
+        {
+            services.ConfigureHttpClientDefaults(addDefaults);
+        }
+
+        return (services, reached);
+    }
+
+    /// <summary>The client's delegating handlers by type name, outermost first.</summary>
+    private static List<string> HandlerChain(ServiceProvider provider, string name)
+    {
+        var chain = new List<string>();
+        HttpMessageHandler handler = provider.GetRequiredService<IHttpMessageHandlerFactory>().CreateHandler(name);
+        for (HttpMessageHandler? current = handler; current is DelegatingHandler delegating; current = delegating.InnerHandler)
+        {
+            chain.Add(current.GetType().Name);
+        }
+
+        return chain;
+    }
+
+    /// <summary>
+    /// The kill switch must not hand a client the defaults' pipeline: the platform's standard handler (.NET
+    /// Aspire's) retries every method, so a failing POST would reach the origin four times. A disabled client
+    /// loses the defaults' resilience handlers, says so once (event 19), and sends each request once.
+    /// </summary>
+    /// <remarks>
+    /// Fails if the defaults' handler is kept (four deliveries each), for a standard or hedged client switched
+    /// off by its own section or by the root kill switch.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false, "Enabled")]
+    [InlineData(false, "Clients:test:Enabled")]
+    [InlineData(true, "Enabled")]
+    public async Task ADisabledClient_LosesTheDefaultsHandler_SoAPostIsSentOnce(bool hedged, string switchKey)
+    {
+        var services = new ServiceCollection();
+        services.ConfigureHttpClientDefaults(defaults => defaults
+            .AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+        var logs = new ListLoggerProvider();
+        services.AddLogging(logging => logging.AddProvider(logs));
+        Settings settings = Settings.Enabled().Set(switchKey, "false");
+        if (hedged)
+        {
+            settings.Set("PipelineSelection:Authorities:0", "http://origin.test");
+        }
+
+        services.AddHttpResilience(Configuration(settings));
+
+        var origin = new RecordingHandler();
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
+        builder.ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        using HttpClient client = Create(provider);
+        using (var content = new StringContent("{}"))
+        {
+            (await client.PostAsync("http://origin.test/x", content, TestContext.Current.CancellationToken)).Dispose();
+        }
+
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(2, origin.Count);
+        Assert.Single(logs.WithEvent(HttpResilience.NET.Internal.HttpResilienceLogging.ConfigurationCategory, 19));
+    }
+
+    /// <summary>
+    /// A disabled client keeps the handlers registered for it in code, a resilience handler included: only what
+    /// <c>ConfigureHttpClientDefaults</c> added is removed.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ADisabledClient_KeepsItsOwnResilienceHandler()
+    {
+        var services = new ServiceCollection();
+        services.ConfigureHttpClientDefaults(defaults => defaults
+            .AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+        services.AddHttpResilience(Configuration(Settings.Enabled().Set("Enabled", "false")));
+
+        var origin = new RecordingHandler();
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        builder.AddResilienceHandler("own", pipeline => pipeline.AddRetry(new HttpRetryStrategyOptions
+        {
+            MaxRetryAttempts = 1,
+            Delay = TimeSpan.Zero
+        }));
+        builder.AddHttpResilienceHandler().ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        // The client's own retry (one attempt, one retry); without the defaults' pipeline around it (4 × 2).
+        Assert.Equal(2, origin.Count);
+    }
+
+    /// <summary>
+    /// A resilience handler the consumer adds to <i>this client</i> before this package's conflicts with it, so
+    /// client creation fails naming the fix, as a conflicting <c>HttpClient.Timeout</c> does. Deleting code the
+    /// consumer wrote, with an Information entry, is what this replaced.
+    /// </summary>
+    /// <remarks>
+    /// Told apart from a <c>ConfigureHttpClientDefaults</c> handler, which is replaced quietly, by a marker this
+    /// package places before the client's first earlier <c>Configure</c>. Fails if the consumer's handler is
+    /// replaced instead (the client is created) or if the defaults' handler is refused too.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AConsumersOwnResilienceHandler_AddedBefore_FailsClientCreation(bool standard, bool withAspireDefaults)
+    {
+        var services = new ServiceCollection();
+        if (withAspireDefaults)
+        {
+            services.ConfigureHttpClientDefaults(defaults => defaults.AddStandardResilienceHandler());
+        }
+
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        if (standard)
+        {
+            builder.AddStandardResilienceHandler();
+        }
+        else
+        {
+            builder.AddResilienceHandler("mine", pipeline => pipeline.AddTimeout(TimeSpan.FromSeconds(9)));
+        }
+
+        builder.AddHttpResilienceHandler().ConfigurePrimaryHttpMessageHandler(() => new RecordingHandler());
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => Create(provider));
+
+        Assert.Contains("'test'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("after AddHttpResilienceHandler", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same for a handler added through a registration whose client cannot be read without running it:
+    /// <c>AddOptions&lt;HttpClientFactoryOptions&gt;(name).Configure&lt;TDep&gt;</c> registers a factory, not a
+    /// <c>ConfigureNamedOptions</c> instance.
+    /// </summary>
+    /// <remarks>
+    /// Fails if only <c>ConfigureNamedOptions</c> instances place the marker: the consumer's handler is then taken
+    /// for a defaults one and deleted, and the client is created.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AConsumersResilienceHandler_FromAFactoryRegistration_AddedBefore_FailsClientCreation(
+        bool withAspireDefaults)
+    {
+        var services = new ServiceCollection();
+        if (withAspireDefaults)
+        {
+            services.ConfigureHttpClientDefaults(defaults => defaults.AddStandardResilienceHandler());
+        }
+
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+        services.AddOptions<HttpClientFactoryOptions>("test").Configure<IServiceProvider>((options, _) =>
+            options.HttpMessageHandlerBuilderActions.Add(handlerBuilder => handlerBuilder.AdditionalHandlers.Add(
+                new ResilienceHandler(new ResiliencePipelineBuilder<HttpResponseMessage>()
+                    .AddTimeout(TimeSpan.FromSeconds(9))
+                    .Build()))));
+
+        services.AddHttpClient("test").AddHttpResilienceHandler()
+            .ConfigurePrimaryHttpMessageHandler(() => new RecordingHandler());
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => Create(provider));
+
+        Assert.Contains("'test'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("after AddHttpResilienceHandler", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A factory registration nobody wrote for this client, before or after the platform's own, must not make the
+    /// defaults' handler look like the client's: it is still replaced and the client is created.
+    /// </summary>
+    /// <remarks>
+    /// Fails if a factory registration ahead of the platform's moves the marker before the defaults (every client
+    /// with .NET Aspire defaults would then fail creation), or if the defaults' handler survives (twelve calls).
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AnUnrelatedFactoryRegistration_KeepsTheDefaultsHandlerReplaceable(bool registeredFirst)
+    {
+        var services = new ServiceCollection();
+        void AddUnrelated() => services.AddTransient<IConfigureOptions<HttpClientFactoryOptions>>(
+            _ => new ConfigureNamedOptions<HttpClientFactoryOptions>("unrelated", _ => { }));
+
+        if (registeredFirst)
+        {
+            AddUnrelated();
+        }
+
+        services.ConfigureHttpClientDefaults(defaults =>
+            defaults.AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+        services.AddHttpClient("other");
+
+        if (!registeredFirst)
+        {
+            AddUnrelated();
+        }
+
+        var origin = new RecordingHandler();
+        services.AddHttpClient("test").AddHttpResilienceHandler().ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(3, origin.Count);
+    }
+
+    /// <summary>
+    /// Code the consumer wrote for the client before this package's call that is not a resilience handler (a
+    /// primary handler, a header) keeps the defaults' handler replaceable: only resilience handlers conflict.
+    /// </summary>
+    /// <remarks>
+    /// Both orders: the defaults' actions run before every named client's whenever they are registered, which is
+    /// what lets the marker separate the two. Fails if the defaults' handler is refused as the consumer's.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OtherConfigurationAddedBefore_StillLetsTheDefaultsHandlerBeReplaced(bool defaultsFirst)
+    {
+        var services = new ServiceCollection();
+        void AddDefaults() => services.ConfigureHttpClientDefaults(defaults => defaults
+            .AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+
+        if (defaultsFirst)
+        {
+            AddDefaults();
+        }
+
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+
+        var origin = new RecordingHandler();
+        services.AddHttpClient("test")
+            .ConfigurePrimaryHttpMessageHandler(() => origin)
+            .ConfigureHttpClient(client => client.DefaultRequestHeaders.Add("X-Caller", "orders"))
+            .AddHttpResilienceHandler();
+
+        if (!defaultsFirst)
+        {
+            AddDefaults();
+        }
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        // This package's three attempts; the defaults' four would make twelve if they nested.
+        Assert.Equal(3, origin.Count);
+    }
+
+    /// <summary>
+    /// A resilience handler added after this package's is the supported way to add a strategy, and is kept.
+    /// </summary>
+    /// <remarks>Fails if the replacement reaches past this package's handlers.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AHandlerAddedAfter_IsKept()
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+
+        var origin = new RecordingHandler();
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        builder.AddHttpResilienceHandler();
+        builder.AddResilienceHandler("after", pipeline => pipeline.AddTimeout(TimeSpan.FromSeconds(9)));
+        builder.ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        HttpMessageHandler handler = provider.GetRequiredService<IHttpMessageHandlerFactory>().CreateHandler("test");
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(3, origin.Count);
+
+        int resilienceHandlers = 0;
+        for (HttpMessageHandler? current = handler; current is DelegatingHandler delegating; current = delegating.InnerHandler)
+        {
+            resilienceHandlers += current is Microsoft.Extensions.Http.Resilience.ResilienceHandler ? 1 : 0;
+        }
+
+        // This package's standard handler and the consumer's "after" handler.
+        Assert.Equal(2, resilienceHandlers);
+    }
+
+    /// <summary>
+    /// Under <c>Connection:Enabled</c> the package turns handler rotation off (the pool's
+    /// <c>PooledConnectionLifetime</c> bounds connection age instead), so a finite <c>SetHandlerLifetime</c> on the
+    /// client is a conflicting value and fails client creation, as a conflicting <c>HttpClient.Timeout</c> does,
+    /// whichever is registered first.
+    /// </summary>
+    /// <remarks>Fails if the stated lifetime is silently overwritten (the client is created).</remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AFiniteHandlerLifetime_UnderConnectionEnabled_FailsClientCreation(bool lifetimeFirst)
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled().Set("Connection:Enabled", "true")));
+
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        if (lifetimeFirst)
+        {
+            builder.SetHandlerLifetime(TimeSpan.FromMinutes(5));
+        }
+
+        builder.AddHttpResilienceHandler();
+        if (!lifetimeFirst)
+        {
+            builder.SetHandlerLifetime(TimeSpan.FromMinutes(5));
+        }
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => Create(provider));
+
+        Assert.Contains("'test'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("SetHandlerLifetime", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("00:05:00", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The lifetime is the consumer's whenever it does not conflict: an infinite one agrees with
+    /// <c>Connection:Enabled</c>, and without it the package leaves rotation alone.
+    /// </summary>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(true, -1, -1)]
+    [InlineData(false, 300, 300)]
+    [InlineData(false, -1, -1)]
+    public async Task ANonConflictingHandlerLifetime_IsKept(bool connectionEnabled, int statedSeconds, int expectedSeconds)
+    {
+        static TimeSpan Seconds(int value) => value < 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(value);
+
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(
+            Settings.Enabled().Set("Connection:Enabled", connectionEnabled ? "true" : "false")));
+        services.AddHttpClient("test").SetHandlerLifetime(Seconds(statedSeconds)).AddHttpResilienceHandler();
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        Create(provider).Dispose();
+
+        Assert.Equal(
+            Seconds(expectedSeconds),
+            provider.GetRequiredService<IOptionsMonitor<HttpClientFactoryOptions>>().Get("test").HandlerLifetime);
+    }
+
+    /// <summary>
+    /// The platform's own <c>RemoveAllResilienceHandlers()</c> before this package's handler, which earlier
+    /// versions recommended, is no longer needed but still works: nothing is left for this package to replace.
+    /// </summary>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RemoveAllResilienceHandlers_BeforeThisPackage_UndoesTheDefaultsNesting(bool hedged)
+    {
+        var logs = new ListLoggerProvider();
+        var services = new ServiceCollection();
+        services.AddLogging(logging => logging.AddProvider(logs));
+        services.ConfigureHttpClientDefaults(defaults => defaults
+            .AddStandardResilienceHandler(options => options.Retry.Delay = TimeSpan.Zero));
+        services.AddHttpResilience(Configuration(Settings.Hedged().Set("Hedging:Delay", "00:00:10")));
+
+        var origin = new RecordingHandler();
+
+        // Experimental in the platform package (EXTEXP0001); the documentation says so.
+#pragma warning disable EXTEXP0001
+        IHttpClientBuilder builder = services.AddHttpClient("test").RemoveAllResilienceHandlers();
+#pragma warning restore EXTEXP0001
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
+        builder.ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        HttpClient client = Create(provider);
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        // Standard: three attempts. Hedged: the primary and one hedged attempt after the 500.
+        Assert.Equal(hedged ? 2 : 3, origin.Count);
+        Assert.Equal(TimeSpan.FromSeconds(30) + TimeSpan.FromSeconds(30), client.Timeout);
+        Assert.DoesNotContain(logs.Records, r => r.Contains("resilience handlers", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// The one symptom of that nesting the package <i>can</i> prevent: the finite client timeout survives it.
     /// </summary>
     /// <remarks>
-    /// The platform's resilience handler sets <see cref="HttpClient.Timeout"/> to
-    /// <see cref="Timeout.InfiniteTimeSpan"/> so its own total timeout is authoritative. This package puts a
-    /// finite bound back, because <c>Timeout:Total</c> stops applying at response headers and nothing else
-    /// bounds the response <i>body</i>. Measured before the fix: a second platform handler put the timeout
-    /// back to <c>-00:00:00.001</c>, so an origin could hold a connection and a buffer open indefinitely by
-    /// trickling a body, and the pipeline reported a fast successful attempt.
-    /// <para>
-    /// Fails if the client timeout goes back to being applied with <c>ConfigureHttpClient</c>, which is
-    /// last-wins and loses to any later registration.
-    /// </para>
+    /// The platform handler sets <see cref="HttpClient.Timeout"/> to infinite; this package restores a finite
+    /// bound for the response body. Fails if the client timeout is applied with <c>ConfigureHttpClient</c>,
+    /// which is last-wins and loses to any later registration.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ASecondPlatformHandler_DoesNotTakeAwayTheFiniteClientTimeout()
     {
         (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Enabled());
@@ -123,37 +680,14 @@ public class ConsumerBoundaryTests
     }
 
     /// <summary>
-    /// The same on the hedging pipeline, where the nesting multiplies fan-out rather than adding to it.
-    /// </summary>
-    [Fact]
-    public async Task AConsumersOwnHedgingHandler_IsReportedToo()
-    {
-        var logs = new ListLoggerProvider();
-        (ServiceCollection services, IHttpClientBuilder builder, _) =
-            Client(Settings.Hedged(), hedged: true, logs: logs);
-        builder.AddStandardHedgingHandler();
-
-        await using ServiceProvider provider = services.BuildServiceProvider();
-        Create(provider).Dispose();
-
-        Assert.Single(logs.Records, r => r.Contains("resilience handlers", StringComparison.Ordinal));
-    }
-
-    /// <summary>
     /// The escape hatch the documentation actually recommends still composes, and must not trip the guard.
     /// </summary>
     /// <remarks>
-    /// This is the half that matters for the guard being usable: <c>AddResilienceHandler</c> adds one more
-    /// <c>ResilienceHandler</c> to the chain, exactly as a second standard handler does, and the difference is
-    /// that it neither nests a retry loop nor resets <c>HttpClient.Timeout</c>. Measured: with it, the origin
-    /// still sees three calls and the client timeout is still finite.
-    /// <para>
-    /// That indistinguishability is why the guard reports instead of failing. The first version of it threw,
-    /// and this test is what caught it rejecting the pattern the README recommends. The notice naming both
-    /// possibilities is the accepted cost; a Warning here would have been worse.
-    /// </para>
+    /// <c>AddResilienceHandler</c> adds a <c>ResilienceHandler</c> just as a second standard handler does,
+    /// but neither nests a retry loop nor resets <c>HttpClient.Timeout</c>: the origin still sees three
+    /// calls. That indistinguishability is why the guard reports instead of failing.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TheSanctionedEscapeHatch_StillComposes()
     {
         (ServiceCollection services, IHttpClientBuilder builder, RecordingHandler origin) =
@@ -163,7 +697,7 @@ public class ConsumerBoundaryTests
         await using ServiceProvider provider = services.BuildServiceProvider();
         HttpClient client = Create(provider);
 
-        (await client.GetAsync("http://origin.test/x")).Dispose();
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
 
         Assert.Equal(3, origin.Count);
         Assert.Equal(TimeSpan.FromSeconds(30) + TimeSpan.FromSeconds(30), client.Timeout);
@@ -174,11 +708,10 @@ public class ConsumerBoundaryTests
     /// itself -- which is the supported way to migrate a client onto this package one step at a time.
     /// </summary>
     /// <remarks>
-    /// Fails if the guard starts counting handlers for clients this package registered no pipeline for. That
-    /// would turn <c>Enabled: false</c> from "adding the package changes nothing" into "adding the package
-    /// breaks a client that had its own resilience", which is the opposite of the flag's whole purpose.
+    /// Fails if the guard counts handlers for clients with no pipeline from this package, which would make
+    /// <c>Enabled: false</c> break a client that has its own resilience.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ADisabledClient_MayStillAddThePlatformHandlerItself()
     {
         (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Empty());
@@ -194,19 +727,11 @@ public class ConsumerBoundaryTests
     /// <c>Timeout:Total</c>.
     /// </summary>
     /// <remarks>
-    /// <c>ValidateTimeouts</c> refuses <c>Timeout:Client</c> at or below <c>Timeout:Total</c>, and the reason
-    /// is good: at that point it truncates the pipeline instead of backing it up, and does so with a bare
-    /// <see cref="TaskCanceledException"/> carrying none of the pipeline's context. Measured before the fix:
-    /// the identical value written as <c>ConfigureHttpClient(c =&gt; c.Timeout = 2s)</c> against a 30-second
-    /// total budget produced no failure and no warning, because it is not an options value and the validator
-    /// cannot see it.
-    /// <para>
-    /// <c>ConfigureHttpClient</c> actions run in registration order and last wins, so the fix is the one
-    /// already used for the primary handler: apply from a phase that runs after every registration. Fails if
-    /// the client timeout goes back to being applied with <c>ConfigureHttpClient</c>.
-    /// </para>
+    /// The same value as <c>Timeout:Client</c> would be refused by <c>ValidateTimeouts</c>. Fails if the
+    /// client timeout is applied with <c>ConfigureHttpClient</c> rather than from a post-configure that runs
+    /// after every registration.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AConsumersClientTimeout_FailsRatherThanTruncatingThePipeline()
     {
         (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Enabled());
@@ -226,27 +751,15 @@ public class ConsumerBoundaryTests
     /// pipeline, and the guard above cannot see it.
     /// </summary>
     /// <remarks>
-    /// This is the limit of <c>ApplyClientTimeout</c>, pinned rather than implied away, in the same spirit as
-    /// <see cref="AConsumersOwnStandardHandler_NestsTwoPipelines_AndSaysSo"/>. Every phase this package can
-    /// reach -- <c>ConfigureHttpClient</c>, <c>IPostConfigureOptions&lt;HttpClientFactoryOptions&gt;</c> --
-    /// runs while <see cref="IHttpClientFactory"/> is building the client. A typed client's constructor runs
-    /// <i>after</i> that, on the instance the factory has already finished with, so the last write is the
-    /// consumer's and no options validator, filter or post-configure exists that could observe it.
+    /// Every phase this package can reach runs while <see cref="IHttpClientFactory"/> builds the client; a
+    /// typed client's constructor runs afterwards, so nothing can observe it. Asserted at the origin: a
+    /// 30-second pipeline truncated to one second, one call, and a bare <see cref="TaskCanceledException"/>.
     /// <para>
-    /// The failure it produces is exactly the one <c>ValidateTimeouts</c> refuses when the same value is
-    /// written as <c>Timeout:Client</c>: a 30-second pipeline truncated to one second, one origin call, and a
-    /// bare <see cref="TaskCanceledException"/> carrying none of the pipeline's context. Asserted at the
-    /// origin because the count is what says the pipeline was cut short rather than merely reported on.
-    /// </para>
-    /// <para>
-    /// Documented in README.md, docs/ARCHITECTURE.md and docs/PRODUCTION-CHECKLIST.md, all of which said the
-    /// guard covered "setting HttpClient.Timeout in code" without qualification until this test was written.
-    /// If a future change does make this reachable -- an <c>IHttpClientFactory</c> phase that runs after
-    /// typed-client activation would be the only way -- this test failing is the signal to correct those
-    /// three documents, not to delete it.
+    /// Documented in README.md, docs/ARCHITECTURE.md and docs/PRODUCTION-CHECKLIST.md. If this ever becomes
+    /// detectable and the test fails, update those documents.
     /// </para>
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ATypedClientsConstructorTimeout_TruncatesThePipeline_AndNoGuardCanSeeIt()
     {
         var services = new ServiceCollection();
@@ -254,12 +767,12 @@ public class ConsumerBoundaryTests
 
         var origin = new RecordingHandler(async (_, _, cancellationToken) =>
         {
-            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
         });
 
         services.AddHttpClient<TruncatingTypedClient>("test")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => origin);
 
         using ServiceProvider provider = services.BuildServiceProvider();
@@ -280,20 +793,11 @@ public class ConsumerBoundaryTests
     /// from the value afterwards.
     /// </summary>
     /// <remarks>
-    /// This test asserted the opposite until the fourth review, and the reasoning it carried was wrong. It
-    /// said no non-colliding sentinel exists for a <see cref="TimeSpan"/> whose unset value is a real
-    /// duration -- true, and beside the point, because the ambiguity was never in the value. It was in the
-    /// moment of reading. <c>ApplyClientTimeout</c> now registers an action at index <b>0</b> of
-    /// <c>HttpClientActions</c>, which runs before every <c>ConfigureHttpClient</c> and before the platform
-    /// handler's own assignment, and normalises the timeout to infinite. Anything finite that survives to
-    /// the last action is therefore a consumer statement by construction, and 100 seconds stops being a
-    /// special case.
-    /// <para>
-    /// Production change that would make this fail: removing the index-0 normalizing action, or restoring
-    /// the 100-second branch. Either one silently swallows a deliberate assignment again.
-    /// </para>
+    /// <c>ApplyClientTimeout</c> normalises the timeout to infinite with an action at index <b>0</b> of
+    /// <c>HttpClientActions</c>, so any finite value at the last action was assigned by the consumer.
+    /// Fails if that action is removed or 100 seconds is special-cased.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AConsumersHundredSecondTimeout_IsRefusedLikeAnyOtherConflictingValue()
     {
         (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Enabled());
@@ -313,11 +817,10 @@ public class ConsumerBoundaryTests
     /// A client nothing assigned a timeout to still gets the resolved one.
     /// </summary>
     /// <remarks>
-    /// The failure direction of the change above: normalizing to infinite before the consumer's actions is
-    /// only safe while the last action still reads infinite as "nobody stated one". Production change that
-    /// would make this fail: treating infinite as a consumer statement.
+    /// The other direction: infinite at the last action means nobody stated a timeout. Fails if infinite is
+    /// treated as a consumer statement.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AClientNothingAssignedATimeoutTo_StillGetsTheResolvedOne()
     {
         (ServiceCollection services, _, _) = Client(Settings.Enabled());
@@ -351,10 +854,9 @@ public class ConsumerBoundaryTests
     /// The same value stated the supported way is accepted, and reaches the client.
     /// </summary>
     /// <remarks>
-    /// The point of the failure above is that there is a right place to say this. If the schema could not
-    /// express it, the guard would be an obstruction rather than a redirection.
+    /// The guard redirects to a supported setting; it must not be an obstruction.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheSameBoundStatedAsTimeoutClient_ReachesTheClient()
     {
         (ServiceCollection services, _, _) =
@@ -369,11 +871,9 @@ public class ConsumerBoundaryTests
     /// A consumer's <c>ConfigureHttpClient</c> that does not touch the timeout is left alone.
     /// </summary>
     /// <remarks>
-    /// Setting a default request header is the ordinary use of that method, and it must keep working. Fails
-    /// if the guard starts rejecting any <c>ConfigureHttpClient</c> registration rather than a conflicting
-    /// timeout.
+    /// Fails if the guard rejects any <c>ConfigureHttpClient</c> rather than a conflicting timeout.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AConsumersOtherClientConfiguration_IsUntouched()
     {
         (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Enabled());
@@ -391,16 +891,16 @@ public class ConsumerBoundaryTests
     /// A client this package never registered is not examined at all.
     /// </summary>
     /// <remarks>
-    /// Both new guards run from container-wide extension points -- a handler-builder filter and a
-    /// post-configure on <c>HttpClientFactoryOptions</c> -- so the blast radius if they misjudge which
-    /// clients they own is every client in the process. Fails if either starts asserting on a stranger.
+    /// Both guards run from container-wide extension points (a handler-builder filter and a post-configure
+    /// on <c>HttpClientFactoryOptions</c>), so a misjudgement would affect every client. Fails if either
+    /// acts on a client this package did not register.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AnUnrelatedClient_IsNotExaminedByEitherGuard()
     {
         var services = new ServiceCollection();
         services.AddHttpResilience(Configuration(Settings.Enabled()));
-        services.AddHttpClient("test").AddHttpResilience();
+        services.AddHttpClient("test").AddHttpResilienceHandler();
 
         IHttpClientBuilder stranger = services.AddHttpClient("stranger");
         stranger.AddStandardResilienceHandler();
@@ -412,22 +912,69 @@ public class ConsumerBoundaryTests
     }
 
     /// <summary>
+    /// Root <c>Connection</c> settings reach only clients registered with this package, never one the
+    /// application did not opt in, including the unnamed default client behind <c>CreateClient()</c> and an
+    /// injected <see cref="HttpClient"/>.
+    /// </summary>
+    /// <remarks>
+    /// The connection filter is container-wide, and the unnamed client shares its name with the root options,
+    /// so reading options by client name alone handed it the root values. Fails if the filter acts on a client
+    /// the registration does not list.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData("")]
+    [InlineData("stranger")]
+    public void RootConnectionSettings_DoNotReachAClientThatNeverOptedIn(string name)
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled()
+            .Set("Connection:Enabled", "true")
+            .Set("Connection:AllowAutoRedirect", "false")));
+        services.AddHttpClient("test").AddHttpResilienceHandler();
+
+        var sockets = new SocketsHttpHandler { AllowAutoRedirect = true, ConnectTimeout = TimeSpan.FromSeconds(42) };
+        services.AddHttpClient(name).ConfigurePrimaryHttpMessageHandler(() => sockets);
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        Create(provider, name).Dispose();
+
+        Assert.True(sockets.AllowAutoRedirect, "root Connection:AllowAutoRedirect reached a client that never opted in.");
+        Assert.Equal(TimeSpan.FromSeconds(42), sockets.ConnectTimeout);
+        Assert.Equal(Timeout.InfiniteTimeSpan, sockets.PooledConnectionLifetime);
+    }
+
+    /// <summary>
+    /// The same client with a customised <see cref="HttpClientHandler"/> is still created: the refusal that
+    /// protects a registered client's settings does not apply to a client this package does not configure.
+    /// </summary>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData("")]
+    [InlineData("stranger")]
+    public void RootConnectionSettings_DoNotFailAClientThatNeverOptedIn(string name)
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled().Set("Connection:Enabled", "true")));
+        services.AddHttpClient("test").AddHttpResilienceHandler();
+
+        var handler = new HttpClientHandler { UseProxy = false };
+        services.AddHttpClient(name).ConfigurePrimaryHttpMessageHandler(() => handler);
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        Create(provider, name).Dispose();
+
+        Assert.False(handler.UseProxy);
+    }
+
+    /// <summary>
     /// Every pipeline shape accounts for exactly the resilience handlers it adds, so the notice fires on a
     /// nested pipeline and stays silent on a correct one.
     /// </summary>
     /// <remarks>
-    /// The tally recorded at registration is arithmetic over the same conditions that decide which handlers to
-    /// add, and that duplication is the risk. It is not theoretical: the first version assumed the platform's
-    /// hedging handler contributed one handler where it contributes <b>two</b> -- a routing handler around the
-    /// hedging one -- and reported every hedged client in the suite as nested.
-    /// <para>
-    /// Both halves are asserted per shape, because each catches a different drift. A tally that is too low
-    /// fails the silent half; a tally that is too high fails the reporting half. Fails if the platform changes
-    /// how many handlers either of its handlers adds -- which is the point: this names the cause instead of
-    /// leaving thirty unrelated failures.
-    /// </para>
+    /// The registration tally duplicates the conditions that decide which handlers are added, so it can
+    /// drift. The platform's hedging handler contributes <b>two</b> handlers (routing and hedging). A tally
+    /// too low fails the silent half; too high fails the reporting half.
     /// </remarks>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData(false, false, false)]
     [InlineData(false, true, false)]
     [InlineData(false, false, true)]
@@ -467,9 +1014,11 @@ public class ConsumerBoundaryTests
         // Too high, and a second pipeline goes unreported.
         var nestedLogs = new ListLoggerProvider();
         (ServiceCollection nested, IHttpClientBuilder builder, _) = Client(Shape(), hedged, logs: nestedLogs);
+        // A second platform hedging handler fails client creation (PlatformOptionsOwnershipTests), so the
+        // hedged shape is tallied against the escape hatch, which the count cannot tell apart from it.
         if (hedged)
         {
-            builder.AddStandardHedgingHandler();
+            builder.AddResilienceHandler("extra", pipeline => pipeline.AddTimeout(TimeSpan.FromSeconds(9)));
         }
         else
         {
@@ -488,18 +1037,11 @@ public class ConsumerBoundaryTests
     /// The notice is emitted once per client, not once per handler construction.
     /// </summary>
     /// <remarks>
-    /// <see cref="IHttpClientFactory"/> rebuilds a client's handler chain every time the handler lifetime
-    /// expires -- every two minutes by default -- and every
-    /// <see cref="Microsoft.Extensions.Http.IHttpMessageHandlerBuilderFilter"/> runs again each time. Without
-    /// deduplication this notice would repeat for the life of the process, which turns a diagnostic into noise
-    /// and is exactly why every other notice here reports once.
-    /// <para>
-    /// The filter is driven directly rather than by waiting for a rotation, because the alternative is a test
-    /// that sleeps -- and a timing-dependent assertion is not one this suite accepts. Fails if the
-    /// deduplicating set is removed.
-    /// </para>
+    /// <see cref="IHttpClientFactory"/> rebuilds the handler chain on every rotation (every two minutes by
+    /// default) and reruns every filter. The filter is driven directly rather than by waiting for a rotation.
+    /// Fails if the deduplicating set is removed.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheNestingNotice_IsEmittedOncePerClient_NotOncePerHandlerConstruction()
     {
         var logs = new ListLoggerProvider();
@@ -520,18 +1062,12 @@ public class ConsumerBoundaryTests
     /// <c>Connection:Enabled</c> on for the pool settings.
     /// </summary>
     /// <remarks>
-    /// The package used to assign <c>AllowAutoRedirect</c> unconditionally from the resolved value, which for
-    /// a standard client that stated nothing is the runtime default of <see langword="true"/> -- so the one
-    /// property on a consumer's handler that is a security control was reversed by a connection-pool switch,
-    /// while TROUBLESHOOTING.md told its owner the handler's other settings were preserved. The runtime strips
-    /// <c>Authorization</c> across a redirect and re-sends <c>X-Api-Key</c> and every other custom credential
-    /// header verbatim, so the reversal is a credential-disclosure path, not a preference.
-    /// <para>
-    /// Production change that would make this fail: dropping the <c>AllowAutoRedirectStated</c> check in
-    /// <c>SocketsHttpHandlerFactory.ApplyRedirectBound</c>.
-    /// </para>
+    /// An unstated <c>AllowAutoRedirect</c> resolves to <see langword="true"/> for a standard client, and must
+    /// not overwrite a consumer's <see langword="false"/>. The runtime re-sends custom credential headers such
+    /// as <c>X-Api-Key</c> across redirects. Fails if the <c>OptionsComposition.IsRedirectStated</c> check in
+    /// <c>SocketsHttpHandlerFactory.ApplyRedirectBound</c> is dropped.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AConsumersOwnRedirectBound_SurvivesConnectionTuning()
     {
         var services = new ServiceCollection();
@@ -540,7 +1076,7 @@ public class ConsumerBoundaryTests
         var hardened = new SocketsHttpHandler { AllowAutoRedirect = false, MaxConnectionsPerServer = 7 };
         services.AddHttpClient("test")
             .ConfigurePrimaryHttpMessageHandler(() => hardened)
-            .AddHttpResilience();
+            .AddHttpResilienceHandler();
 
         using ServiceProvider provider = services.BuildServiceProvider();
         Create(provider).Dispose();
@@ -549,8 +1085,7 @@ public class ConsumerBoundaryTests
             hardened.AllowAutoRedirect,
             "a redirect bound the consumer set on its own handler was reversed by Connection:Enabled.");
 
-        // The properties the schema always states are still applied, so this is not a blanket "stop touching
-        // the handler" -- only the one the schema had no opinion about.
+        // The properties the schema always states are still applied; only the unstated one is left alone.
         Assert.Equal(TimeSpan.FromSeconds(3), hardened.ConnectTimeout);
         Assert.Equal(TimeSpan.FromMinutes(2), hardened.PooledConnectionLifetime);
         Assert.Equal(7, hardened.MaxConnectionsPerServer);
@@ -560,11 +1095,10 @@ public class ConsumerBoundaryTests
     /// The other direction: a schema that <i>does</i> state the value still wins over the consumer's handler.
     /// </summary>
     /// <remarks>
-    /// Without this, the fix above would be indistinguishable from "never write AllowAutoRedirect", which
-    /// would silently drop a stated <c>Connection:AllowAutoRedirect</c> and leave a hedged client following
-    /// redirects around its own allow-list.
+    /// Guards against "never write AllowAutoRedirect", which would let a hedged client follow redirects
+    /// around its allow-list.
     /// </remarks>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData(false, "true", true)]
     [InlineData(false, "false", false)]
     [InlineData(true, null, false)]
@@ -586,7 +1120,7 @@ public class ConsumerBoundaryTests
         var consumers = new SocketsHttpHandler { AllowAutoRedirect = !expected };
         IHttpClientBuilder builder = services.AddHttpClient("test")
             .ConfigurePrimaryHttpMessageHandler(() => consumers);
-        _ = hedged ? builder.AddHedgedHttpResilience() : builder.AddHttpResilience();
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
 
         using ServiceProvider provider = services.BuildServiceProvider();
         Create(provider).Dispose();
@@ -595,18 +1129,14 @@ public class ConsumerBoundaryTests
     }
 
     /// <summary>
-    /// A hedged client whose primary handler has no redirect switch at all. The bound cannot be applied, and
-    /// that used to be silent.
+    /// A hedged client whose primary handler has no redirect switch at all: the bound cannot be applied, and a
+    /// Warning says so.
     /// </summary>
     /// <remarks>
-    /// Reported rather than thrown: this shape is overwhelmingly a test stub, which resolves no redirects and
-    /// cannot breach the bound, and the way out of a throw would be to state
-    /// <c>Connection:AllowAutoRedirect</c> true -- switching a security bound off to make a test compile. The
-    /// shape that is a genuine hazard, a handler wrapping a <see cref="SocketsHttpHandler"/> of its own, is
-    /// indistinguishable from it here. So the gap gets a Warning naming the client, and this test is what
-    /// stops it going back to silence.
+    /// Reported rather than thrown, because this is usually a test stub that resolves no redirects. A handler
+    /// wrapping its own <see cref="SocketsHttpHandler"/> looks the same here, so the Warning names the client.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AHedgedClientWhoseHandlerHasNoRedirectSwitch_SaysTheBoundWasNotApplied()
     {
         var logs = new ListLoggerProvider();
@@ -619,7 +1149,7 @@ public class ConsumerBoundaryTests
         RebuildHandlerChain(provider, "test");
 
         string record = Assert.Single(
-            logs.Records, r => r.Contains("could not apply the redirect bound", StringComparison.Ordinal));
+            logs.Records, r => r.Contains("could not disable redirects", StringComparison.Ordinal));
 
         Assert.StartsWith("[Warning]", record, StringComparison.Ordinal);
         Assert.Contains("RecordingHandler", record, StringComparison.Ordinal);
@@ -629,7 +1159,7 @@ public class ConsumerBoundaryTests
     /// <summary>
     /// The same client with a handler that <i>does</i> carry the switch says nothing, and the bound holds.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AHedgedClientWithASocketsHandler_AppliesTheBoundAndSaysNothing()
     {
         var logs = new ListLoggerProvider();
@@ -640,14 +1170,14 @@ public class ConsumerBoundaryTests
         var handler = new SocketsHttpHandler { AllowAutoRedirect = true };
         services.AddHttpClient("test")
             .ConfigurePrimaryHttpMessageHandler(() => handler)
-            .AddHedgedHttpResilience();
+            .AddHttpResilienceHedgingHandler();
 
         using ServiceProvider provider = services.BuildServiceProvider();
         Create(provider).Dispose();
 
         Assert.False(handler.AllowAutoRedirect);
         Assert.DoesNotContain(
-            logs.Records, r => r.Contains("could not apply the redirect bound", StringComparison.Ordinal));
+            logs.Records, r => r.Contains("could not disable redirects", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -659,9 +1189,8 @@ public class ConsumerBoundaryTests
         HttpClientFactoryOptions options =
             provider.GetRequiredService<IOptionsMonitor<HttpClientFactoryOptions>>().Get(clientName);
 
-        // The innermost action is what adds the handlers, exactly as DefaultHttpClientFactory composes it --
-        // so the filters that wrap it see the same chain a real rotation would produce. Running the filters
-        // over an empty builder would have made this test pass with the deduplication removed.
+        // The innermost action adds the handlers, as DefaultHttpClientFactory composes it, so the filters see
+        // the chain a real rotation produces.
         Action<HttpMessageHandlerBuilder> configure = handlerBuilder =>
         {
             foreach (Action<HttpMessageHandlerBuilder> action in options.HttpMessageHandlerBuilderActions)
@@ -702,18 +1231,10 @@ public class ConsumerBoundaryTests
     /// A consumer's <c>PostConfigure</c> reaches the rate limiter the client actually runs on.
     /// </summary>
     /// <remarks>
-    /// The limiter was built from the <see cref="HttpResilienceOptions"/> instance captured at registration,
-    /// while <see cref="Microsoft.Extensions.Options.IOptionsMonitor{TOptions}"/> handed back a different
-    /// one. Measured before the fix: the monitor reported a permit budget of 50 and the pipeline enforced 2,
-    /// with startup validation clean -- so a consumer lowering a budget in code got the higher registration
-    /// value, and every dashboard showed the lower one.
-    /// <para>
-    /// This is the one value that was not live, and nothing caught it: the rate limiter's shape is not in
-    /// <c>StructuralDecisions</c>, so <c>NamedPipelineOptionsValidator</c> had nothing to compare. Fails if
-    /// the limiter goes back to being built from a registration-time snapshot.
-    /// </para>
+    /// Every limiter is built from live options inside its keyed factory. Fails if the limiter is built from
+    /// a registration-time snapshot, which <c>NamedPipelineOptionsValidator</c> would not detect.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PostConfigure_ReachesTheRateLimiterTheClientRunsOn()
     {
         (ServiceCollection services, _, RecordingHandler origin) = Client(
@@ -733,7 +1254,7 @@ public class ConsumerBoundaryTests
         {
             try
             {
-                (await client.GetAsync("http://origin.test/x")).Dispose();
+                (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
                 admitted++;
             }
             catch (Polly.RateLimiting.RateLimiterRejectedException)
@@ -745,5 +1266,180 @@ public class ConsumerBoundaryTests
         // The post-configured budget, not the one in the configuration file.
         Assert.Equal(5, admitted);
         Assert.Equal(5, origin.Count);
+    }
+
+    /// <summary>
+    /// <c>ConfigureHttpClientDefaults</c> passes a builder with no name, so there is no section to read.
+    /// The failure must say so rather than surface as an <see cref="ArgumentNullException"/> from inside.
+    /// </summary>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ConfigureHttpClientDefaults_FailsWithAMessageNamingTheAlternative(bool hedged)
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Hedged()));
+
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() =>
+            services.ConfigureHttpClientDefaults(builder =>
+                _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler()));
+
+        Assert.Contains("ConfigureHttpClientDefaults", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("AddHttpClient", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Aspire", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("replaced", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("RemoveAllResilienceHandlers", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A consumer that clears the factory's <c>HttpClientActions</c> also removes the markers this package uses
+    /// to find each handler group's client actions. Nothing of the package's is left to remove, so client
+    /// creation proceeds, with the pipeline and the client timeout intact.
+    /// </summary>
+    /// <remarks>
+    /// Fails if a missing pair of markers throws again: every <c>CreateClient</c> would fail with a message
+    /// about markers the consumer has never heard of. Run with a handler group active and inactive.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AConsumerClearingHttpClientActions_KeepsThePipelineAndTheClientTimeout(bool concurrencyLimiter)
+    {
+        Settings settings = Settings.Enabled();
+        if (concurrencyLimiter)
+        {
+            settings.Set("ConcurrencyLimiter:Enabled", "true").Set("ConcurrencyLimiter:Limit", "5");
+        }
+
+        (ServiceCollection services, _, RecordingHandler origin) = Client(settings);
+        services.Configure<HttpClientFactoryOptions>("test", options => options.HttpClientActions.Clear());
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        using HttpClient client = Create(provider);
+
+        (await client.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(3, origin.Count);
+        Assert.Equal(TimeSpan.FromSeconds(60), client.Timeout); // Timeout:Total 30 s + the 30 s allowance
+    }
+
+    /// <summary>
+    /// The handler groups depend on <c>HttpMessageHandlerBuilderActions</c> running in registration order. A
+    /// consumer that reorders that list breaks them, and client creation fails with a message naming the list
+    /// and the cause, not an internal marker.
+    /// </summary>
+    /// <remarks>Fails if the message stops naming the list or what the consumer did to it.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public void AConsumerReorderingHandlerBuilderActions_FailsClientCreation_NamingTheCause()
+    {
+        (ServiceCollection services, _, _) = Client(Settings.Enabled());
+        services.Configure<HttpClientFactoryOptions>("test", options =>
+        {
+            Action<HttpMessageHandlerBuilder>[] reversed = [.. options.HttpMessageHandlerBuilderActions];
+            Array.Reverse(reversed);
+            options.HttpMessageHandlerBuilderActions.Clear();
+            foreach (Action<HttpMessageHandlerBuilder> action in reversed)
+            {
+                options.HttpMessageHandlerBuilderActions.Add(action);
+            }
+        });
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => Create(provider));
+
+        Assert.Contains("HttpMessageHandlerBuilderActions", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("removed or reordered", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A consumer that strips this package's handlers after registering it leaves the client with no resilience
+    /// at all. That is warned (event 16), naming the client, and the damage is asserted: one origin call where
+    /// the pipeline would make three.
+    /// </summary>
+    /// <remarks>Fails if the missing-handler check is removed.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task RemovingThisPackagesHandlers_AfterRegistration_IsWarned()
+    {
+        var logs = new ListLoggerProvider();
+        (ServiceCollection services, IHttpClientBuilder builder, RecordingHandler origin) =
+            Client(Settings.Enabled(), logs: logs);
+#pragma warning disable EXTEXP0001
+        builder.RemoveAllResilienceHandlers();
+#pragma warning restore EXTEXP0001
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Equal(1, origin.Count);
+
+        LogEntry warning = Assert.Single(logs.WithEvent(HttpResilience.NET.Internal.HttpResilienceLogging.ConfigurationCategory, 16));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains("'test'", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Replacing this package's handler with one of the consumer's own keeps the handler count the same, so a
+    /// count cannot see it. The check follows this package's handlers by identity instead.
+    /// </summary>
+    /// <remarks>Fails if the check falls back to counting every resilience handler in the chain.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ReplacingThisPackagesHandler_WithTheConsumersOwn_IsStillWarned()
+    {
+        var logs = new ListLoggerProvider();
+        (ServiceCollection services, IHttpClientBuilder builder, _) = Client(Settings.Enabled(), logs: logs);
+#pragma warning disable EXTEXP0001
+        builder.RemoveAllResilienceHandlers();
+#pragma warning restore EXTEXP0001
+        builder.AddResilienceHandler("mine", pipeline => pipeline.AddTimeout(TimeSpan.FromSeconds(5)));
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Single(logs.WithEvent(HttpResilience.NET.Internal.HttpResilienceLogging.ConfigurationCategory, 16));
+    }
+
+    /// <summary>
+    /// The supported setups never warn: an extra handler of the consumer's own, a disabled client, the platform's
+    /// handlers removed before this package's (the Aspire fix), and every handler group active.
+    /// </summary>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData("extra handler")]
+    [InlineData("disabled client")]
+    [InlineData("removed before")]
+    [InlineData("every group")]
+    public async Task SupportedSetups_DoNotWarnAboutMissingHandlers(string setup)
+    {
+        var logs = new ListLoggerProvider();
+        Settings settings = setup switch
+        {
+            "disabled client" => Settings.Enabled().Set("Enabled", "false"),
+            "every group" => Settings.Enabled()
+                .Set("ConcurrencyLimiter:Enabled", "true").Set("ConcurrencyLimiter:Limit", "5")
+                .Set("RateLimiter:Enabled", "true").Set("RateLimiter:PermitLimit", "100"),
+            _ => Settings.Enabled()
+        };
+
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(settings));
+        services.AddLogging(logging => logging.AddProvider(logs));
+
+        IHttpClientBuilder builder = services.AddHttpClient("test");
+        if (setup == "removed before")
+        {
+#pragma warning disable EXTEXP0001
+            builder.RemoveAllResilienceHandlers();
+#pragma warning restore EXTEXP0001
+        }
+
+        builder.AddHttpResilienceHandler().ConfigurePrimaryHttpMessageHandler(() => new RecordingHandler());
+        if (setup == "extra handler")
+        {
+            builder.AddResilienceHandler("mine", pipeline => pipeline.AddTimeout(TimeSpan.FromSeconds(5)));
+        }
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        (await Create(provider).GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Assert.Empty(logs.WithEvent(HttpResilience.NET.Internal.HttpResilienceLogging.ConfigurationCategory, 16));
     }
 }

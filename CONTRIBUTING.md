@@ -1,160 +1,156 @@
-# Contributing to HttpResilience.NET
-
-Thank you for your interest in contributing! This guide covers what you need to get started.
+# Contributing
 
 ## Prerequisites
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) or later
-- A Git client
-- An editor that supports C# (Visual Studio, VS Code with C# Dev Kit, Rider, etc.)
+- .NET 10 SDK 10.0.404 or a later 10.0.4xx patch (`global.json`, `rollForward: latestPatch`). The floor is the
+  current security release, so an unpatched SDK cannot build or publish the package; raise it with each one.
+- A GitHub PAT with `read:packages`: `nuget.config` restores `CodeStyle.NET` and the package validation baseline
+  (`HttpResilience.NET`, previous release) from the internal feed, so `dotnet restore` and `dotnet pack` fail
+  without it ([scripts/README.md](scripts/README.md#restoring-from-baps-apps-packages)).
+- Python 3 for the documentation checks; PowerShell 7 (`pwsh`) for the publish scripts.
 
-## Getting started
-
-```bash
-git clone https://github.com/baps-apps/http-resilience-net.git
-cd http-resilience-net
-dotnet restore
-dotnet build
-```
-
-## Running tests
+## Build and test
 
 ```bash
-# Behavior and unit tests
-dotnet test tests/HttpResilience.NET.Tests
-
-# Against a real Kestrel and real sockets
-dotnet test tests/HttpResilience.NET.IntegrationTests
-
-# All tests
-dotnet test
+dotnet build -c Release
+dotnet test -c Release        # the suite of record
 ```
 
-**Run `dotnet test -c Release` before calling a suite green.** Bare `dotnet test` builds Debug, where every
-`[ReleaseOnlyFact]` — the allocation ceilings — reports as skipped rather than run. CI runs both legs.
+**Use `-c Release`.** Debug skips every `[ReleaseOnlyFact]` (the allocation ceilings) rather than running it.
+After a root build, build a test project explicitly before trusting a `--no-build` run.
 
-The other gates CI applies, all runnable locally:
+| Project | Contents |
+| --- | --- |
+| `tests/HttpResilience.NET.Tests` | Behavior (one file per guarantee, `Behavior/`) and unit tests |
+| `tests/HttpResilience.NET.IntegrationTests` | `TestServer` end to end; real Kestrel sockets for redirects and HTTP/2 |
+| `tests/HttpResilience.NET.AotSmoke` | Native AOT binary running `SmokeScenarios`: bound values, both pipelines, `Connection:Enabled` and host start (also run under JIT by the integration tests) |
+| `benchmarks/HttpResilience.NET.Benchmarks` | BenchmarkDotNet; quoted reports live in `docs/benchmarks/` |
+| `samples/HttpResilience.NET.Sample` | Console sample on the generic host, so startup validation, the startup client check and the startup notices run; `SampleConfigurationTests` validates its `appsettings.json` |
+
+## Release gates
+
+There is no CI for changes. Run these locally before merging and before releasing (the one workflow is the
+weekly [platform-drift run](#platform-drift)):
 
 ```bash
-dotnet format whitespace --verify-no-changes          # whitespace only, on purpose — see CLAUDE.md
-dotnet list package --vulnerable --include-transitive # CI fails on any hit
-python3 scripts/check-benchmark-docs.py               # docs/benchmarks figures vs the raw reports
-dotnet publish tests/HttpResilience.NET.AotSmoke -c Release -r osx-arm64   # proves the AOT claim
+dotnet test -c Release
+dotnet test -c Release -p:TestMinimumDependencies=true  # the same suite on the minimum dependency versions the
+                                                      # package declares (Directory.Packages.props)
+dotnet format whitespace --verify-no-changes          # whitespace only: full `dotnet format` reports
+                                                      # trim warnings the real build never emits
+dotnet list package --vulnerable --include-transitive # any hit blocks the change
+dotnet list src/HttpResilience.NET package --deprecated --include-transitive  # any hit blocks the change; the
+                                                      # shipped project only: the tests need the deprecated
+                                                      # Polly.Extensions.Http, the v7 stack event 20 detects
+python3 scripts/check-benchmark-docs.py               # docs/benchmarks allocation figures vs the raw reports
+python3 scripts/check-benchmark-docs.py --against <dir>/results  # vs a fresh run, when hot-path code changed
+python3 scripts/check-readme-links.py                 # README links absolute: it is the package page
+python3 scripts/check-public-api-shipped.py           # releases: PublicAPI.Unshipped.txt must be empty
+dotnet pack src/HttpResilience.NET -c Release          # package validation against the last published version
+
+# Proves trim/AOT at run time (a trimmed reflective binder leaves defaults instead of throwing): publishes and
+# runs the AotSmoke binary. Plain `dotnet test` runs the same scenarios under JIT.
+HTTPRESILIENCE_AOT_SMOKE=1 dotnet test tests/HttpResilience.NET.IntegrationTests -c Release --filter "FullyQualifiedName~NativeAotSmokeTests"
 ```
 
-## Project structure
+The Native AOT publish needs the platform's native toolchain (Xcode command-line tools on macOS, `clang` and
+`zlib` headers on Linux). The Homebrew .NET SDK on macOS links against Homebrew's OpenSSL: the test appends
+`/opt/homebrew/lib` (or `/usr/local/lib`) to `LIBRARY_PATH` when `libssl.dylib` is there. If the link still fails
+with `ld: library 'ssl' not found`, install it (`brew install openssl@3`) or put its `lib` directory on
+`LIBRARY_PATH`.
 
-```text
-src/
-  HttpResilience.NET/          Core library (NuGet package)
-tests/
-  HttpResilience.NET.Tests/              Behavior + unit tests
-  HttpResilience.NET.IntegrationTests/   Real Kestrel and real sockets
-  HttpResilience.NET.AotSmoke/           Native AOT publish, asserts bound values at run time
-benchmarks/
-  HttpResilience.NET.Benchmarks/         BenchmarkDotNet; reports land in docs/benchmarks/
-samples/
-  HttpResilience.NET.Sample/   Console sample app, smoke-tested in CI
-docs/                          Extended documentation
+### Platform drift
+
+The package declares minimum dependency versions with no upper bound, and its handler groups rely on list order
+in `IHttpClientFactory` that the platform does not document. [`.github/workflows/platform-drift.yml`](.github/workflows/platform-drift.yml)
+runs the Release suite every Monday, and on demand (**Actions > Platform drift > Run workflow**), on four
+channels: `pinned` (the versions in `Directory.Packages.props`, the control), `current` (newest stable within
+the `global.json` .NET major: the graph most consumers resolve), `latest` (newest stable Microsoft.Extensions,
+Http.Resilience and Polly on nuget.org, a newer .NET major included) and `preview` (prereleases included). A failed
+scheduled run opens or comments on an issue labelled `platform-drift`; the run's summary lists the versions
+used, and its artifacts hold the test results and the resolved package graph.
+
+Reproduce a channel locally (bash, which splits the arguments):
+
+```bash
+dotnet test -c Release $(python3 scripts/resolve-platform-versions.py latest)
 ```
 
-## Making changes
+When `current` passes, raise the test versions in `Directory.Packages.props` to match, so `pinned` follows; the
+tests target `net10.0`, so `pinned` never moves to `latest`'s newer major. The feed authentication step needs
+the `CodeStyle.NET` package to grant this repository read access (package settings, **Manage Actions access**),
+or a `PACKAGES_READ_TOKEN` secret with `read:packages`.
 
-1. **Fork** the repository and create a branch from `main`.
-2. **Write or update tests** for any new functionality or bug fix.
-3. **Follow existing code style** – the solution uses central package management (`Directory.Packages.props`), nullable reference types, and implicit usings.
-4. **Keep commits focused** – one logical change per commit with a clear message.
-5. **Run the full test suite** before pushing: `dotnet test`.
-6. **Open a pull request** against `main` with a description of _what_ changed and _why_.
+## Rules for changes
 
-## Coding guidelines
-
-- Target `net10.0`.
-- Use nullable annotations (`#nullable enable`) throughout.
-- Prefer `IConfiguration` / `IConfigurationSection` binding over hard-coded values.
-- Add XML doc comments on public APIs (`GenerateDocumentationFile` is enabled).
-- Keep methods small and single-purpose; resilience strategies should be independently testable.
-- Avoid adding new package dependencies unless strictly necessary – changes go through `Directory.Packages.props`.
-- **Record every public member in `src/HttpResilience.NET/PublicAPI.Unshipped.txt` in the same commit.**
-  `Microsoft.CodeAnalysis.PublicApiAnalyzers` plus `TreatWarningsAsErrors` make an unrecorded addition,
-  removal or signature change a build error, and RS0016 quotes the exact line to add. Moving Unshipped into
-  Shipped is a release step, not a per-PR one.
-- **No reflective option binding.** `EnableConfigurationBindingGenerator` is what makes the `IsTrimmable` and
-  `IsAotCompatible` declarations true; a reflective binding call reintroduced here fails the build.
-- The package **configures** `Microsoft.Extensions.Http.Resilience` and implements no strategy of its own.
-  The twelve rules that keep it that way are in [CLAUDE.md](CLAUDE.md) and
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); a change that violates one should expect to be pushed back on.
-
-## Configuration and options changes
-
-When adding or changing a key on `HttpResilienceOptions`:
-
-- **Add the rule to `Internal/HttpResilienceOptionsValidator.cs`, not a data annotation.** Annotations cannot
-  express a `TimeSpan` range or a relationship between two properties, and they are scoped to a single options
-  name so they silently skip every per-client registration. Every message names the config path, the value,
-  the expectation and the reason.
-- **Add the key to the table in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).** That is the only place the
-  whole schema is listed, and `ConfigurationReferenceTests` fails the build when a key is missing from it.
-- Decide whether the key is a _value_ option or a _structural_ one. A new key is a value option by default;
-  one that decides **which handlers exist** goes in `Internal/StructuralDecisions.cs`, and that should be a
-  deliberate act. Anything built from options belongs in a factory that reads `IOptionsMonitor`, never in a
-  closure over the registration snapshot.
-- Update the sample `appsettings.json` in `samples/HttpResilience.NET.Sample`; `SampleConfigurationTests`
-  holds it to the validator, and CI runs the sample.
-- Update `README.md` where the concept is explained, and [docs/RECIPES.md](docs/RECIPES.md) if there is a
-  configuration worth showing.
+- **The package configures `Microsoft.Extensions.Http.Resilience`; it implements no strategy.** The rules that
+  keep it that way are in [CLAUDE.md](CLAUDE.md) (Architecture) and
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#design-rules). Expect push-back on a change that breaks one.
+- **Never read configuration at registration.** Anything built from options goes in a factory or delegate that
+  reads `IOptionsMonitor` when the client is built. A key that decides whether a handler exists adds a predicate
+  to that handler's `AddHandlerGroup` call, and its pipeline delegate must add nothing when the predicate is
+  false.
+- **Each validation rule lives in one place, never in data annotations**: `HttpResilienceOptionsValidator`
+  (values, platform limits), `NamedPipelineOptionsValidator` (per client, inert keys), `RootSectionRules`
+  (root-only), `RenamedKeyRules` / `UnknownKeyRules` / `SchemaVersionRules` (keys) and
+  `UnusedClientSectionValidator`. Messages name the key, value, expectation and reason.
+- **Every public member goes in `src/HttpResilience.NET/PublicAPI.Unshipped.txt` in the same commit**; an
+  unrecorded change is a build error (RS0016 quotes the line).
+- **No reflective option binding.** The configuration binding source generator is what makes the trim/AOT
+  declarations true.
+- **Dependencies** go through `Directory.Packages.props`. The library references each at its **minimum**
+  version and references directly every package whose types it uses; raise a minimum only when an API needs it.
+- **New or changed key**: add it to the table in [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
+  (`ConfigurationReferenceTests` fails otherwise), update the sample's `appsettings.json` (and
+  `SampleConfigurationTests` if you add a client), and update `README.md` / `docs/RECIPES.md` where relevant.
+- **Behavior change**: add a `CHANGELOG.md` entry under `[Unreleased]`, classified by
+  [docs/VERSIONING.md](docs/VERSIONING.md) (a default change and a new validation rule are both MAJOR).
 
 ## Tests
 
-Tests assert **behavior**, not that registration does not throw — the 1.0 suite had 64 tests that almost all
-asserted "did not throw" and caught none of the four critical defects.
+- Assert behavior (origin call counts, delivered bodies, gauge readings), never just "did not throw".
+- **A test that cannot fail proves nothing.** For a safety test, make the production change that should break
+  it, watch it fail, revert.
+- "A consumer also does X to this client" is a standing axis: `Behavior/ConsumerBoundaryTests.cs`.
+- Measure platform behavior (`MeterListener`, origin counts); do not assume it.
+- No sleeps where a deterministic mechanism exists (`RecordingHandler.WaitForCountAsync`, `FakeTimeProvider`), and
+  wait for a condition, never for "nothing changed for N ms".
+- Every test states `Timeout = TestTimeouts.Default` and passes `TestContext.Current.CancellationToken` to
+  anything that takes one; `EveryTest_HasATimeout` and xUnit1051 enforce both.
 
-- One file per guarantee under `Behavior/`, wired through the public API.
-- **A test that cannot fail proves nothing.** Name the production change that would make a new safety test
-  fail, then make that change and watch it fail.
-- "A consumer also does X to this client" is a standing axis, in `Behavior/ConsumerBoundaryTests.cs`.
-- Claims about platform behavior get measured — a `MeterListener`, an origin call count, the health-state
-  dictionary — not assumed.
+## Releasing
 
-## Commit messages
+1. Run the [release gates](#release-gates).
+2. Move `PublicAPI.Unshipped.txt` into `PublicAPI.Shipped.txt`, review the diff as the API change list, then
+   run `python3 scripts/check-public-api-shipped.py`. A `*REMOVED*` line is not copied: delete the matching line
+   from Shipped instead.
+3. After publishing, set `PackageValidationBaselineVersion` to the version just published and empty
+   `CompatibilitySuppressions.xml` (its breaks are now in the baseline). Update `PackageReleaseNotes` in the
+   csproj for the next release, leading with anything that changes behavior without a compile error.
+4. Move `[Unreleased]` in `CHANGELOG.md` under the new version, and replace `Unreleased` in the version's
+   heading (`## [3.0.0] - Unreleased`) with the publish date.
+5. Commit steps 2 and 4 and the `<Version>` bump. The script refuses a working tree with uncommitted or
+   untracked changes, builds from that commit and tags it; step 3 goes in a commit after publishing.
+6. `pwsh scripts/publish-package.ps1` ([scripts/README.md](scripts/README.md#package-publishing)). It runs the
+   release gates above (except a fresh benchmark run) and the Release test suite, and stops on the first
+   failure; it signs and verifies the package, and refuses to start without a certificate
+   ([Package signing](scripts/README.md#package-signing)) unless `-AllowUnsigned` is passed. Publishing
+   a version that already exists replaces it and moves its tag. Consumers that already restored it keep the
+   old copy in their NuGet cache until they clear it (`dotnet nuget locals all --clear`).
 
-Use clear, imperative-mood commit messages:
+### Patching the previous major
 
-```text
-Add per-authority pipeline selection mode
-Fix retry jitter calculation for sub-second delays
-Update the configuration reference for TokenBucket keys
-```
+Security fixes only, inside the window in [SECURITY.md](SECURITY.md#supported-versions) (2.x until 2027-05-14):
 
-## Pull request checklist
-
-- [ ] Code compiles without warnings (`dotnet build`). `TreatWarningsAsErrors` is on, so this also gates
-      analyzer, code-style and XML-doc regressions.
-- [ ] All existing and new tests pass in **both** configurations: `dotnet test` and `dotnet test -c Release`.
-- [ ] Public API changes include XML doc comments **and** a line in `PublicAPI.Unshipped.txt`.
-- [ ] `README.md`, [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and the other relevant `docs/` pages are
-      updated if behavior changed. A claim in a document that nothing compares against the code is the kind
-      that drifts.
-- [ ] `CHANGELOG.md` has an entry, under `[Unreleased]` if no version is being cut, classified by
-      [docs/VERSIONING.md](docs/VERSIONING.md) — a default change and a new validation rule are both MAJOR.
-- [ ] No secrets, credentials, or personal paths are committed.
-
-## Reporting issues
-
-Open a [GitHub issue](https://github.com/baps-apps/http-resilience-net/issues) with:
-
-- A clear title and description.
-- Steps to reproduce (if applicable).
-- Expected vs. actual behavior.
-- .NET SDK version and OS.
-
-## Versioning
-
-This project follows [Semantic Versioning](https://semver.org/). See [docs/VERSIONING.md](docs/VERSIONING.md) for the full policy.
+1. Branch `release/2.x` from the tag `v2.0.0` (later patches: from the branch). Its first commit copies the
+   current `scripts/` directory, so the patch is published with today's release gates and signing.
+2. Make the fix with a test, set `<Version>` to the next patch (`2.0.1`), and add its `## [2.0.1]` section to that
+   branch's `CHANGELOG.md`.
+3. Publish from the branch with `pwsh scripts/publish-package.ps1`, then add the same section to `main`'s
+   CHANGELOG, below the current major's.
 
 ## License
 
-Proprietary. Copyright (c) BAPS, all rights reserved. This repository carries no open-source license and
-grants no rights outside the organization; contributions are made as work for the organization and are
-covered by the same terms. The package is published to GitHub Packages under `baps-apps` and must not be
-pushed to nuget.org.
+Proprietary. Copyright (c) BAPS, all rights reserved. Contributions are work for the organization under the
+same terms. The package is published to GitHub Packages under `baps-apps` and must never be pushed to
+nuget.org.

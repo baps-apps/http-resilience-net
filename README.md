@@ -1,74 +1,106 @@
 # HttpResilience.NET
 
-Standardized outbound HTTP resilience for .NET services: one validated configuration schema, safe defaults, and a fixed pipeline shape, over [`Microsoft.Extensions.Http.Resilience`](https://learn.microsoft.com/dotnet/core/resilience/http-resilience) and [Polly](https://www.pollydocs.org/).
+Standard outbound HTTP resilience for .NET services: one validated configuration schema, safe defaults and a
+fixed pipeline shape, on top of [`Microsoft.Extensions.Http.Resilience`](https://learn.microsoft.com/dotnet/core/resilience/http-resilience)
+and [Polly](https://www.pollydocs.org/).
 
-The package **configures** the platform's resilience handlers. It does not implement retry, timeouts, circuit breaking, rate limiting or connection pooling itself, and it does not stand between you and a future improvement to any of them.
+The package **configures** the platform's handlers. Retry, timeouts, circuit breaking, rate limiting and
+connection pooling are Microsoft's and Polly's; this package supplies validated values for them.
 
-## What it gives you
+- **Validated at startup.** Messages name the key, the value, what was expected and why.
+- **Safe by default.** Only GET, HEAD, OPTIONS and TRACE are retried or hedged. Anything else needs a
+  per-client opt-in, and every opted-in client logs a startup Warning.
+- **Fixed pipeline order.** You set values, not strategy order.
+- **Bounded telemetry.** No metric tag comes from request data.
+- **Guards where consumers collide.** A second registration on a client throws; a conflicting
+  `HttpClient.Timeout` fails client creation; an extra resilience handler is reported.
 
-- **A validated schema.** Every rule is checked at startup, for every client, with messages that name the property, the value, the expected range and the reason.
-- **Safe defaults, on by default.** Only GET, HEAD, OPTIONS and TRACE are ever repeated. Every other method — POST, PUT, PATCH, DELETE, and anything non-standard — is retried or hedged only if you say so, per client, in writing.
-- **A fixed pipeline shape.** Ordering is not configurable, because ordering is where resilience pipelines go wrong.
-- **Connection standardization.** `SocketsHttpHandler` settings applied consistently, and applied after every other registration so nothing can take them away.
-- **Bounded telemetry.** Nothing derived from a request URI ever becomes a metric tag, and a hedged client's destinations are allow-listed so the platform's own per-authority series stay bounded too.
-- **A dependency health check.** Circuit breaker state, reported as **Degraded and never Unhealthy** — which is what stops a dependency outage restarting a healthy pod.
-- **Guards at the consumer boundary.** A second registration on the same client fails; a conflicting `HttpClient.Timeout` fails; a client carrying a handler this package did not add is reported. What each guard cannot see is stated where it is documented rather than implied to be airtight.
+## Install
+
+```bash
+dotnet add package HttpResilience.NET --version 3.0.0
+```
+
+Published to the internal `baps-apps` GitHub Packages feed only ([Distribution](#distribution-and-license)).
+Upgrading from 2.x: see `3.0.0` in [CHANGELOG.md](https://github.com/baps-apps/http-resilience-net/blob/main/CHANGELOG.md).
+Moving from `AddStandardResilienceHandler` or `AddStandardHedgingHandler`: **the defaults differ** (20 s total
+instead of 30 s, 2 retries instead of 3, a 5 s cap on retry waits, POST never retried or hedged). The
+[side-by-side table](https://github.com/baps-apps/http-resilience-net/blob/main/docs/CONFIGURATION.md#differences-from-addstandardresiliencehandler)
+lists every difference and the values that keep the platform's timing.
 
 ## Quick start
 
-```json
-{
-  "HttpResilience": {
-    "Enabled": true,
-    "Timeout": { "Total": "00:00:20", "Attempt": "00:00:05" },
-    "Retry": { "MaxRetries": 2, "BaseDelay": "00:00:00.500" }
-  }
-}
-```
-
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
+builder.Services.AddHttpResilience(builder.Configuration);   // once, anywhere
 
-builder.Services.AddHttpResilience(builder.Configuration);
-
-builder.Services.AddHttpClient<IOrdersApi, OrdersApi>()
-    .AddHttpResilience("Orders");
+builder.Services.AddHttpClient("Orders").AddHttpResilienceHandler();
 ```
 
-That is the whole minimum. Every value except `Enabled` shown above is already the default, so a service that states nothing else gets the standard pipeline.
-
-**`Enabled` is opt-in and defaults to `false`,** so adding this package never changes how an existing client behaves until someone says so. Because a forgotten key produces exactly the same state as a deliberate opt-out, a client registered with resilience switched off logs a **Warning** naming the key, at startup, before the service accepts traffic.
-
-`AddHttpResilience(configuration)` is idempotent, so a shared platform extension and the application using it may both call it. Calling it with a *different* section fails at startup, because clients registered on either side of the second call would read different configuration.
-
-Every key, default and validation rule: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
-
-## Per-client configuration
-
-Clients name a section under `HttpResilience:Clients`. Values not stated are inherited from the root, so a client states only what it changes.
+Every value has a default and the `HttpResilience` section is optional. To change values, add it:
 
 ```json
 {
   "HttpResilience": {
-    "Enabled": true,
     "Timeout": { "Total": "00:00:20", "Attempt": "00:00:05" },
-
+    "Retry": { "MaxRetries": 2 },
     "Clients": {
-      "Orders":  { "Timeout": { "Total": "00:00:10", "Attempt": "00:00:03" } },
-      "Reports": { "Timeout": { "Total": "00:02:00", "Attempt": "00:00:30" } }
+      "Orders": { "Timeout": { "Total": "00:00:10", "Attempt": "00:00:03" } }
     }
   }
 }
 ```
 
-```csharp
-builder.Services.AddHttpClient("Orders").AddHttpResilience();
-builder.Services.AddHttpClient("Reports").AddHttpResilience();
+- **Calling `AddHttpResilienceHandler()` is the opt-in.** `HttpResilience:Clients:{name}:Enabled: false`
+  turns one client off; the root `HttpResilience:Enabled: false` turns every client off (a kill switch). Each
+  disabled client logs a startup Warning naming the key.
+- **Order does not matter.** Configuration is read when a client is first created, so clients may be
+  registered before `AddHttpResilience`, and configuration sources added later are honoured.
+- **Changes need a restart.** There is no reload.
+- **Root values can be set in code**, alone or on top of configuration:
+
+  ```csharp
+  builder.Services.AddHttpResilience(builder.Configuration, options => options.Retry.MaxRetries = 3);
+  ```
+
+  Applied after the root section and before each client's section. It cannot switch off a safe-method guard;
+  the kill switch is configuration-only.
+
+Every key, default and rule: **[docs/CONFIGURATION.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/CONFIGURATION.md)**.
+
+## What fails startup, and how to opt out
+
+A mistake that would leave a client on defaults it was not meant to have fails the deployment. Read this before
+sharing one configuration file across services.
+
+| Fails startup | Why | Opt out |
+| --- | --- | --- |
+| A key the schema does not have (`Retry:Enable`) | The binder ignores it, so the default stays in force | `HttpResilience:SchemaVersion` newer than the package: a Warning instead (event 18). `HttpResilience:AllowUnknownKeys: true`: no check |
+| A `Clients:{name}` section no registered client reads | A misnamed section (`OrdersApi` for `IOrdersApi`) configures nothing | `HttpResilience:AllowUnusedClientSections: true` |
+| A client whose handler chain cannot be built | Fails at host start, not at the first request | `HttpResilience:ValidateClientsOnStart: false` |
+| `HttpClient.Timeout` set in `ConfigureHttpClient` to another value | It would cut the pipeline short | None: set `Timeout:Client` instead ([RECIPES.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RECIPES.md#setting-httpclienttimeout)) |
+| A value out of range, or a rule broken (`Timeout:Attempt` ≥ `Total`) | The platform would reject it later, or it would do nothing | None: the message names the key, the value and the fix |
+
+**One file shared by many services** (an organization-wide `appsettings.json`, a config server, Helm values):
+each service registers only some clients, and services upgrade at different times. State the package version
+the file was written for, so a service on an older 3.x logs the keys it does not know (Warning event 18) instead
+of failing, while a typo in a file written for its own version still fails; and allow unused client sections:
+
+```json
+{ "HttpResilience": { "SchemaVersion": "3.0", "AllowUnusedClientSections": true } }
 ```
 
-A client reads the section named after it, so the name is written once. Pass a different name to read someone else's section, or `string.Empty` to use only the root values.
+A `SchemaVersion` with a newer major (`4.0` read by 3.x) fails startup: a major may rename keys.
 
-**The name is `IHttpClientBuilder.Name`, which for a typed client comes from `IHttpClientFactory` and not from this schema.** For the two-generic overload that is `TClient` — the *interface*:
+The three switches are root-only. Set in code, they win over configuration whatever the registration order:
+`services.Configure<HttpResilienceStartupOptions>(o => o.AllowUnknownKeys = true)`. See
+[RECIPES.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RECIPES.md#one-configuration-file-shared-by-many-services).
+
+## Per-client configuration
+
+A client reads `HttpResilience:Clients:{name}` on top of the root, so it states only what it changes. Lists
+(`Retry:RetryableMethods`, `PipelineSelection:Authorities`) **replace** the root's list; they are not merged.
+
+**A typed client's name comes from `IHttpClientFactory`**; for the two-generic overload it is the interface:
 
 | Registration | Section it reads |
 | --- | --- |
@@ -76,57 +108,39 @@ A client reads the section named after it, so the name is written once. Pass a d
 | `AddHttpClient<OrdersApi>()` | `Clients:OrdersApi` |
 | `AddHttpClient<IOrdersApi, OrdersApi>()` | `Clients:`**`IOrdersApi`** |
 
-A leading `I` in a configuration file is nobody's first guess, so name the section explicitly when it matters:
+Pass the section name to avoid surprises: `.AddHttpResilienceHandler("Orders")`. A client with no section of
+its own reads the root values.
 
-```csharp
-builder.Services.AddHttpClient<IOrdersApi, OrdersApi>().AddHttpResilience("Orders");
-```
+- **Register once per client.** A second `AddHttpResilienceHandler` or `AddHttpResilienceHedgingHandler` on
+  the same client throws (nested pipelines multiply retries).
+- **Not inside `ConfigureHttpClientDefaults`**: it has no client name, so the call throws. .NET Aspire
+  ServiceDefaults need no change: their standard handler is replaced on each client this package configures
+  ([RECIPES.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RECIPES.md#a-net-aspire-service-servicedefaults)).
 
-**A section under `Clients` that no client reads fails startup.** Inert configuration reads exactly like configuration that is in force — the client runs on root defaults and nothing says so. The message names the section, lists the sections that *are* read, and mentions the typed-client rule above, because that is the usual cause. If one configuration file is deliberately shared by services registering different subsets of clients, set `HttpResilience:AllowUnusedClientSections` to `true`.
+## Retrying a POST (or any non-safe method)
 
-**A client section replaces a list it states, rather than adding to the root's.** Both of the schema's lists — `Retry:RetryableMethods` and `PipelineSelection:Authorities` — are allow-lists, so widening is the unsafe direction, and the binder's default behavior of adding to a collection would let a client widen an inherited list but never narrow one. A client that states no list of its own still inherits the root's, so a fleet-wide allow-list is still expressible in one place.
-
-Client names live under their own `Clients` child, so a client may be called `Retry` or `Timeout` without colliding with the schema.
-
-Resilience can only be added once per client. A second `AddHttpResilience` on the same name fails at startup rather than nesting two pipelines.
-
-## Retrying a non-idempotent request
-
-Only the methods RFC 9110 defines as safe — GET, HEAD, OPTIONS, TRACE — are retried. Everything else is left alone, including methods this package has never heard of: a WebDAV `MOVE` or `PROPPATCH`, a cache `PURGE`, any `new HttpMethod("...")`. This is an **allow-list**, not a deny-list of the five familiar mutating verbs — a deny-list retries whatever it has not been told about.
-
-If an endpoint deduplicates on an idempotency key, opt in explicitly:
+Only when the endpoint deduplicates on an idempotency key, and only for that client:
 
 ```json
-{
-  "HttpResilience": {
-    "Clients": {
-      "Payments": {
-        "Retry": { "RetryableMethods": [ "GET", "POST" ] }
-      }
-    }
-  }
-}
+{ "HttpResilience": { "Clients": { "Payments": { "Retry": { "RetryableMethods": [ "GET", "POST" ] } } } } }
 ```
 
-The allow-list replaces the default guard entirely: only the methods you name are retried. It is also the only way to retry a non-standard method.
-
-Four rules make "per client" real rather than advisory:
-
-- **Every client that can repeat a mutating request logs one Warning at startup** (event 10), naming the client, the methods and the key that allowed it — by either mechanism, the allow-list included. "Which of our clients can duplicate a mutation?" is an incident question that should be answerable from logs rather than by grepping configuration across repositories.
-- **Neither `DisableForUnsafeHttpMethods` flag may be `false` at the root.** One key there decides that every standard client in the process — including clients registered later that state nothing — may deliver a mutating request to its origin more than once. Whether that is safe is a property of one endpoint's idempotency handling, and there is no fleet-wide answer to it. Startup fails and names the client section to move it to.
-- **`Retry:RetryableMethods` may narrow at the root, but not widen.** A root list of `["GET"]` restricts every client and is safer than the default. Naming an *unsafe* method there reaches every standard client by exactly the route the flag is refused for, so it is refused too.
-- **Stating the flag beside a list in force is refused, in either direction.** An allow-list wins outright in the pipeline, so a `DisableForUnsafeHttpMethods` beside one is bound and never read. The direction that reads as harmless is the one that matters: a client writing `true` beside a list is writing the *protective* statement and having it discarded. Measured before this was refused — a clean startup and three POST bodies at the origin.
-
-**To narrow a client back to safe methods under an inherited list, give it an empty list.** `"RetryableMethods": []` means *no allow-list*, so the client returns to the default guard. It does not disable retries; `Retry:Enabled` is the off switch.
-
-**A retried request must carry re-playable content.** A retry re-sends the same `HttpRequestMessage`, so `StringContent`, `ByteArrayContent` and `JsonContent` replay correctly and a single-pass stream does not. Measured: a `StreamContent` over a non-seekable stream retried three times delivers the body once and then **an empty body twice**, with no exception thrown. Buffer it first with `await content.LoadIntoBufferAsync()`, or build fresh content per attempt.
+- The list **replaces** the default guard: only the listed methods are retried. It is an allow-list, so
+  unfamiliar methods (`MOVE`, `PURGE`) are never retried unless listed.
+- The root cannot widen this for everyone: a root list may name only safe methods, and neither
+  `DisableForUnsafeHttpMethods` flag may be `false` at the root.
+- An empty client list (`"RetryableMethods": []`) restores the safe-method guard under an inherited list.
+- **Content must be replayable.** A `StreamContent` over a non-seekable stream is delivered once, then the
+  retry throws `HttpRequestException` although the origin already received the request, so a caller that
+  retries on failure sends it again. Call `await content.LoadIntoBufferAsync()` first.
 
 ## Hedging
 
-Hedging races concurrent copies of a request and takes the first success. It multiplies outbound traffic, so it is selected in code, never by a configuration value:
+Hedging sends a second copy of a slow request and takes the first answer. It multiplies traffic, so it is
+chosen in code, instead of (not with) `AddHttpResilienceHandler`:
 
 ```csharp
-builder.Services.AddHttpClient("Search").AddHedgedHttpResilience();
+builder.Services.AddHttpClient("Search").AddHttpResilienceHedgingHandler();
 ```
 
 ```json
@@ -142,312 +156,157 @@ builder.Services.AddHttpClient("Search").AddHedgedHttpResilience();
 }
 ```
 
-Mutating methods are excluded by default, on the same safe-method allow-list as retries. Hedged attempts are *simultaneous*, so unlike retries they give an origin's idempotency key no serialization to rely on.
-
-The exclusion covers **both** ways a hedged attempt starts. Polly begins one either because an attempt completed and failed, or because the hedging delay elapsed while every attempt was still running — and only the first consults an outcome predicate. The second is the case hedging exists for, a slow primary, so a guard written only as `ShouldHandle` would let a slow POST reach the origin `1 + MaxHedgedAttempts` times with its body while every test using a fast origin passed. The timer path is closed separately, by suppressing the attempt itself.
-
-**A hedged client must list the authorities it may call.** The hedging handler keeps a circuit breaker, a concurrency limiter and a metric series **per authority** for the life of the process, so an unbounded set of destinations is a memory-exhaustion path. Requests to an unlisted authority are rejected before they reach the pipeline.
-
-The hedging pipeline has no retry strategy, so a hedged client that states `Retry:*` keys of its own fails at startup rather than binding configuration nothing reads. Root-level retry configuration is still inherited by every standard client and is unaffected.
-
-```text
-AuthorityAllowList                  rejects an unlisted destination before anything is allocated
-  └─ ConcurrencyLimiter (optional)  one slot per logical request
-       └─ RateLimiter   (optional)  one permit per logical request
-            └─ Total timeout
-                 └─ Hedging
-                      └─ Endpoint concurrency limiter   1,000 concurrent, platform default
-                           └─ Endpoint circuit breaker  per authority
-                                └─ Attempt timeout
-                                     └─ SocketsHttpHandler
-```
+- **`Authorities` is required.** The platform keeps per-authority state for the life of the process, so a
+  request to an unlisted authority fails with `InvalidOperationException` before it is sent (not
+  `HttpRequestException`, which retry policies treat as transient).
+- **Only safe methods are hedged by default**, including hedges started by the delay timer. Hedged attempts run
+  at the same time, so an idempotency key may not prevent duplicates.
+- **No retry.** `Retry` keys in a hedged client's own section fail startup.
+- **Redirects are not followed** by default: a redirect would bypass the allow-list. Opt in with
+  `Connection:AllowAutoRedirect: true`. The runtime strips `Authorization` on a redirect but re-sends custom
+  headers such as API keys.
 
 ## The pipeline
 
-Fixed, outermost to innermost:
+Fixed, outermost first:
 
 ```text
-ConcurrencyLimiter   (optional)  one slot per logical request
-  └─ Limiter         ALWAYS PRESENT — the standard handler has one limiter slot and it is never empty
-       │             RateLimiter:Enabled = false → concurrency backstop, 1,000 permits, no queue
-       │             RateLimiter:Enabled = true  → your rate limiter, and the backstop moves outside it
-       └─ Total timeout
-            └─ Retry
-                 └─ Circuit breaker
-                      └─ Attempt timeout
-                           └─ SocketsHttpHandler
+Standard (AddHttpResilienceHandler)            Hedged (AddHttpResilienceHedgingHandler)
+
+ConcurrencyLimiter      (optional)             Authority allow-list
+  ConcurrencyBackstop   (see below)              ConcurrencyLimiter   (optional)
+    Limiter             (always present)           RateLimiter        (optional)
+      Total timeout                                  Total timeout
+        Retry                                          Hedging
+          Circuit breaker                                per authority: backstop limiter
+            Attempt timeout                                Circuit breaker
+              SocketsHttpHandler                             Attempt timeout
 ```
 
-A concurrency slot and a rate-limit permit each cover a whole logical request, including its retries — a retrying request can never be rejected by its own budget. The cost is that queue wait is **outside** `Timeout:Total`.
+- **A concurrency bound always exists.** The platform's limiter slot holds the rate limiter if enabled,
+  otherwise `ConcurrencyLimiter:Backstop` (1,000, no queue). On a standard client a rate limiter displaces the
+  backstop into its own handler, unless the client's own `ConcurrencyLimiter` is enabled (validated at or below
+  the backstop, so it is the bound). Above the bound, requests fail with `RateLimiterRejectedException`.
+- **One limiter slot or permit covers a whole logical request**, including its retries, so queue wait is
+  **outside** `Timeout:Total`.
 
-**The limiter slot is never empty.** Microsoft's standard handler always carries one, and its default is a concurrency limiter of 1,000 with no queue. Left implicit that is a scaling cliff nobody can see: above 1,000 concurrent requests the client throws `RateLimiterRejectedException`, naming a rate limiter you never enabled. It is surfaced as `ConcurrencyLimiter:Backstop` so the number can be read, alerted on and changed.
-
-### Adding something outside this shape
-
-You already have the platform API for it — but the two calls that look interchangeable are not:
+To add a strategy the schema does not cover, use the platform's `AddResilienceHandler`. **Not**
+`AddStandardResilienceHandler`, which nests a second pipeline:
 
 ```csharp
-// Composes. Origin sees 3 calls.
-builder.Services.AddHttpClient("Legacy").AddHttpResilience()
-    .AddResilienceHandler("legacy-quirk", p => p.AddTimeout(TimeSpan.FromSeconds(9)));
+// Composes: 3 origin calls for a failing GET.
+.AddHttpResilienceHandler().AddResilienceHandler("extra", p => p.AddTimeout(TimeSpan.FromSeconds(9)));
 
-// Nests. Origin sees 9 calls. Nothing throws.
-builder.Services.AddHttpClient("Legacy").AddHttpResilience()
-    .AddStandardResilienceHandler();
+// Nests: 9 origin calls, total timeout applied twice. Nothing throws.
+.AddHttpResilienceHandler().AddStandardResilienceHandler();
 ```
 
-`AddResilienceHandler` adds one more strategy outside this pipeline and the origin call count does not change. `AddStandardResilienceHandler` on a client that already has `AddHttpResilience` **nests a second pipeline**, and nested pipelines multiply rather than add: one GET makes **nine** origin calls — three configured attempts, each retried three times by the outer pipeline — and the total timeout is applied twice.
-
-A second `AddHttpResilience` fails at startup. **This does not**, and the honest reason is that the package cannot tell the two apart: both add a `ResilienceHandler`, and the only difference is a pipeline name on an internal field that reading would need the reflection this package's trim and Native AOT support rules out. Every other observable difference was measured and there is none.
-
-So instead the package **counts**. A client carrying more resilience handlers than this package added logs one **Information** line (event 12) at construction, naming both possibilities. Information rather than Warning because the state is frequently correct — it is what the composing pattern above produces — and a line that cries wolf on recommended code is a line operators filter out.
+The two cannot be told apart through public API, so the second is only reported: an Information log (event
+12) on any client with more resilience handlers than this package added.
 
 ## Timeouts
 
 ```text
-CancellationToken (caller / request abort)   always wins, never a breaker failure
-  └─ Timeout:Client     HttpClient.Timeout: queue wait + attempts + RESPONSE BODY transfer
-       └─ Timeout:Total      all attempts plus backoff, from admission onwards
-            └─ Timeout:Attempt      one HTTP attempt, up to response HEADERS
-                 └─ Connection:ConnectTimeout   TCP + TLS only, strictly less than Attempt
+CancellationToken (caller)     always wins; never a circuit-breaker failure
+  Timeout:Client               HttpClient.Timeout: queue wait + attempts + response BODY
+    Timeout:Total              all attempts and backoff, up to response headers
+      Timeout:Attempt          one attempt, up to response headers
+        Connection:ConnectTimeout   TCP + TLS (only with Connection:Enabled)
 ```
 
-**`Timeout:Total` stops applying when response headers arrive.** Every strategy lives in the handler chain, and the chain returns as soon as `SocketsHttpHandler` has the headers. Under the default `HttpCompletionOption.ResponseContentRead` the body is then buffered by `HttpClient` itself, after the chain, where no resilience strategy can see it.
+- **`Total` and `Attempt` stop at response headers.** Only `Timeout:Client` bounds the body; it defaults to
+  `Timeout:Total` + 30 s. For streaming, use `HttpCompletionOption.ResponseHeadersRead` and your own read
+  deadline.
+- **Set `HttpClient.Timeout` with `Timeout:Client`, not in code.** A different value set via
+  `ConfigureHttpClient` fails client creation. **A typed client that sets `client.Timeout` in its constructor
+  cannot be detected** and silently truncates the pipeline: search your constructors.
+- A retry schedule longer than `Timeout:Total` is allowed (a cap is valid) and logs a startup Warning (event 14).
 
-`Microsoft.Extensions.Http.Resilience` sets `HttpClient.Timeout` to infinite for exactly this reason in reverse — so that its total request timeout, rather than the 100-second default, bounds the attempts. That leaves a trickled response body bounded by nothing at all: an origin that answers headers promptly and then stalls holds a connection, a buffer and an inbound request for as long as it likes, while the pipeline's telemetry reports a fast successful attempt.
+## Connection settings
 
-So this package puts a finite bound back. `Timeout:Client` defaults to `Timeout:Total` plus 30 seconds, is validated to be strictly greater than `Timeout:Total`, and wins over every other assignment. The allowance covers limiter queue wait and the response body only, since `Timeout:Total` already covers every attempt up to headers; it was a minute, which was three times the whole default attempt budget for body bytes alone. It is a backstop, not an SLO. For streaming, request `HttpCompletionOption.ResponseHeadersRead` and impose your own deadline on reading the stream.
+Off by default. With `Connection:Enabled: true`, the client's primary `SocketsHttpHandler` gets the pool
+settings and the factory's handler rotation is turned off (`PooledConnectionLifetime` bounds connection age and
+DNS staleness instead; a finite `SetHandlerLifetime` on the client fails client creation). Settings are applied
+after every other registration, so order does not matter:
 
-**`Timeout:Client` is the only place the schema can validate that bound.** `ConfigureHttpClient` actions run in registration order and last wins, so a plain `ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(2))` truncates a 30-second pipeline with a bare `TaskCanceledException` — the exact condition validation refuses when the same value is written as `Timeout:Client`. It is therefore applied from a post-configure on `HttpClientFactoryOptions`, which runs after every `ConfigureHttpClient` registration rather than racing it. A conflicting assignment in code fails at client creation and names the key to use instead. Every other use of `ConfigureHttpClient` — a default request header, a base address — is untouched.
+- A `SocketsHttpHandler` you supply is **kept** (certificates, proxy, callbacks survive). If it sets a
+  connection setting the schema also sets (connect and pool timeouts, `EnableMultipleHttp2Connections`, a stated
+  `MaxConnectionsPerServer`) to a different value, client creation **fails**, naming the key. A value left at the
+  runtime default is configured.
+- An `HttpClientHandler` with nothing set is replaced with a new `SocketsHttpHandler`. One carrying any setting
+  (client certificate, certificate callback, proxy, credentials, cookies) **fails client creation**, naming the
+  settings: move them to a `SocketsHttpHandler`.
+- Any other primary handler type fails client creation.
 
-**One shape gets past that guard, and it is not preventable.** A **typed client's constructor** runs after `IHttpClientFactory` has finished building the client, so no options phase can observe it — `public OrdersApi(HttpClient client) { client.Timeout = TimeSpan.FromSeconds(1); }` truncates a 30-second pipeline to one second with the same bare `TaskCanceledException`, and nothing warns. Grep typed-client constructors for `Timeout`; the log will not tell you. Explained in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Everything is per process
 
-Startup validation enforces that the retry schedule fits the total budget, with 1.5x headroom for jitter. **That headroom is a factor, not a bound**: Polly's jittered delay is drawn from a distribution, so a schedule that passes can still occasionally have its last retry truncated. What is rejected is a schedule that could not fit even with half again the nominal backoff. The caveat applies more sharply to `Retry-After`, which replaces the computed delay entirely — an origin naming a large value can spend the whole budget on one wait. Both are bounded by `Timeout:Total`, never unbounded.
-
-## Connection settings are owned, not merely requested
-
-`Connection:Enabled` configures the primary `SocketsHttpHandler` and sets the `IHttpClientFactory` handler lifetime to infinite, because `PooledConnectionLifetime` is what bounds connection age instead. Those two are only safe together.
-
-`ConfigurePrimaryHttpMessageHandler` is last-wins across registrations; `SetHandlerLifetime` is not. A package that replaced the handler *at registration time* would leave a trap: any later registration — a client certificate, a proxy, a test stub — takes the handler away and leaves rotation disabled around a pool nothing gave a lifetime to. A handler a consumer constructed directly carries the runtime default of **infinite**, so nothing then recycles connections or re-resolves DNS for the life of the process, which behind a moving service IP is an outage no probe reports.
-
-So the settings are applied from an `IHttpMessageHandlerBuilderFilter`, which runs after every `ConfigurePrimaryHttpMessageHandler` registration rather than racing it:
-
-- a `SocketsHttpHandler` you supplied is **kept and configured**, so a client certificate, proxy or SSL callback survives. Configured means: `ConnectTimeout`, `PooledConnectionIdleTimeout`, `PooledConnectionLifetime` and `EnableMultipleHttp2Connections` are overwritten, because the schema always states them; `MaxConnectionsPerServer` only when it is set; and `AllowAutoRedirect` only when it is stated or resolves to `false`. **A redirect bound you set on your own handler is not reversed by switching this on** — it used to be, silently, which for a control the runtime re-sends custom credential headers across is a credential-disclosure path and not a preference. Tune any of the first four yourself and you should leave `Connection:Enabled` false instead;
-- the factory's default `HttpClientHandler` is replaced;
-- anything else fails at client creation with a message saying why, because there is nothing for `PooledConnectionLifetime` to bind to.
-
-Registration order does not matter for `ConfigurePrimaryHttpMessageHandler`, which is what a consumer normally uses. `IHttpClientFactory` composes handler-builder filters in reverse, so another `IHttpMessageHandlerBuilderFilter` registered **before** this one still gets the last word. If you have one of those, or you want to own the pool yourself, set `Connection:Enabled` to `false` and set `PooledConnectionLifetime` on your own handler.
-
-**Whether a client *can* be created is not an options value, so startup validation cannot see it.** The handler chain is built by `IHttpClientFactory` on the first `CreateClient`, which for a client on a rare code path is hours after the deploy. `AddHttpResilience` therefore registers an `IHostedService` that creates every client this package configured, once, while the host is starting. Only this package's clients, and nothing else in the container.
-
-It is on by default. Turn it off with configuration rather than code, so it is reachable during an incident without a redeploy:
-
-```jsonc
-{ "HttpResilience": { "ValidateClientsOnStart": false } }
-```
-
-`ValidateHttpResilienceClientsOnStart()` is the equivalent call in code and is idempotent. Setting the key to `false` **while** calling that method fails at startup naming both: the call would win, and a key an operator reached for that silently does nothing is worse than no key.
-
-This is an `IHostedService`, so it runs under a generic host and not under a bare `ServiceCollection` plus `BuildServiceProvider` — the same limitation `ValidateOnStart` has.
-
-## Rate limiting is process-local
-
-**The rate limiter cannot enforce a cluster-wide quota.** Each replica gets its own limiter, so the fleet-wide rate is `replicas × PermitLimit` per window. Ten pods configured for 100 requests per second permit 1,000 requests per second in aggregate.
-
-**And there is a second multiplier.** The budget belongs to a *named client*, not to a downstream, so two clients calling the same host hold two independent budgets. That shape is ordinary — a typed client split by concern, or a shared library registering its own client against a host the application also calls — so the real fleet-wide rate is `replicas × clients × PermitLimit`. Count the clients that reach the host, not the hosts.
-
-Size `PermitLimit` as `downstream quota ÷ (replicas × clients)`, or enforce the real quota at a gateway. The same applies to the circuit breaker: `MinimumThroughput` is observed per replica **and counted in attempts, not caller requests**, so a 20-replica deployment sends at least `20 × MinimumThroughput` failing attempts before the fleet stops.
-
-See [docs/OPERATIONS.md](docs/OPERATIONS.md#retry-amplification) for the amplification arithmetic before raising `Retry:MaxRetries`.
-
-## Per-authority pipelines
-
-One client calling several hosts can isolate their **circuit breakers**. Rate and concurrency limits stay per client and shared across authorities: a limiter budget is a statement about this process's capacity, not about one host's health. The authorities must be listed, so the number of pipelines is fixed at deploy time:
-
-```json
-{
-  "HttpResilience": {
-    "Clients": {
-      "Partner": {
-        "PipelineSelection": {
-          "Mode": "ByAuthority",
-          "Authorities": [ "https://a.partner.example", "https://b.partner.example" ]
-        }
-      }
-    }
-  }
-}
-```
-
-Anything not listed shares a single pipeline. Without the allow-list, a target host derived from request data — a tenant-configured webhook, a stored callback URL — would let each distinct authority permanently allocate a pipeline, a circuit breaker and a metric series, with nothing to evict them.
-
-**A root-level `Authorities` list is inherited by every client, and that is deliberate.** It is how a fleet states one destination allow-list for its hedged clients, which require one. A standard client inheriting it under the default `Mode: None` is unaffected — the list is inert for it and no failure is raised. What *is* refused is a client that **states** a list of its own while its mode is `None`: a written statement nothing reads.
-
-**Per-authority selection instantiates the whole pipeline per key, and the concurrency backstop with it — while the client has no rate limiter.** The rate limiter does not multiply: it is one instance per client, shared by every authority's pipeline. `ConcurrencyLimiter:Backstop` normally does, so a client with N listed authorities is bounded at `(N + 1) × Backstop` concurrent requests, counting the shared pipeline.
-
-Enabling a rate limiter changes that number. The rate limiter takes the standard handler's limiter slot, so the backstop moves out into a handler of its own — one handler, outside the per-authority pipelines, and therefore **one limiter per client rather than one per authority**. The bound in that configuration is `1 × Backstop`. Size `Backstop` per authority when the client has no rate limiter and per client when it does. All three cases are pinned by `ConcurrencyBackstopTests`.
-
-Hosts are matched on `Uri.IdnHost` with any trailing root label removed, so an internationalized authority matches whether the request spells it in Unicode or punycode, and `orders.internal` matches `orders.internal.`. Scheme and port must match exactly.
-
-### A hedged client does not follow redirects
-
-A 3xx is resolved inside `SocketsHttpHandler`, below every `DelegatingHandler`, so the allow-list above never sees the second hop — and an allow-list a redirect can step around is not an allow-list. `AddHedgedHttpResilience` therefore resolves `Connection:AllowAutoRedirect` to `false`, and does so even when `Connection:Enabled` is off, because a safety bound an unrelated connection-pool switch can disable is not a bound.
-
-Two measured facts behind that choice:
-
-| | Across a redirect |
-| --- | --- |
-| `Authorization` header | **stripped by the runtime**, same-origin or cross-origin |
-| `X-Api-Key` and every other custom header | **re-sent verbatim**, including cross-origin |
-
-Bearer tokens are safe; the custom header that most internal service-to-service auth actually uses is not. That is why OWASP's SSRF guidance says to disable redirects rather than validate the first URL and trust the rest. Pinned against real sockets by `RedirectTests`.
-
-Opt back in per client when the destination genuinely redirects:
-
-```json
-{
-  "HttpResilience": {
-    "Clients": { "Search": { "Connection": { "AllowAutoRedirect": true } } }
-  }
-}
-```
-
-`AddHttpResilience` — the standard pipeline — keeps the runtime default of `true`, and applies **no destination control at all**. It has declared no closed destination set to leave: under `Mode: None` every request shares one pipeline, and even under `ByAuthority` an unlisted host is explicitly allowed. Turning redirects off there would break every client that talks to a CDN or a pre-signed URL. If a standard client's destination is influenced by request data, the cardinality that grows is `System.Net.Http`'s own `server.address` dimension, which this package neither sets nor can bound.
+- **The rate limiter is process-local and cannot enforce a cluster-wide quota.** Each replica and each named
+  client has its own budget: the fleet rate is `replicas × clients × PermitLimit`. Divide the quota, or
+  enforce it at a gateway.
+- **Retries multiply outbound load in every replica independently.** At the default `MaxRetries: 2`, a failing
+  dependency receives up to 3x your request rate from every pod. Read
+  [OPERATIONS.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/OPERATIONS.md#retry-amplification) before raising it.
+- **The circuit breaker is per replica and counts attempts, not requests.** Each replica must see
+  `MinimumThroughput` (20) attempts within `SamplingDuration` (30 s) before it can open, and opens when half of
+  them failed; a quieter client needs a lower value. Startup event 11 states the rate each client needs.
 
 ## Telemetry
 
-This package emits through BCL primitives only and **takes no dependency on OpenTelemetry**: metrics on a `Meter` obtained from `IMeterFactory`, logs on `ILogger` under the category `HttpResilience`, and no `ActivitySource` of its own. Nothing leaves the process until the consuming service wires an SDK, which is why the meter names are exposed as constants rather than a package reference that would choose an exporter for every consumer.
-
-Install the SDK in the **consuming service**: `OpenTelemetry.Extensions.Hosting` for `AddOpenTelemetry()` and the provider lifetime, `OpenTelemetry.Exporter.OpenTelemetryProtocol` for `AddOtlpExporter()`, and `OpenTelemetry.Instrumentation.Http` for `System.Net.Http`'s own metrics and per-attempt spans.
+The package depends on no OpenTelemetry package: it publishes on a `Meter` and `ILogger` and creates no spans
+(`System.Net.Http` already emits one span per attempt). Wire the SDK in your service:
 
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
-
-builder.Services.AddHttpResilience(builder.Configuration);
-builder.Services.AddHttpClient("Orders").AddHttpResilience();
-
-builder.Services.AddHttpResilienceTelemetry();   // adds the error.type tag. Registers no meter.
+builder.Services.AddHttpResilienceTelemetry();   // adds error.type for exceptions; registers no meter
 
 builder.Services.AddOpenTelemetry()
-    .ConfigureResource(resource => resource.AddService("orders-api"))
     .WithMetrics(metrics => metrics
-        .AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName)  // "Polly" — retries, breaker events
-        .AddMeter(HttpResilienceTelemetryExtensions.MeterName)       // "HttpResilience.NET" — breaker state, limiters
-        .AddHttpClientInstrumentation()                              // request duration, connection pool
+        .AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName)  // "Polly": retries, breaker events
+        .AddMeter(HttpResilienceTelemetryExtensions.MeterName)       // "HttpResilience.NET": breaker state, limiters
+        .AddHttpClientInstrumentation()
         .AddOtlpExporter())
-    .WithTracing(tracing => tracing
-        .AddHttpClientInstrumentation()                              // one span per attempt
-        .AddOtlpExporter());
-
-builder.Logging.AddOpenTelemetry(logging =>
-{
-    logging.IncludeFormattedMessage = true;
-    logging.IncludeScopes = true;
-    logging.AddOtlpExporter();
-});
+    .WithTracing(tracing => tracing.AddHttpClientInstrumentation().AddOtlpExporter());
 ```
 
-**`AddHttpResilienceTelemetry()` and `AddMeter(...)` do different jobs and neither substitutes for the other.** The first adds one tag and registers no instrument; the second registers instruments and adds no tag. Confusing them fails **silently**: the SDK drops every measurement from a meter name it was not given, so a missing `AddMeter` is an empty dashboard with nothing logged and no exception thrown.
+- **A missing `AddMeter` fails silently** (an empty dashboard). `AddHttpResilienceTelemetry()` adds a tag, not
+  a meter.
+- With the `OpenTelemetry.NET` package 2.7.0 or later, `AddObservability(...)` registers both meters; still
+  call `AddHttpResilienceTelemetry()`.
+- Logs use `HttpResilience.NET.*` categories. Startup notices (a disabled client, unsafe methods repeatable, a
+  per-client settings summary) need a generic host.
 
-Both meter names are constants on `HttpResilienceTelemetryExtensions` rather than strings you maintain. `"Polly"` covers **every** Polly pipeline in the container, not only this package's.
-
-The one gap `AddHttpResilienceTelemetry` fills: `Microsoft.Extensions.Http.Resilience` already tags `error.type` with the status code when a **response** is the failure, and nothing tags it when an **exception** is — Polly emits `exception.type` there instead. A dashboard filtering on `error.type` would otherwise silently miss every connection failure, DNS failure and timeout.
-
-Debug-level events (retry attempts, hedging attempts) are below the default log level:
-
-```json
-{ "Logging": { "LogLevel": { "HttpResilience": "Debug" } } }
-```
-
-**This package creates no spans, on purpose.** `System.Net.Http` emits one `Activity` per **attempt**, so a retried or hedged call already appears as several sibling HTTP spans under the caller's span — counting them is how you answer "was it retried, and how many times".
-
-Every instrument, dimension, cardinality bound and log event ID: **[docs/OPERATIONS.md](docs/OPERATIONS.md#metrics)**.
-
-### If your service uses `OpenTelemetry.NET` package
-
-**On 2.7.0 or later the meters need no configuration.** `AddObservability(configuration)` registers HTTP client instrumentation and both meter names unconditionally — they are in `OpenTelemetryConstants.DefaultMeterNames`. Nothing in the block above is needed.
-
-On **2.6.x or earlier**, add both explicitly, since the SDK drops measurements from a meter name it was not given:
-
-```json
-{ "OpenTelemetryOptions": { "Meters": [ "Polly", "HttpResilience.NET" ] } }
-```
-
-`AddHttpResilienceTelemetry()` is a separate call in `Program.cs` at **every** version. Nothing in the observability package can make it for you, and without it `error.type` is missing on every exception outcome.
+Instruments, tags, log events and alerts: **[docs/OPERATIONS.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/OPERATIONS.md)**.
 
 ## Health checks
 
-```csharp
-builder.Services.AddHttpResilienceHealthChecks();
-// or, in the shape the rest of the health-check ecosystem uses:
-builder.Services.AddHealthChecks().AddHttpResilience();
-
-app.MapHealthChecks("/healthz/live",  new() { Predicate = _ => false });
-app.MapHealthChecks("/healthz/ready", new() { Predicate = r => !r.Tags.Contains("dependency") });
-app.MapHealthChecks("/healthz/deps",  new() { Predicate = r =>  r.Tags.Contains("dependency") });
-```
-
-Reports **Degraded** at worst, never Unhealthy, and is tagged `dependency` by default. The Degraded ceiling is the guarantee — it is unconditional, so even an accidental wiring to a liveness probe answers 200 and restarts nothing. The tag is routing: passing your own `tags` **replaces** it rather than adding to it.
-
-**Degraded is HTTP 200.** ASP.NET Core's default `ResultStatusCodes` maps Healthy *and* Degraded to `200`, and only Unhealthy to `503` — so the endpoint's status code alone carries no signal, and an alert wired to it stays green while every circuit in the process is open. Alert on `http.resilience.circuit_breaker.state` instead, or opt in explicitly on the diagnostic endpoint only:
-
-```csharp
-app.MapHealthChecks("/healthz/deps", new HealthCheckOptions
-{
-    Predicate = r => r.Tags.Contains(HttpResilienceHealthCheckExtensions.DependencyTag),
-    ResultStatusCodes =
-    {
-        [HealthStatus.Healthy]   = StatusCodes.Status200OK,
-        [HealthStatus.Degraded]  = StatusCodes.Status503ServiceUnavailable,
-        [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
-    },
-});
-```
-
-Do that for `/healthz/deps` and nothing else.
-
-**Do not gate a liveness or readiness probe on it.** An open circuit means a downstream is unhealthy, not that this process is. Restarting the pod or pulling it from the load balancer would shed capacity during a dependency outage and amplify it.
-
-**The dependency endpoint names your internal topology.** Its payload is keyed `client -> authority`, so `/healthz/deps` discloses internal client names and hostnames to anyone who can reach it. Keep it behind cluster-internal networking or authentication.
-
-Registration is idempotent under one name, like `AddHttpResilience` and for the same reason. A second registration under a *different* name is a deliberate one and is honoured.
+The package registers none. **Never gate a liveness or readiness probe on circuit breaker state**: an open
+circuit means a dependency is unhealthy, not this process, and restarting pods cuts capacity during the
+outage. Alert on the `http_resilience.circuit_breaker.state` gauge instead.
 
 ## Requirements
 
-- .NET 10 SDK (pinned in `global.json`)
-- **Trimming and Native AOT are supported.** Option binding goes through the configuration binding source generator, so there is no reflection to trim away. `tests/HttpResilience.NET.AotSmoke` publishes a Native AOT binary in CI and asserts the bound values at run time — a trimmed reflective binder does not fail loudly, it leaves a client running on defaults it never configured, so the claim is proven by execution rather than by a clean build.
-- `nuget.config` clears defaults and adds `baps-apps-packages` for `CodeStyle.NET`. Restore from a fresh clone needs a GitHub PAT for that source — see [scripts/README.md](scripts/README.md).
+- `net10.0`. Trimming and Native AOT are supported (source-generated configuration binding).
+- A generic host. Startup validation, the startup client check and the startup notices run when the host
+  starts; a bare `ServiceProvider` gets none of them (validation then happens at first client creation).
 
 ## Distribution and license
 
-Proprietary and internal. Copyright (c) BAPS, all rights reserved — this repository carries no open-source
-license and grants no rights to use, copy, modify or redistribute it outside the organization.
-
-The package is published to GitHub Packages under `baps-apps` (`https://nuget.pkg.github.com/baps-apps/index.json`)
-and never to nuget.org. Consuming it needs that source in your `nuget.config` and a GitHub PAT with
-`read:packages` — see [scripts/README.md](scripts/README.md). `packageSourceMapping` should pin
-`HttpResilience.NET` to that source, so a public package cannot shadow the internal name.
+Proprietary and internal: Copyright (c) BAPS, all rights reserved; no open-source license. Published to
+GitHub Packages (`https://nuget.pkg.github.com/baps-apps/index.json`), never to nuget.org. Consumers need that
+source and a GitHub PAT with `read:packages` ([scripts/README.md](https://github.com/baps-apps/http-resilience-net/blob/main/scripts/README.md#restoring-from-baps-apps-packages)).
+Map `HttpResilience.NET` to that source with `packageSourceMapping` so a public package cannot shadow it.
 
 ## Documentation
 
-- [CONFIGURATION.md](docs/CONFIGURATION.md) — every key, default and validation rule
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the package composes the platform, and what it deliberately does not own
-- [OPERATIONS.md](docs/OPERATIONS.md) — amplification arithmetic, instruments, dashboards, alerts
-- [RUNBOOK.md](docs/RUNBOOK.md) — what to do when resilience alerts fire
-- [RECIPES.md](docs/RECIPES.md) — common configurations
-- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
-- [SECURITY-GOVERNANCE.md](docs/SECURITY-GOVERNANCE.md)
-- [PRODUCTION-CHECKLIST.md](docs/PRODUCTION-CHECKLIST.md)
-- [VERSIONING.md](docs/VERSIONING.md)
-- [benchmarks/](docs/benchmarks/README.md) — the raw reports behind every performance claim
-- [CHANGELOG.md](CHANGELOG.md)
-- [V1.md](docs/V1.md) — using the 1.0.0 package, for services that have not moved to 2.0.0
-
-## Building
-
-```bash
-dotnet build
-dotnet test
-dotnet run --project samples/HttpResilience.NET.Sample
-dotnet run --project benchmarks/HttpResilience.NET.Benchmarks -c Release -- --filter "*"
-```
+| Doc | For |
+| --- | --- |
+| [CONFIGURATION.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/CONFIGURATION.md) | Every key, default and validation rule |
+| [RECIPES.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RECIPES.md) | Common setups |
+| [TROUBLESHOOTING.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/TROUBLESHOOTING.md) | Errors and surprises, by symptom |
+| [OPERATIONS.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/OPERATIONS.md) | Load arithmetic, metrics, logs, alerts |
+| [RUNBOOK.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RUNBOOK.md) | What to do when an alert fires |
+| [PRODUCTION-CHECKLIST.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/PRODUCTION-CHECKLIST.md) | Before go-live |
+| [ARCHITECTURE.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/ARCHITECTURE.md) | How the package composes the platform |
+| [SECURITY-GOVERNANCE.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/SECURITY-GOVERNANCE.md) | Security posture and change control |
+| [VERSIONING.md](https://github.com/baps-apps/http-resilience-net/blob/main/docs/VERSIONING.md) | What counts as breaking |
+| [benchmarks/](https://github.com/baps-apps/http-resilience-net/blob/main/docs/benchmarks/README.md) | Measured overhead |
+| [CONTRIBUTING.md](https://github.com/baps-apps/http-resilience-net/blob/main/CONTRIBUTING.md) | Building, testing, releasing |

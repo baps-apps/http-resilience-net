@@ -31,7 +31,7 @@ public class RedirectTests
     /// to come from not following the redirect at all. Production change that would make this fail: resolving
     /// <c>AllowAutoRedirect</c> to <see langword="true"/> for the hedging pipeline.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_DoesNotLeaveItsAllowList_ByDefault()
     {
         await using var origin = await RedirectOrigin.StartAsync();
@@ -50,7 +50,7 @@ public class RedirectTests
     /// that would make this fail: applying the redirect setting only inside the <c>Connection:Enabled</c>
     /// branch of <c>ConnectionHandlerFilter</c>.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_DoesNotLeaveItsAllowList_EvenWithConnectionTuningOff()
     {
         await using var origin = await RedirectOrigin.StartAsync();
@@ -65,7 +65,7 @@ public class RedirectTests
     /// Following redirects off the list stays possible, but only by saying so -- which puts the decision in
     /// the diff a reviewer reads, rather than in a default.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_FollowsRedirects_WhenExplicitlyOptedIn()
     {
         await using var origin = await RedirectOrigin.StartAsync();
@@ -82,7 +82,7 @@ public class RedirectTests
     /// explicitly allowed and served by the shared pipeline. Changing this would break every client that talks
     /// to a CDN, a pre-signed URL or anything else that answers with a 302.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task StandardClient_FollowsRedirects_LikeTheRuntimeDoes()
     {
         await using var origin = await RedirectOrigin.StartAsync();
@@ -93,11 +93,49 @@ public class RedirectTests
         Assert.Equal(1, origin.UnlistedHits);
     }
 
+    /// <summary>
+    /// A root <c>Connection:AllowAutoRedirect: false</c> in shared configuration stops every standard client
+    /// re-sending its custom headers (API keys) to another host, with or without connection tuning.
+    /// </summary>
+    /// <remarks>
+    /// Production change that would make this fail: applying the stated <see langword="false"/> only to hedged
+    /// clients, or only inside the <c>Connection:Enabled</c> branch of <c>ConnectionHandlerFilter</c>.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StandardClient_DoesNotFollowRedirects_UnderARootFalse(bool connectionEnabled)
+    {
+        await using var origin = await RedirectOrigin.StartAsync();
+
+        using HttpResponseMessage response = await SendAsync(
+            origin, allowAutoRedirect: false, connectionEnabled: connectionEnabled, hedged: false);
+
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Equal(0, origin.UnlistedHits);
+    }
+
+    /// <summary>
+    /// Under that root, a client that needs redirects (a CDN, pre-signed URLs) states so in its own section.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task StandardClient_FollowsRedirects_WhenItsSectionOptsBackIn()
+    {
+        await using var origin = await RedirectOrigin.StartAsync();
+
+        using HttpResponseMessage response = await SendAsync(
+            origin, allowAutoRedirect: false, connectionEnabled: false, hedged: false, clientAllowAutoRedirect: true);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(1, origin.UnlistedHits);
+    }
+
     private static async Task<HttpResponseMessage> SendAsync(
         RedirectOrigin origin,
         bool? allowAutoRedirect = null,
         bool connectionEnabled = true,
-        bool hedged = true)
+        bool hedged = true,
+        bool? clientAllowAutoRedirect = null)
     {
         var settings = new Dictionary<string, string?>
         {
@@ -111,6 +149,11 @@ public class RedirectTests
         if (allowAutoRedirect is { } value)
         {
             settings["HttpResilience:Connection:AllowAutoRedirect"] = value ? "true" : "false";
+        }
+
+        if (clientAllowAutoRedirect is { } clientValue)
+        {
+            settings["HttpResilience:Clients:search:Connection:AllowAutoRedirect"] = clientValue ? "true" : "false";
         }
 
         if (!hedged)
@@ -127,7 +170,7 @@ public class RedirectTests
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         IHttpClientBuilder builder = services.AddHttpClient("search");
-        _ = hedged ? builder.AddHedgedHttpResilience() : builder.AddHttpResilience();
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
 
         await using ServiceProvider provider = services.BuildServiceProvider();
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("search");

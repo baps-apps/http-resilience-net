@@ -38,7 +38,7 @@ public class MeteringEnricherTests
     /// nothing supplies <c>error.type</c> -- the attribute the OpenTelemetry convention names, and the one a
     /// dashboard filters on. Without it, a query for <c>error.type</c> misses every connection failure.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AddsExceptionTypeName()
     {
         List<KeyValuePair<string, object?>> tags =
@@ -53,7 +53,7 @@ public class MeteringEnricherTests
     /// A failed response is the platform's to tag, on every pipeline in the process. Tagging it here as well
     /// put <c>error.type</c> on the measurement twice, because this enricher runs first.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AddsNothing_ForFailedResponses_BecauseThePlatformAlreadyTagsThem()
     {
         Assert.Empty(Enrich(Outcome.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable))));
@@ -63,7 +63,7 @@ public class MeteringEnricherTests
     /// Insurance for the reverse ordering: if this enricher ever ran after one that supplies the key, it must
     /// not add a second copy.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AddsNothing_WhenTheTagIsAlreadyPresent()
     {
         List<KeyValuePair<string, object?>> tags = Enrich(
@@ -73,13 +73,13 @@ public class MeteringEnricherTests
         Assert.Equal("already-set", Assert.Single(tags).Value);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AddsNothing_ForSuccessfulResponses()
     {
         Assert.Empty(Enrich(Outcome.FromResult(new HttpResponseMessage(HttpStatusCode.OK))));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AddsNothing_WhenThereIsNoOutcome()
     {
         Assert.Empty(Enrich(null));
@@ -89,7 +89,7 @@ public class MeteringEnricherTests
     /// Nothing derived from the request may appear in a metric tag: a dimension whose cardinality is the
     /// number of hosts a process happens to call will eventually evict everything else in the backend.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void NeverTagsAnythingDerivedFromTheRequestUri()
     {
         // Even an exception message carrying the URL must not reach a tag: only the type name is used.

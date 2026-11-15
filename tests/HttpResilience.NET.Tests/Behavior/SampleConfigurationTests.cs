@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace HttpResilience.NET.Tests.Behavior;
 
@@ -7,16 +8,7 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// The sample's configuration is held to the same validation as any consumer's.
 /// </summary>
 /// <remarks>
-/// <c>samples/HttpResilience.NET.Sample</c> is the only executable example in the repository and the file
-/// most likely to be copied into a service, and it shipped with
-/// <c>Connection:PooledConnectionIdleTimeout</c> equal to <c>Connection:PooledConnectionLifetime</c> -- a
-/// combination this package's own validator rejects, so <c>dotnet run --project samples/...</c> terminated
-/// with an <c>OptionsValidationException</c> before reaching a single line of the demonstration.
-/// <para>
-/// CI builds, tests, AOT-publishes and packs, and ran nothing. A smoke step now starts the sample, and this
-/// test fails the unit suite first with a message naming the key, because a validation failure in the
-/// example is a defect in the documentation rather than in the code.
-/// </para>
+/// The sample is the example most likely to be copied into a service. Fails with a message naming the key.
 /// </remarks>
 public class SampleConfigurationTests
 {
@@ -34,10 +26,15 @@ public class SampleConfigurationTests
     ];
 
     /// <summary>
-    /// Fails if any client section in the sample's <c>appsettings.json</c> would be rejected at registration.
+    /// Fails if the sample's <c>appsettings.json</c> would fail startup: any rule on the root or on a client
+    /// section, an unused client section, or a client whose handler chain cannot be built.
     /// </summary>
-    [Fact]
-    public void EveryClientTheSampleRegisters_PassesValidation()
+    /// <remarks>
+    /// Registration reads no configuration, so validation is run the way a host runs it: every
+    /// <see cref="IStartupValidator"/>, then each client created once, as the startup probe does.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task EveryClientTheSampleRegisters_PassesStartupValidation()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
             .AddJsonFile(SampleAppSettingsPath(), optional: false)
@@ -49,9 +46,22 @@ public class SampleConfigurationTests
         foreach ((string name, bool hedged) in _sampleClients)
         {
             IHttpClientBuilder builder = services.AddHttpClient(name);
+            _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
+        }
 
-            // Registration is where this package validates, so the assertion is that it returns at all.
-            _ = hedged ? builder.AddHedgedHttpResilience() : builder.AddHttpResilience();
+        await using ServiceProvider provider = services.BuildServiceProvider(validateScopes: true);
+
+        IStartupValidator[] validators = [.. provider.GetServices<IStartupValidator>()];
+        Assert.NotEmpty(validators);
+        foreach (IStartupValidator validator in validators)
+        {
+            validator.Validate();
+        }
+
+        IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
+        foreach ((string name, _) in _sampleClients)
+        {
+            factory.CreateClient(name).Dispose();
         }
     }
 

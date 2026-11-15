@@ -1,58 +1,28 @@
-using HttpResilience.NET.Options;
 using Microsoft.Extensions.Http;
 
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
-/// Applies <see cref="ConnectionOptions"/> to the primary handler a client actually ends up with.
+/// Applies <see cref="HttpResilienceConnectionOptions"/> to the primary handler a client actually ends up with.
 /// </summary>
-/// <remarks>
-/// <c>ConfigurePrimaryHttpMessageHandler</c> is last-wins across registrations; <c>SetHandlerLifetime</c> is
-/// not. A client can therefore end up with factory rotation disabled -- because this package disabled it --
-/// around a handler nothing has given a <see cref="SocketsHttpHandler.PooledConnectionLifetime"/> to. A
-/// consumer-supplied handler is the case that matters: constructed directly, its lifetime is the runtime
-/// default of infinite, and with factory rotation off neither mechanism recycles the pool, so connections and
-/// their DNS resolutions live as long as the process. Behind a moving service IP that is an outage nothing
-/// reports. (The handler the factory itself supplies on .NET 10 is a <see cref="SocketsHttpHandler"/> with a
-/// two-minute lifetime, so it is not the dangerous case -- but which handler a client ends up with is exactly
-/// what registration order decides, which is the point.)
-/// <para>
-/// So this type never simply replaces what it finds, and it does not run at registration time. Driven from
-/// <see cref="ConnectionHandlerFilter"/> it sees the handler the client actually ends up with: it configures
-/// one a consumer supplied where it can, and refuses where it cannot.
-/// </para>
-/// </remarks>
 internal static class SocketsHttpHandlerFactory
 {
     /// <summary>
     /// Applies the connection settings to the client's primary handler, keeping a handler the consumer
-    /// supplied rather than discarding whatever it carried.
+    /// supplied rather than discarding whatever it carried, and failing rather than overwriting a connection
+    /// setting the consumer gave it.
     /// </summary>
-    public static void Install(HttpMessageHandlerBuilder builder, ConnectionOptions connection)
+    public static void Install(HttpMessageHandlerBuilder builder, HttpResilienceConnectionOptions connection)
     {
         switch (builder.PrimaryHandler)
         {
             case SocketsHttpHandler existing:
-                // A consumer's handler may carry a client certificate, a proxy or an SSL callback -- none of
-                // which this schema can express, and all of which replacing it would drop without a word.
-                // What Apply overwrites is the four properties the schema always states -- ConnectTimeout,
-                // PooledConnectionIdleTimeout, PooledConnectionLifetime, EnableMultipleHttp2Connections --
-                // plus MaxConnectionsPerServer and AllowAutoRedirect only when the schema has something to say
-                // about them. A consumer that has tuned any of the first four on its own handler should leave
-                // Connection:Enabled false rather than have this silently disagree with it.
-                //
-                // This is also the factory's own default handler on .NET 10, so this branch is the normal path
-                // rather than the exception, which is exactly why the two conditional properties are
-                // conditional: "the consumer supplied it" and "the factory supplied it" are indistinguishable
-                // here, so the guard has to come from whether the schema was asked, not from whose handler it is.
+                RejectConflictingSettings(builder.Name, existing, connection);
                 Apply(existing, connection);
                 break;
 
-            case HttpClientHandler:
-                // Not the factory's default any more -- on .NET 10 that is already a SocketsHttpHandler, so
-                // this branch is only reached when a consumer supplied an HttpClientHandler explicitly. It
-                // has no pooled-connection lifetime to set, so it has to go.
-                builder.PrimaryHandler = Create(connection);
+            case HttpClientHandler client:
+                ReplaceUnconfiguredClientHandler(builder, client, connection);
                 break;
 
             default:
@@ -61,13 +31,168 @@ internal static class SocketsHttpHandlerFactory
     }
 
     /// <summary>
+    /// Fails client creation when a supplied <see cref="SocketsHttpHandler"/> sets a connection setting that the
+    /// schema would overwrite with a different value.
+    /// </summary>
+    private static void RejectConflictingSettings(
+        string? clientName,
+        SocketsHttpHandler handler,
+        HttpResilienceConnectionOptions connection)
+    {
+        if (ConflictingSettings(handler, connection) is { Count: > 0 } conflicts)
+        {
+            throw new InvalidOperationException(
+                $"HTTP client '{clientName}' has Connection:Enabled set, and its SocketsHttpHandler sets " +
+                $"{string.Join(", ", conflicts)}. Connection:Enabled would overwrite those values. Set them in " +
+                "the client's Connection section and remove them from the handler, or set Connection:Enabled to " +
+                "false for this client.");
+        }
+    }
+
+    /// <summary>
+    /// The connection settings on <paramref name="handler"/> that differ from both a new
+    /// <see cref="SocketsHttpHandler"/> and the value the schema resolves.
+    /// </summary>
+    /// <remarks>
+    /// A value left at the runtime default cannot be told from one never set, so it is not a conflict.
+    /// <c>MaxConnectionsPerServer</c> is written only when stated, so it conflicts only then. The redirect
+    /// bound is not compared: a stated or hedged value is a destination bound and wins.
+    /// </remarks>
+    internal static List<string> ConflictingSettings(SocketsHttpHandler handler, HttpResilienceConnectionOptions connection)
+    {
+        var conflicts = new List<string>();
+        using var defaults = new SocketsHttpHandler();
+
+        Check(handler.ConnectTimeout, defaults.ConnectTimeout, connection.ConnectTimeout,
+            nameof(HttpResilienceConnectionOptions.ConnectTimeout));
+        Check(handler.PooledConnectionIdleTimeout, defaults.PooledConnectionIdleTimeout,
+            connection.PooledConnectionIdleTimeout, nameof(HttpResilienceConnectionOptions.PooledConnectionIdleTimeout));
+        Check(handler.PooledConnectionLifetime, defaults.PooledConnectionLifetime,
+            connection.PooledConnectionLifetime, nameof(HttpResilienceConnectionOptions.PooledConnectionLifetime));
+        Check(handler.EnableMultipleHttp2Connections, defaults.EnableMultipleHttp2Connections,
+            connection.EnableMultipleHttp2Connections, nameof(HttpResilienceConnectionOptions.EnableMultipleHttp2Connections));
+
+        if (connection.MaxConnectionsPerServer is { } max)
+        {
+            Check(handler.MaxConnectionsPerServer, defaults.MaxConnectionsPerServer, max,
+                nameof(HttpResilienceConnectionOptions.MaxConnectionsPerServer));
+        }
+
+        return conflicts;
+
+        void Check<T>(T actual, T runtimeDefault, T configured, string key)
+            where T : IEquatable<T>
+        {
+            if (!actual.Equals(runtimeDefault) && !actual.Equals(configured))
+            {
+                conflicts.Add(FormattableString.Invariant($"{key} to {actual} (Connection:{key} is {configured})"));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Replaces an <see cref="HttpClientHandler"/> with a configured <see cref="SocketsHttpHandler"/> only
+    /// when it carries nothing the replacement would drop; otherwise fails client creation.
+    /// </summary>
+    /// <remarks>
+    /// Its settings cannot be copied faithfully (its certificate callback receives the request, the
+    /// <see cref="SocketsHttpHandler"/> one does not), and silently dropping a client certificate or a pinning
+    /// callback is a security regression, so the only safe outcomes are an exact no-op or a refusal.
+    /// </remarks>
+    private static void ReplaceUnconfiguredClientHandler(
+        HttpMessageHandlerBuilder builder,
+        HttpClientHandler client,
+        HttpResilienceConnectionOptions connection)
+    {
+        if (CustomizedSettings(client) is { Count: > 0 } customized)
+        {
+            throw new InvalidOperationException(
+                $"HTTP client '{builder.Name}' has Connection:Enabled set, but its primary handler is " +
+                $"{(client.GetType() == typeof(HttpClientHandler) ? "an HttpClientHandler" : $"a {client.GetType().Name}")} " +
+                $"configured with {string.Join(", ", customized)}. Connection:Enabled replaces an " +
+                "HttpClientHandler with a new SocketsHttpHandler, which would silently drop those settings " +
+                "(a client certificate, a certificate-validation callback, a proxy or credentials among them). " +
+                "Supply a SocketsHttpHandler carrying the same settings (SslOptions, Proxy, Credentials), " +
+                "for example with ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { ... }) or " +
+                "UseSocketsHttpHandler, or set Connection:Enabled to false for this client.");
+        }
+
+        client.Dispose();
+        builder.PrimaryHandler = Create(connection);
+    }
+
+    /// <summary>
+    /// The settings on <paramref name="client"/> that differ from a new <see cref="HttpClientHandler"/>.
+    /// </summary>
+    /// <remarks>
+    /// An empty <see cref="HttpClientHandler.CookieContainer"/> shared with other code cannot be told apart
+    /// from the default one, so only a container holding cookies or non-default limits is reported.
+    /// </remarks>
+    internal static List<string> CustomizedSettings(HttpClientHandler client)
+    {
+        var customized = new List<string>();
+        using var defaults = new HttpClientHandler();
+
+        if (client.GetType() != typeof(HttpClientHandler))
+        {
+            customized.Add($"a derived type ({client.GetType().Name}) whose overrides would be lost");
+        }
+
+        // ClientCertificates throws unless ClientCertificateOptions is Manual.
+        if (client.ClientCertificateOptions != defaults.ClientCertificateOptions)
+        {
+            customized.Add(nameof(HttpClientHandler.ClientCertificateOptions));
+        }
+        else if (client.ClientCertificates.Count > 0)
+        {
+            customized.Add(nameof(HttpClientHandler.ClientCertificates));
+        }
+
+        Check(client.ServerCertificateCustomValidationCallback is not null,
+            nameof(HttpClientHandler.ServerCertificateCustomValidationCallback));
+        Check(client.SslProtocols != defaults.SslProtocols, nameof(HttpClientHandler.SslProtocols));
+        Check(client.CheckCertificateRevocationList != defaults.CheckCertificateRevocationList,
+            nameof(HttpClientHandler.CheckCertificateRevocationList));
+        Check(client.Proxy is not null, nameof(HttpClientHandler.Proxy));
+        Check(client.UseProxy != defaults.UseProxy, nameof(HttpClientHandler.UseProxy));
+        Check(client.DefaultProxyCredentials is not null, nameof(HttpClientHandler.DefaultProxyCredentials));
+        Check(client.Credentials is not null, nameof(HttpClientHandler.Credentials));
+        Check(client.UseDefaultCredentials != defaults.UseDefaultCredentials,
+            nameof(HttpClientHandler.UseDefaultCredentials));
+        Check(client.PreAuthenticate != defaults.PreAuthenticate, nameof(HttpClientHandler.PreAuthenticate));
+        Check(client.UseCookies != defaults.UseCookies, nameof(HttpClientHandler.UseCookies));
+        Check(client.CookieContainer.Count > 0 ||
+            client.CookieContainer.Capacity != defaults.CookieContainer.Capacity ||
+            client.CookieContainer.PerDomainCapacity != defaults.CookieContainer.PerDomainCapacity ||
+            client.CookieContainer.MaxCookieSize != defaults.CookieContainer.MaxCookieSize,
+            nameof(HttpClientHandler.CookieContainer));
+        Check(client.AutomaticDecompression != defaults.AutomaticDecompression,
+            nameof(HttpClientHandler.AutomaticDecompression));
+        Check(client.AllowAutoRedirect != defaults.AllowAutoRedirect, nameof(HttpClientHandler.AllowAutoRedirect));
+        Check(client.MaxAutomaticRedirections != defaults.MaxAutomaticRedirections,
+            nameof(HttpClientHandler.MaxAutomaticRedirections));
+        Check(client.MaxConnectionsPerServer != defaults.MaxConnectionsPerServer,
+            nameof(HttpClientHandler.MaxConnectionsPerServer));
+        Check(client.MaxResponseHeadersLength != defaults.MaxResponseHeadersLength,
+            nameof(HttpClientHandler.MaxResponseHeadersLength));
+        Check(client.MeterFactory is not null, nameof(HttpClientHandler.MeterFactory));
+        Check(client.Properties.Count > 0, nameof(HttpClientHandler.Properties));
+
+        return customized;
+
+        void Check(bool differs, string setting)
+        {
+            if (differs)
+            {
+                customized.Add(setting);
+            }
+        }
+    }
+
+    /// <summary>
     /// Stops the client following redirects, without touching anything else about the handler. Returns
     /// <see langword="false"/> when the primary handler has no redirect switch, so the caller can say so.
     /// </summary>
-    /// <remarks>
-    /// Used when a client bounds its destinations but has not opted into connection tuning -- every hedged
-    /// client, and any client that states <c>Connection:AllowAutoRedirect</c> false.
-    /// </remarks>
     public static bool TryDisableAutoRedirect(HttpMessageHandlerBuilder builder)
     {
         switch (builder.PrimaryHandler)
@@ -81,39 +206,24 @@ internal static class SocketsHttpHandlerFactory
                 return true;
 
             default:
-                // There is nothing here to set the flag on, and this used to return in silence -- a safety
-                // bound that could not be applied and said nothing, which is the state every other notice in
-                // this package exists to refuse.
-                //
-                // Reported by the caller rather than thrown, and the difference from Install's throw is
-                // deliberate. Install runs when Connection:Enabled is set, where a handler with no
-                // PooledConnectionLifetime means nothing recycles the pool -- a real defect on any handler.
-                // Here, the handler that actually reaches this branch is a test stub, which resolves no
-                // redirects and therefore cannot breach the bound at all. Throwing would fail every stubbed
-                // hedged client in every consumer's test suite over a hazard those clients do not have, and
-                // the way out of the throw would be to state Connection:AllowAutoRedirect true -- teaching
-                // people to switch a security bound off to make tests compile. The case that is a genuine
-                // hazard is a handler wrapping a SocketsHttpHandler of its own, which does resolve redirects;
-                // it is rare, indistinguishable from the stub here, and worth a Warning naming the client.
                 return false;
         }
     }
 
-    public static SocketsHttpHandler Create(ConnectionOptions connection)
+    public static SocketsHttpHandler Create(HttpResilienceConnectionOptions connection)
     {
         var handler = new SocketsHttpHandler();
         Apply(handler, connection);
         return handler;
     }
 
-    private static void Apply(SocketsHttpHandler handler, ConnectionOptions connection)
+    private static void Apply(SocketsHttpHandler handler, HttpResilienceConnectionOptions connection)
     {
         handler.ConnectTimeout = connection.ConnectTimeout;
         handler.PooledConnectionIdleTimeout = connection.PooledConnectionIdleTimeout;
         handler.PooledConnectionLifetime = connection.PooledConnectionLifetime;
         handler.EnableMultipleHttp2Connections = connection.EnableMultipleHttp2Connections;
 
-        // Left at the runtime default (unlimited) unless an operator has sized it for a specific dependency.
         if (connection.MaxConnectionsPerServer is { } max)
         {
             handler.MaxConnectionsPerServer = max;
@@ -126,24 +236,11 @@ internal static class SocketsHttpHandlerFactory
     /// Assigns <see cref="SocketsHttpHandler.AllowAutoRedirect"/> only when this schema has something to say
     /// about it.
     /// </summary>
-    /// <remarks>
-    /// The resolved value is <see langword="true"/> for a standard client that stated nothing, and that value
-    /// came from the pipeline kind rather than from a person. Writing it overwrote the one property on a
-    /// consumer's own handler that is a security control: a handler hardened with
-    /// <c>AllowAutoRedirect = false</c> had redirects switched back on by nothing more than
-    /// <c>Connection:Enabled</c>, while the troubleshooting guide told its owner their settings were
-    /// preserved. The runtime strips <c>Authorization</c> across a redirect and re-sends every custom
-    /// credential header verbatim, so that is a credential-disclosure path, not a preference.
-    /// <para>
-    /// <see langword="false"/> is written whether it was stated or resolved. That is the hedged client's
-    /// destination bound, and a bound a consumer's handler can defeat by construction is not a bound.
-    /// </para>
-    /// </remarks>
-    private static void ApplyRedirectBound(SocketsHttpHandler handler, ConnectionOptions connection)
+    private static void ApplyRedirectBound(SocketsHttpHandler handler, HttpResilienceConnectionOptions connection)
     {
         bool follows = connection.FollowsRedirects(enforcesAllowList: false);
 
-        if (connection.AllowAutoRedirectStated || !follows)
+        if (OptionsComposition.IsRedirectStated(connection) || !follows)
         {
             handler.AllowAutoRedirect = follows;
         }

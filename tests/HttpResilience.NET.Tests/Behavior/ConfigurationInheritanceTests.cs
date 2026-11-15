@@ -8,18 +8,11 @@ using Microsoft.Extensions.Options;
 namespace HttpResilience.NET.Tests.Behavior;
 
 /// <summary>
-/// A client section is layered on top of the root, and what "layered" means for a <b>list</b> is not what it
-/// means for a scalar.
+/// A client section is layered on top of the root, but a client's <b>list</b> replaces the root's.
 /// </summary>
 /// <remarks>
-/// <c>Microsoft.Extensions.Configuration</c>'s binder adds to a non-null collection rather than replacing it,
-/// so binding the root and then the client section onto one options instance <i>unions</i> every list. That
-/// is the unsafe direction for both lists this schema has: a client could widen an inherited allow-list but
-/// never narrow one, so a section that reads as a restriction is not one.
-/// <para>
-/// Every test here asserts on delivered requests rather than on the bound value, because the bound value is
-/// what a reader would check and the origin call count is what an operator experiences.
-/// </para>
+/// The configuration binder appends to an existing collection, which would let a client widen an inherited
+/// allow-list but never narrow it. Tests assert on delivered requests, not on the bound value.
 /// </remarks>
 public class ConfigurationInheritanceTests
 {
@@ -28,14 +21,11 @@ public class ConfigurationInheritanceTests
     /// the root's HEAD entry survives, and a client that named only GET goes on retrying HEAD.
     /// </summary>
     /// <remarks>
-    /// The root list is safe-only because an unsafe entry there is now refused outright -- a root list may
-    /// narrow what is retried but never widen it. That removes the original failure this test described (a
-    /// client naming GET under a root naming POST, still retrying POST bodies) as a reachable state, and it
-    /// is <c>ARootLevelAllowListNamingAnUnsafeMethod_FailsAtRegistration</c> that now holds that line. What
-    /// is left here is the mechanism underneath it: a client section <b>replaces</b> an inherited list rather
-    /// than unioning with it, which is what the binder does not do on its own.
+    /// A root list may only name safe methods (see
+    /// <c>ARootLevelAllowListNamingAnUnsafeMethod_FailsAtRegistration</c>). This test covers the mechanism: a
+    /// client section replaces an inherited list rather than unioning with it.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ClientRetryableMethods_ReplaceTheRootList_RatherThanAddingToIt()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -44,7 +34,7 @@ public class ConfigurationInheritanceTests
                 .Set("Retry:RetryableMethods:1", "HEAD")
                 .ForClient("test", "Retry:RetryableMethods:0", "GET"));
 
-        await harness.SendAsync(HttpMethod.Head);
+        await harness.SendAsync(HttpMethod.Head, cancellationToken: TestContext.Current.CancellationToken);
 
         // The client narrowed the list to GET. A retried HEAD means the root's entry survived the override.
         Assert.Equal(1, harness.Origin.Count);
@@ -57,36 +47,35 @@ public class ConfigurationInheritanceTests
     /// The inherited list is <c>["HEAD"]</c> rather than the default safe set, so the assertion discriminates:
     /// a client that failed to inherit it would fall back to the default guard and retry the GET.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ClientWithoutItsOwnList_StillInheritsTheRootRetryableMethods()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled().Set("Retry:RetryableMethods:0", "HEAD"));
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // GET is not on the inherited list, so it is not retried. Three calls would mean the client never
         // saw the root's list at all.
         Assert.Equal(1, harness.Origin.Count);
 
-        await harness.SendAsync(HttpMethod.Head);
+        await harness.SendAsync(HttpMethod.Head, cancellationToken: TestContext.Current.CancellationToken);
 
         // And what the list does name is still retried, so the list is in force rather than merely present.
         Assert.Equal(4, harness.Origin.Count);
     }
 
     /// <summary>
-    /// A client under a permissive inherited list can return to the default safe guard by stating an empty
-    /// list of its own -- the documented opt-out, and the one narrowing move a client could not otherwise
-    /// make.
+    /// A client under an inherited list returns to the default safe guard by stating an empty list.
     /// </summary>
     /// <remarks>
-    /// The client section states the key, so <c>ResetListsStatedBy</c> clears the inherited list before
-    /// binding, and an empty list means "no allow-list" rather than "no retries": GET is still retried by the
-    /// safe-method guard, and POST is not. Fails if the empty list starts being treated as an error again, or
-    /// starts unioning with the root's.
+    /// <remarks>
+    /// <c>ResetListsStatedBy</c> clears the inherited list, and an empty list means "no allow-list", not "no
+    /// retries": GET is retried by the safe-method guard, POST is not. Fails if the empty list is treated as
+    /// an error or unions with the root's.
     /// </remarks>
-    [Fact]
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ClientStatingAnEmptyList_ReturnsToTheDefaultSafeMethodGuard()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -94,27 +83,25 @@ public class ConfigurationInheritanceTests
                 .Set("Retry:RetryableMethods:0", "HEAD")
                 .ForClient("test", "Retry:RetryableMethods", string.Empty));
 
-        await harness.SendAsync(HttpMethod.Head);
+        await harness.SendAsync(HttpMethod.Head, cancellationToken: TestContext.Current.CancellationToken);
 
         // Not the inherited list any more: HEAD is retried because it is safe, not because it was named.
         Assert.Equal(3, harness.Origin.Count);
 
         using var content = new StringContent("x", Encoding.UTF8, "text/plain");
-        await harness.SendAsync(HttpMethod.Post, content: content);
+        await harness.SendAsync(HttpMethod.Post, content: content, cancellationToken: TestContext.Current.CancellationToken);
 
         // And the guard the empty list restored is the real one.
         Assert.Equal(4, harness.Origin.Count);
     }
 
     /// <summary>
-    /// A hedged client's allow-list bounds the destinations it may reach, so inheriting an entry the client's
-    /// own section does not state widens a security control by accident.
+    /// A hedged client's allow-list bounds its destinations, so an entry only the root states must not widen it.
     /// </summary>
     /// <remarks>
-    /// Fails if the authorities list goes back to being unioned: the request to the root-only authority is
-    /// admitted instead of rejected.
+    /// Fails if the authorities list is unioned: the root-only authority would be admitted.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ClientAuthorities_ReplaceTheRootList_SoAHedgedClientCannotInheritADestination()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -123,50 +110,39 @@ public class ConfigurationInheritanceTests
                 .ForClient("test", "PipelineSelection:Authorities:0", "http://origin.test"),
             hedged: true);
 
-        HttpRequestException rejected = await Assert.ThrowsAsync<HttpRequestException>(
-            () => harness.GetAsync("http://inherited.test/x"));
+        InvalidOperationException rejected = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.GetAsync("http://inherited.test/x", TestContext.Current.CancellationToken));
 
         Assert.Contains("http://inherited.test", rejected.Message, StringComparison.Ordinal);
 
         // The authority the client did list is still reachable.
-        HttpResponseMessage response = await harness.GetAsync("http://origin.test/x");
+        HttpResponseMessage response = await harness.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
     /// <summary>
-    /// A hedged client that states no authorities of its own still inherits the root's, which is what makes
-    /// a fleet-wide allow-list expressible in one place.
+    /// A hedged client that states no authorities inherits the root's, so a fleet-wide list is one entry.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClientWithoutItsOwnList_StillInheritsTheRootAuthorities()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled().Set("PipelineSelection:Authorities:0", "http://origin.test"),
             hedged: true);
 
-        HttpResponseMessage response = await harness.GetAsync("http://origin.test/x");
+        HttpResponseMessage response = await harness.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
     /// <summary>
-    /// The root authority list above is inherited by <i>every</i> client, so a standard client sharing that
-    /// root must not be the thing that fails startup.
+    /// A root authority list is inherited by every client, so it must not fail a standard client.
     /// </summary>
     /// <remarks>
-    /// The mirror of <c>RootHedgingConfiguration_DoesNotFailAStandardClient</c> and
-    /// <c>RootRetryConfiguration_DoesNotFailAHedgedClient</c>, and it did not hold. The rule that an
-    /// authority list is inert under <c>Mode: None</c> was evaluated against the <i>bound</i> options, which
-    /// include everything inherited -- so stating the fleet-wide list the test above depends on made every
-    /// standard client in the same process fail registration, and the message named the standard client's own
-    /// section rather than the root where the list actually is.
-    /// <para>
-    /// Two documented features, individually tested, that could not be used together: no existing test
-    /// registered both kinds of client. Fails if the rule goes back to reading the bound value instead of the
-    /// client's own section.
-    /// </para>
+    /// The inert-list rule reads the client's own section, not the bound value, which includes the root.
+    /// Fails if the rule reads the bound value.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ARootAuthorityList_DoesNotFailAStandardClient()
     {
         var services = new ServiceCollection();
@@ -175,22 +151,20 @@ public class ConfigurationInheritanceTests
                 Settings.Enabled().Set("PipelineSelection:Authorities:0", "http://origin.test").Build())
             .Build());
 
-        // One of each, which is the ordinary shape of a service with a hedged read path: the list is for the
-        // hedged client, and the standard client inherits it because inheritance is not selective.
-        services.AddHttpClient("hedged").AddHedgedHttpResilience();
+        // One of each, the usual shape of a service with a hedged read path.
+        services.AddHttpClient("hedged").AddHttpResilienceHedgingHandler();
 
         var origin = new RecordingHandler(HttpStatusCode.OK);
-        services.AddHttpClient("standard").AddHttpResilience()
+        services.AddHttpClient("standard").AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => origin);
 
         await using ServiceProvider provider = services.BuildServiceProvider();
         provider.GetRequiredService<IStartupValidator>().Validate();
 
         (await provider.GetRequiredService<IHttpClientFactory>().CreateClient("standard")
-            .GetAsync("http://origin.test/x")).Dispose();
+            .GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
 
-        // The standard client runs, and the inherited list did nothing to it -- one shared pipeline, as
-        // Mode: None says.
+        // The standard client runs on one shared pipeline, as Mode: None says.
         Assert.Equal(1, origin.Count);
     }
 
@@ -199,14 +173,12 @@ public class ConfigurationInheritanceTests
     /// a written statement with no effect.
     /// </summary>
     /// <remarks>
-    /// The half of the rule worth keeping. Fails if moving the check to the client's own section dropped it
-    /// rather than narrowing it.
+    /// Fails if the check is dropped rather than scoped to the client's section.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AClientStatingItsOwnAuthorityListUnderModeNone_StillFails()
     {
-        OptionsValidationException failure = Assert.Throws<OptionsValidationException>(() =>
-            ResilienceHarness.BuildProvider(
+        OptionsValidationException failure = StartupAssert.Fails(() => ResilienceHarness.BuildProvider(
                 Settings.Enabled().ForClient("test", "PipelineSelection:Authorities:0", "http://origin.test")));
 
         Assert.Contains(

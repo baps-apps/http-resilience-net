@@ -17,14 +17,9 @@ namespace HttpResilience.NET.IntegrationTests;
 /// The pipeline over a real HTTP/2 connection.
 /// </summary>
 /// <remarks>
-/// <c>Connection:EnableMultipleHttp2Connections</c> defaults to <see langword="true"/>, which is a deliberate
-/// deviation from the runtime default of <see langword="false"/> -- and nothing exercised HTTP/2 at all, so
-/// neither the deviation nor the pipeline's behavior on a multiplexed connection was covered by anything.
-/// <para>
-/// Prior-knowledge h2c (HTTP/2 over cleartext) rather than TLS, so the test needs no development certificate
-/// and behaves the same on a developer machine and in CI. What is being asserted is the pipeline's behavior
-/// over a multiplexed connection, not the TLS handshake, and ALPN is the runtime's business either way.
-/// </para>
+/// <c>Connection:EnableMultipleHttp2Connections</c> defaults to <see langword="true"/>, unlike the runtime.
+/// Prior-knowledge h2c (cleartext) is used so no development certificate is needed; the subject is the
+/// pipeline over a multiplexed connection, not TLS.
 /// </remarks>
 public class Http2Tests
 {
@@ -39,7 +34,7 @@ public class Http2Tests
     /// the <c>SocketsHttpHandler</c> branch, a consumer's <c>SslOptions</c> and protocol configuration would
     /// go with it.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ARequestThroughThePipeline_UsesHttp2()
     {
         await using var origin = await Http2Origin.StartAsync();
@@ -61,7 +56,7 @@ public class Http2Tests
     /// close a connection, so a retry loop that depended on connection teardown to make progress would
     /// behave differently here.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Retries_WorkOverAMultiplexedConnection()
     {
         await using var origin = await Http2Origin.StartAsync();
@@ -80,7 +75,7 @@ public class Http2Tests
     /// default deviates from the runtime's, so a mapping that silently dropped it would leave every client
     /// on <see langword="false"/> while the configuration reference said otherwise.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData(true)]
     [InlineData(false)]
     public void EnableMultipleHttp2Connections_ReachesThePrimaryHandler(bool enabled)
@@ -103,7 +98,7 @@ public class Http2Tests
     /// With connection tuning off the package must not touch the property at all, leaving whatever the
     /// runtime and the consumer decided.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void WithConnectionTuningOff_TheHandlerKeepsItsOwnHttp2Setting()
     {
         using ServiceProvider provider = Build(
@@ -173,7 +168,7 @@ public class Http2Tests
 
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
-        IHttpClientBuilder builder = services.AddHttpClient("h2").AddHttpResilience();
+        IHttpClientBuilder builder = services.AddHttpClient("h2").AddHttpResilienceHandler();
         configureClient?.Invoke(builder);
 
         return services.BuildServiceProvider();

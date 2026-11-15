@@ -1,6 +1,5 @@
 using System.Net;
 using HttpResilience.NET.Tests.Infrastructure;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Polly.CircuitBreaker;
 
 namespace HttpResilience.NET.Tests.Behavior;
@@ -14,43 +13,42 @@ public class CircuitBreakerTests
         .Set("CircuitBreaker:SamplingDuration", "00:00:30")
         .Set("CircuitBreaker:BreakDuration", "00:00:30");
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Opens_AfterTheFailureRatioIsExceeded_AndThenFailsFast()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(Breaking());
 
-        await harness.GetAsync();
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         int callsBeforeBreak = harness.Origin.Count;
 
-        await Assert.ThrowsAsync<BrokenCircuitException>(() => harness.GetAsync());
+        await Assert.ThrowsAsync<BrokenCircuitException>(() => harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken));
 
         // Failing fast means the request never reached the origin.
         Assert.Equal(callsBeforeBreak, harness.Origin.Count);
     }
 
-    [Fact]
-    public async Task OpenCircuit_IsReportedAsDegraded_NotUnhealthy()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AnOpenCircuit_IsReportedOpenByTheStateGauge()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(Breaking());
 
-        await harness.GetAsync();
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Equal(HealthStatus.Degraded, HealthState.Status(harness.Services));
-        Assert.NotEmpty(HealthState.NotClosed(harness.Services));
+        Assert.Equal(1, Assert.Single(BreakerState.All(harness.Services)).Value);
     }
 
-    [Fact]
-    public async Task HealthyDependencies_AreReportedHealthy()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task HealthyDependencies_ReportNoOpenCircuit()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled(), new RecordingHandler(HttpStatusCode.OK));
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Equal(HealthStatus.Healthy, HealthState.Status(harness.Services));
+        Assert.Empty(BreakerState.NotClosed(harness.Services));
     }
 
     /// <summary>
@@ -58,7 +56,7 @@ public class CircuitBreakerTests
     /// alone would let the last callback to fire overwrite the others, so one host recovering would mask
     /// another still being open.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PerAuthority_TracksEachBreakerSeparately()
     {
         var origin = new RecordingHandler((request, _, _) => Task.FromResult(
@@ -74,26 +72,29 @@ public class CircuitBreakerTests
                 .Set("PipelineSelection:Authorities:1", "http://good.test"),
             origin);
 
-        await harness.GetAsync("http://bad.test/x");
-        await harness.GetAsync("http://bad.test/x");
+        await harness.GetAsync("http://bad.test/x", TestContext.Current.CancellationToken);
+        await harness.GetAsync("http://bad.test/x", TestContext.Current.CancellationToken);
 
-        await harness.GetAsync("http://good.test/x");
-        await harness.GetAsync("http://good.test/x");
+        await harness.GetAsync("http://good.test/x", TestContext.Current.CancellationToken);
+        await harness.GetAsync("http://good.test/x", TestContext.Current.CancellationToken);
 
-        IReadOnlyList<string> notClosed = HealthState.NotClosed(harness.Services);
+        IReadOnlyList<string> notClosed = BreakerState.NotClosed(harness.Services);
 
         Assert.Contains(notClosed, key => key.Contains("bad.test", StringComparison.Ordinal));
         Assert.DoesNotContain(notClosed, key => key.Contains("good.test", StringComparison.Ordinal));
-        // A breaker that never left Closed fires no transition callback, so absence of an entry means
-        // healthy. Only the failing host is tracked, and it is tracked under its own key.
-        Assert.Single(HealthState.Data(harness.Services));
+        // Every breaker is reported, each under its own key: the failing host open, its neighbour and the
+        // shared pipeline for unlisted hosts closed.
+        IReadOnlyDictionary<string, long> all = BreakerState.All(harness.Services);
+        Assert.Equal(3, all.Count);
+        Assert.Equal(1, all["test -> http://bad.test"]);
+        Assert.Equal(0, all["test -> http://good.test"]);
 
         // The healthy host keeps serving even though its neighbour's circuit is open.
-        HttpResponseMessage response = await harness.GetAsync("http://good.test/x");
+        HttpResponseMessage response = await harness.GetAsync("http://good.test/x", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PerAuthority_IsolatesBreakersSoOneBadHostDoesNotBreakAnother()
     {
         var origin = new RecordingHandler((request, _, _) => Task.FromResult(
@@ -109,18 +110,18 @@ public class CircuitBreakerTests
                 .Set("PipelineSelection:Authorities:1", "http://good.test"),
             origin);
 
-        await harness.GetAsync("http://bad.test/x");
-        await harness.GetAsync("http://bad.test/x");
+        await harness.GetAsync("http://bad.test/x", TestContext.Current.CancellationToken);
+        await harness.GetAsync("http://bad.test/x", TestContext.Current.CancellationToken);
 
-        await Assert.ThrowsAsync<BrokenCircuitException>(() => harness.GetAsync("http://bad.test/x"));
-        Assert.Equal(HttpStatusCode.OK, (await harness.GetAsync("http://good.test/x")).StatusCode);
+        await Assert.ThrowsAsync<BrokenCircuitException>(() => harness.GetAsync("http://bad.test/x", TestContext.Current.CancellationToken));
+        Assert.Equal(HttpStatusCode.OK, (await harness.GetAsync("http://good.test/x", TestContext.Current.CancellationToken)).StatusCode);
     }
 
     /// <summary>
     /// Any authority outside the allow-list shares one pipeline, so no amount of request traffic to novel
     /// hosts can mint additional pipelines, breakers or metric series.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PerAuthority_UnlistedHostsShareASinglePipeline()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -132,7 +133,7 @@ public class CircuitBreakerTests
         {
             try
             {
-                await harness.GetAsync($"http://attacker-{i}.test/x");
+                await harness.GetAsync($"http://attacker-{i}.test/x", TestContext.Current.CancellationToken);
             }
             catch (BrokenCircuitException)
             {
@@ -141,9 +142,10 @@ public class CircuitBreakerTests
             }
         }
 
-        IReadOnlyDictionary<string, object> data = HealthState.Data(harness.Services);
+        IReadOnlyDictionary<string, long> data = BreakerState.All(harness.Services);
 
-        Assert.Single(data);
-        Assert.Contains("shared", data.Keys.Single(), StringComparison.Ordinal);
+        // The listed authority's breaker and the one shared breaker: twenty novel hosts added nothing.
+        Assert.Equal(["test -> http://known.test", "test -> shared"], data.Keys.Order(StringComparer.Ordinal));
+        Assert.NotEqual(0, data["test -> shared"]);
     }
 }

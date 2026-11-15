@@ -12,18 +12,13 @@ namespace HttpResilience.NET.Tests.Internal;
 /// whether a breaker is open <i>right now</i>, and how close a limiter is to saturation.
 /// </summary>
 /// <remarks>
-/// Polly emits a counter of breaker transition events, which answers "did it open" and not "is it open" --
-/// a gauge is the only instrument that survives a restarted scrape or a missed event. Limiter statistics are
-/// on <see cref="System.Threading.RateLimiting.RateLimiter"/> and were simply never read.
-/// <para>
-/// Both are observable gauges, so the callback runs once per collection rather than once per request. A test
-/// that polled them per request would not notice the difference, which is why
+/// Polly's transition counter answers "did it open", not "is it open"; a gauge survives a missed scrape. Both
+/// are observable gauges, read once per collection;
 /// <see cref="Gauges_AreObservable_SoNothingIsPolledOnTheRequestPath"/> asserts the instrument type.
-/// </para>
 /// </remarks>
 public class MetricsTests
 {
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CircuitBreakerState_IsPublishedAsAGauge()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -41,7 +36,7 @@ public class MetricsTests
         {
             try
             {
-                (await harness.GetAsync()).Dispose();
+                (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
             }
             catch (BrokenCircuitException)
             {
@@ -49,17 +44,71 @@ public class MetricsTests
             }
         }
 
-        IReadOnlyList<Measurement> states = collector.Collect("http.resilience.circuit_breaker.state");
+        IReadOnlyList<Measurement> states = collector.Collect("http_resilience.circuit_breaker.state");
 
-        Measurement open = Assert.Single(states);
-        Assert.Equal(1, open.Value); // 0 Closed, 1 Open, 2 HalfOpen
-        Assert.Equal("test", open.Tag("http.client.name"));
-        Assert.Equal("shared", open.Tag("http.resilience.authority"));
+        // One series per state, as OpenTelemetry state metrics do: 1 for the state the breaker is in, 0 for the others.
+        Assert.Equal(
+            ["closed=0", "half_open=0", "open=1"],
+            states.Select(m => $"{m.Tag("http_resilience.circuit_breaker.state")}={m.Value}").Order(StringComparer.Ordinal));
 
-        // The shared pipeline names no destination, so it carries neither semantic-convention tag rather
-        // than a placeholder value. An invented server.address would be worse than a missing one.
-        Assert.Null(open.Tag("server.address"));
-        Assert.Null(open.Tag("server.port"));
+        Assert.All(states, m =>
+        {
+            Assert.Equal("test", m.Tag("http_resilience.client.name"));
+            Assert.Equal("shared", m.Tag("http_resilience.authority"));
+
+            // The shared pipeline names no destination, so it carries neither semantic-convention tag.
+            Assert.Null(m.Tag("server.address"));
+            Assert.Null(m.Tag("server.port"));
+        });
+    }
+
+    /// <summary>
+    /// A breaker is reported from the first collection, as closed, not only after its first transition, so
+    /// "no series" never has to be read as "closed" and a dashboard shows every breaker the client has.
+    /// </summary>
+    /// <remarks>
+    /// The keys come from the client's own allow-list: a standard <c>ByAuthority</c> client has one breaker per
+    /// listed authority plus the shared one for the rest; a hedged client refuses unlisted authorities, so it has
+    /// no shared breaker. Fails if the gauge reports only breakers that have changed state.
+    /// </remarks>
+    [Theory(Timeout = TestTimeouts.Default)]
+    [InlineData(false, false, "shared")]
+    [InlineData(false, true, "http://a.test,http://b.test,shared")]
+    [InlineData(true, true, "http://a.test,http://b.test")]
+    public async Task EveryBreaker_IsReportedClosed_BeforeAnyRequest(bool hedged, bool byAuthority, string expected)
+    {
+        Settings settings = hedged ? Settings.Hedged() : Settings.Enabled();
+        if (byAuthority)
+        {
+            settings = settings
+                .Set("PipelineSelection:Authorities:0", "http://a.test")
+                .Set("PipelineSelection:Authorities:1", "http://b.test");
+            settings = hedged ? settings : settings.Set("PipelineSelection:Mode", "ByAuthority");
+        }
+
+        await using ResilienceHarness harness = ResilienceHarness.Create(settings, hedged: hedged);
+        using var collector = new GaugeCollector(harness.Services);
+
+        Measurement[] closed =
+        [
+            .. collector.Collect("http_resilience.circuit_breaker.state")
+                .Where(m => Equals(m.Tag("http_resilience.circuit_breaker.state"), "closed"))
+        ];
+
+        Assert.All(closed, m => Assert.Equal(1, m.Value));
+        Assert.Equal(
+            expected.Split(','),
+            closed.Select(m => (string)m.Tag("http_resilience.authority")!).Order(StringComparer.Ordinal));
+    }
+
+    /// <summary>A disabled client has no breaker, so it reports none.</summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ADisabledClient_ReportsNoBreaker()
+    {
+        await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled().Set("Enabled", "false"));
+        using var collector = new GaugeCollector(harness.Services);
+
+        Assert.Empty(collector.Collect("http_resilience.circuit_breaker.state"));
     }
 
     /// <summary>
@@ -67,14 +116,10 @@ public class MetricsTests
     /// semantic-convention pair <c>System.Net.Http</c> tags its own series with.
     /// </summary>
     /// <remarks>
-    /// Without them an operator correlating breaker state against <c>http.client.request.duration</c> has to
-    /// split <c>scheme://host:port</c> inside the query. They add no series -- both are functionally
-    /// determined by the authority already present -- so this is a join key, not new cardinality.
-    /// <para>
-    /// Fails if the gauge goes back to emitting only the authority string.
-    /// </para>
+    /// Lets breaker state join to <c>http.client.request.duration</c> without splitting the authority string.
+    /// No extra series: both derive from the authority. Fails if the gauge emits only the authority.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CircuitBreakerState_CarriesTheSemanticConventionDestinationTags()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -92,7 +137,7 @@ public class MetricsTests
         {
             try
             {
-                (await harness.GetAsync()).Dispose();
+                (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
             }
             catch (BrokenCircuitException)
             {
@@ -100,14 +145,16 @@ public class MetricsTests
             }
         }
 
-        Measurement open = Assert.Single(collector.Collect("http.resilience.circuit_breaker.state"));
+        Measurement open = Assert.Single(
+            collector.Collect("http_resilience.circuit_breaker.state"),
+            m => Equals(m.Tag("http_resilience.circuit_breaker.state"), "open") && m.Value == 1);
 
-        Assert.Equal("http://origin.test", open.Tag("http.resilience.authority"));
+        Assert.Equal("http://origin.test", open.Tag("http_resilience.authority"));
         Assert.Equal("origin.test", open.Tag("server.address"));
         Assert.Equal(80, open.Tag("server.port"));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiterStatistics_ArePublishedAsGauges()
     {
         var gate = new TaskCompletionSource();
@@ -124,16 +171,11 @@ public class MetricsTests
 
         using var collector = new GaugeCollector(harness.Services);
 
-        Task<HttpResponseMessage> held = harness.GetAsync();
-        while (harness.Origin.Count == 0)
-        {
-            await Task.Delay(10);
-        }
+        Task<HttpResponseMessage> held = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await harness.Origin.WaitForCountAsync(1);
 
-        // Not Assert.Single any more: a client with a rate limiter also has a displaced concurrency
-        // backstop, and both are now reported on one instrument, told apart by kind. The previous
-        // assertion would have passed for either one of them alone, which is what let the backstop go
-        // unreported for as long as it did.
+        // A client with a rate limiter also has a displaced concurrency backstop; both are reported on one
+        // instrument, told apart by kind.
         Measurement permits = Single(collector, "available_permits", "rate");
         Measurement queued = Single(collector, "queued_requests", "rate");
 
@@ -141,28 +183,20 @@ public class MetricsTests
         (await held).Dispose();
 
         Assert.Equal(1, permits.Value);
-        Assert.Equal("test", permits.Tag("http.client.name"));
+        Assert.Equal("test", permits.Tag("http_resilience.client.name"));
         Assert.Equal(0, queued.Value);
     }
 
     /// <summary>
     /// The concurrency limiter's permits and queue depth are gauged, on the same instruments as the rate
-    /// limiter's and told apart by <c>http.resilience.limiter.kind</c>.
+    /// limiter's and told apart by <c>http_resilience.limiter.kind</c>.
     /// </summary>
     /// <remarks>
-    /// This queue is the sharper of the two, and it was the one with no instrument. Both limiters sit
-    /// <i>outside</i> <c>Timeout:Total</c> -- the platform's ordering, and what makes one permit cover a whole
-    /// logical request -- so time spent waiting for a slot is bounded only by <c>Timeout:Client</c> and the
-    /// caller's token. <c>ConcurrencyLimiter:QueueLimit</c> may be as high as 1,000, and the only signal was a
-    /// Warning emitted when the queue <i>overflowed</i>, which is the difference between an alert and a
-    /// post-mortem.
-    /// <para>
-    /// Polly builds the limiter itself when handed <c>DefaultRateLimiterOptions</c>, so there was no instance
-    /// to read statistics from. The limiter is now constructed here and passed in, the way the rate limiter
-    /// already was. Fails if it goes back to <c>DefaultRateLimiterOptions</c>.
-    /// </para>
+    /// Concurrency queue wait is outside <c>Timeout:Total</c>, so it needs its own signal. The limiter is
+    /// constructed here and passed to Polly so its statistics can be read. Fails if it goes back to
+    /// <c>DefaultRateLimiterOptions</c>.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ConcurrencyLimiterStatistics_ArePublishedAsGauges()
     {
         var gate = new TaskCompletionSource();
@@ -180,20 +214,21 @@ public class MetricsTests
 
         using var collector = new GaugeCollector(harness.Services);
 
-        Task<HttpResponseMessage> held = harness.GetAsync();
-        while (harness.Origin.Count == 0)
-        {
-            await Task.Delay(10);
-        }
+        Task<HttpResponseMessage> held = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
+        await harness.Origin.WaitForCountAsync(1);
 
-        // A second request cannot get the only slot, so it waits in the queue -- which is the number this
-        // test exists for.
-        Task<HttpResponseMessage> queuedRequest = harness.GetAsync();
+        // A second request cannot get the only slot, so it waits in the queue.
+        Task<HttpResponseMessage> queuedRequest = harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
         Measurement queued = Single(collector, "queued_requests", "concurrency");
-        while (queued.Value == 0)
+        using (var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
         {
-            await Task.Delay(10);
-            queued = Single(collector, "queued_requests", "concurrency");
+            while (queued.Value == 0)
+            {
+                // The queue is filled by the limiter on another thread; nothing signals it, so poll with a deadline.
+                await Task.Yield();
+                deadline.Token.ThrowIfCancellationRequested();
+                queued = Single(collector, "queued_requests", "concurrency");
+            }
         }
 
         Measurement permits = Single(collector, "available_permits", "concurrency");
@@ -204,25 +239,17 @@ public class MetricsTests
 
         Assert.Equal(0, permits.Value);
         Assert.Equal(1, queued.Value);
-        Assert.Equal("test", permits.Tag("http.client.name"));
+        Assert.Equal("test", permits.Tag("http_resilience.client.name"));
     }
 
     /// <summary>
-    /// The concurrency backstop is reported too, which is the number nobody configured.
+    /// The displaced concurrency backstop is reported too.
     /// </summary>
     /// <remarks>
-    /// The backstop exists because the platform's limiter slot is never empty and its 1,000-permit default was
-    /// invisible. A control surfaced in configuration and not in telemetry is only half surfaced: an operator
-    /// can read the number but cannot see how close the client is to it.
-    /// <para>
-    /// Only the backstop that has a handler of its own is reported -- the displaced one, present whenever a
-    /// rate limiter has taken the platform's slot. The <i>undisplaced</i> backstop lives inside the standard
-    /// handler and is one limiter per pipeline, so under <c>ByAuthority</c> handing Polly a single instance
-    /// would silently change a per-authority bound into a per-client one. That gap is documented rather than
-    /// closed. Fails if the displaced backstop stops being tracked.
-    /// </para>
+    /// When a rate limiter takes the platform's slot, the backstop moves into its own handler with its own
+    /// limiter. Fails if that limiter stops being tracked.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TheDisplacedConcurrencyBackstop_IsReportedToo()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -235,26 +262,122 @@ public class MetricsTests
             new RecordingHandler(HttpStatusCode.OK));
 
         using var collector = new GaugeCollector(harness.Services);
-        (await harness.GetAsync()).Dispose();
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
 
         Assert.Equal(7, Single(collector, "available_permits", "backstop").Value);
     }
 
+    /// <summary>
+    /// A hedged client's backstop is reported once per listed authority, because that is the bound it enforces.
+    /// </summary>
+    /// <remarks>
+    /// Fails if the endpoint limiter goes back to the platform's own instance, which nothing can read, or if
+    /// one instance is shared across authorities (both would then report the same, combined, permit count).
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AHedgedClientsBackstop_IsReportedPerAuthority()
+    {
+        await using ResilienceHarness harness = ResilienceHarness.Create(
+            Settings.Hedged()
+                .Set("ConcurrencyLimiter:Backstop", "7")
+                .Set("PipelineSelection:Authorities:1", "http://other.test"),
+            new RecordingHandler(HttpStatusCode.OK),
+            hedged: true);
+
+        using var collector = new GaugeCollector(harness.Services);
+        (await harness.GetAsync("http://origin.test/x", TestContext.Current.CancellationToken)).Dispose();
+        (await harness.GetAsync("http://other.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Measurement[] backstops =
+        [
+            .. collector.Collect("http_resilience.limiter.available_permits")
+                .Where(m => Equals(m.Tag("http_resilience.limiter.kind"), "backstop"))
+        ];
+
+        Assert.Equal(
+            ["http://origin.test", "http://other.test"],
+            backstops.Select(m => (string?)m.Tag("http_resilience.authority")).Order(StringComparer.Ordinal));
+        Assert.All(backstops, m => Assert.Equal(7, m.Value));
+
+        // The semantic-convention destination tags, as on the breaker gauge, so dashboards join on one key.
+        Assert.Equal(
+            ["origin.test", "other.test"],
+            backstops.Select(m => (string?)m.Tag("server.address")).Order(StringComparer.Ordinal));
+        Assert.All(backstops, m => Assert.Equal(80, m.Tag("server.port")));
+    }
+
+    /// <summary>
+    /// A standard client's backstop is reported even when no rate limiter has displaced it.
+    /// </summary>
+    /// <remarks>
+    /// One pipeline, so one per-client series with no authority tag. Fails if the platform's limiter slot goes
+    /// back to building its own instance, which nothing can read.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AStandardClientsBackstop_IsReported_WithoutARateLimiter()
+    {
+        await using ResilienceHarness harness = ResilienceHarness.Create(
+            Settings.Enabled()
+                .Set("Retry:Enabled", "false")
+                .Set("ConcurrencyLimiter:Backstop", "7"),
+            new RecordingHandler(HttpStatusCode.OK));
+
+        using var collector = new GaugeCollector(harness.Services);
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
+
+        Measurement backstop = Single(collector, "available_permits", "backstop");
+        Assert.Equal(7, backstop.Value);
+        Assert.Null(backstop.Tag("http_resilience.authority"));
+    }
+
+    /// <summary>
+    /// Under <c>ByAuthority</c> the backstop is one limiter per authority, and is reported that way.
+    /// </summary>
+    /// <remarks>
+    /// Fails if the series is missing, or if one instance is shared across authorities.
+    /// <c>Backstop_IsPerAuthority_UnderByAuthoritySelection</c> pins the bound itself.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task AStandardClientsBackstop_IsReportedPerAuthority_UnderByAuthority()
+    {
+        await using ResilienceHarness harness = ResilienceHarness.Create(
+            Settings.Enabled()
+                .Set("Retry:Enabled", "false")
+                .Set("ConcurrencyLimiter:Backstop", "7")
+                .Set("PipelineSelection:Mode", "ByAuthority")
+                .Set("PipelineSelection:Authorities:0", "http://a.test")
+                .Set("PipelineSelection:Authorities:1", "http://b.test"),
+            new RecordingHandler(HttpStatusCode.OK));
+
+        using var collector = new GaugeCollector(harness.Services);
+        (await harness.GetAsync("http://a.test/x", TestContext.Current.CancellationToken)).Dispose();
+        (await harness.GetAsync("http://b.test/x", TestContext.Current.CancellationToken)).Dispose();
+
+        Measurement[] backstops =
+        [
+            .. collector.Collect("http_resilience.limiter.available_permits")
+                .Where(m => Equals(m.Tag("http_resilience.limiter.kind"), "backstop"))
+        ];
+
+        Assert.Equal(
+            ["http://a.test", "http://b.test"],
+            backstops.Select(m => (string?)m.Tag("http_resilience.authority")).Order(StringComparer.Ordinal));
+        Assert.All(backstops, m => Assert.Equal(7, m.Value));
+    }
+
     private static Measurement Single(GaugeCollector collector, string instrument, string kind) =>
         Assert.Single(
-            collector.Collect($"http.resilience.limiter.{instrument}"),
-            m => Equals(m.Tag("http.resilience.limiter.kind"), kind));
+            collector.Collect($"http_resilience.limiter.{instrument}"),
+            m => Equals(m.Tag("http_resilience.limiter.kind"), kind));
 
     /// <summary>
     /// The gauges exist once a client has been created, without waiting for a request to be sent.
     /// </summary>
     /// <remarks>
-    /// Not "before any client is created", which was the first thing this asserted and was not worth having:
-    /// the breaker gauge reports nothing until a breaker transitions, and a client's limiter does not exist
-    /// until the container creates it, so an earlier meter publishes an empty series and nothing more.
-    /// Client creation is where both first have something to say.
+    /// The breaker gauge reports nothing until a transition, and a limiter exists only once the client is
+    /// created.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Gauges_ArePublished_WhenTheClientIsCreated()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -264,22 +387,21 @@ public class MetricsTests
                 .Set("RateLimiter:Window", "01:00:00"));
 
         using var collector = new GaugeCollector(harness.Services);
-        Assert.Contains("http.resilience.circuit_breaker.state", collector.PublishedInstruments);
-        Assert.Contains("http.resilience.limiter.available_permits", collector.PublishedInstruments);
+        Assert.Contains("http_resilience.circuit_breaker.state", collector.PublishedInstruments);
+        Assert.Contains("http_resilience.limiter.available_permits", collector.PublishedInstruments);
     }
 
     /// <summary>
-    /// Observable, not synchronous: the brief is explicit that limiter statistics must not be read on the
-    /// request path. An <c>ObservableGauge</c> can only be read by a collection.
+    /// Observable, not synchronous, so limiter statistics are never read on the request path.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Gauges_AreObservable_SoNothingIsPolledOnTheRequestPath()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled());
         using var collector = new GaugeCollector(harness.Services);
 
         Assert.All(
-            collector.Instruments.Where(i => i.Name.StartsWith("http.resilience.", StringComparison.Ordinal)),
+            collector.Instruments.Where(i => i.Name.StartsWith("http_resilience.", StringComparison.Ordinal)),
             instrument => Assert.True(
                 instrument.IsObservable,
                 $"{instrument.Name} must be observable so it is read per collection, not per request."));
@@ -297,10 +419,8 @@ internal sealed class GaugeCollector : IDisposable
     private readonly IMeterFactory? _scope;
 
     /// <param name="services">
-    /// Restricts collection to the meter this container published. The package's meter name is process-wide,
-    /// so a collector that did not filter would see every other live container's gauges as well -- which in a
-    /// parallel test run makes any count assertion a coin flip. IMeterFactory stamps each meter with the
-    /// factory that created it, which is per container, so that is the discriminator.
+    /// Restricts collection to this container's meter. The meter name is process-wide, so without this a
+    /// parallel test run would see other containers' gauges. IMeterFactory stamps each meter with its factory.
     /// </param>
     public GaugeCollector(IServiceProvider? services = null)
     {
@@ -403,22 +523,13 @@ internal sealed record Measurement(string Instrument, long Value, List<KeyValueP
 /// The meter must stop reporting when the container that published it goes away.
 /// </summary>
 /// <remarks>
-/// If it does not, every container built in a process leaves its gauges published for the life of that
-/// process. In a test run that is cross-test pollution; in a service that builds a second provider it is
-/// double-counted series that no scrape can attribute.
-/// <para>
-/// Production change that would make this fail: creating the <see cref="System.Diagnostics.Metrics.Meter"/>
-/// with <c>new Meter(name)</c> instead of through <see cref="IMeterFactory"/>. The factory owns the meter's
-/// lifetime and is disposed with the container; <c>HttpResilienceMetrics</c> itself is deliberately not
-/// <c>IDisposable</c>, because a type that both creates a meter through a factory and disposes it would
-/// dispose something it does not own. An earlier revision of this remark named dropping <c>IDisposable</c>
-/// from <c>HttpResilienceMetrics</c> as the falsification, which was a change that could not be made -- there
-/// has never been an <c>IDisposable</c> there to drop.
-/// </para>
+/// Otherwise every container leaves its gauges published for the life of the process. Fails if the
+/// <see cref="System.Diagnostics.Metrics.Meter"/> is created with <c>new Meter(name)</c> instead of through
+/// <see cref="IMeterFactory"/>, which owns its lifetime.
 /// </remarks>
 public class MetricsDisposalTests
 {
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Meter_IsDisposedWithTheContainer()
     {
         ResilienceHarness harness = ResilienceHarness.Create(Settings.Enabled());

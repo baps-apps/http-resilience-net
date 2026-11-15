@@ -1,7 +1,6 @@
 using System.Net;
 using System.Threading.RateLimiting;
 using HttpResilience.NET.Internal;
-using HttpResilience.NET.Options;
 using HttpResilience.NET.Tests.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -12,54 +11,58 @@ namespace HttpResilience.NET.Tests.Behavior;
 
 public class RegistrationTests
 {
-    [Fact]
-    public void AddingResilienceWithoutRegisteringConfiguration_FailsWithAnActionableMessage()
+    /// <summary>
+    /// Without <c>services.AddHttpResilience</c> there is no section to read. That surfaces when the client is
+    /// created, naming the missing call, rather than as a client silently running without a pipeline.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public void AddingResilienceWithoutRegisteringConfiguration_FailsOnCreation_WithAnActionableMessage()
     {
         var services = new ServiceCollection();
+        services.AddHttpClient("orders").AddHttpResilienceHandler();
 
+        using ServiceProvider provider = services.BuildServiceProvider();
         InvalidOperationException exception = Assert.Throws<InvalidOperationException>(
-            () => services.AddHttpClient("orders").AddHttpResilience());
+            () => provider.GetRequiredService<IHttpClientFactory>().CreateClient("orders"));
 
         Assert.Contains("AddHttpResilience(configuration)", exception.Message, StringComparison.Ordinal);
         Assert.Contains("orders", exception.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// A service that adds the package and configures nothing gets no pipeline. <c>Enabled</c> is opt-in.
+    /// Registering the client is the opt-in: with no configuration at all it gets the default pipeline.
     /// </summary>
     /// <remarks>
-    /// Pins the default by behavior rather than by reading the property: one origin call means no retry
-    /// strategy ran. The state is deliberately indistinguishable from a client that set <c>Enabled: false</c>,
-    /// which is why <c>DisabledClient_WarnsAtStartup_BeforeAnyClientIsCreated</c> exists -- a forgotten key
-    /// has to leave a Warning in the deployment's logs, because nothing else about it is visible.
+    /// Three origin calls are the default two retries. The delay is zeroed only to keep the test fast.
     /// </remarks>
-    [Fact]
-    public async Task NoConfigurationAtAll_AddsNoPipeline()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task NoConfigurationAtAll_AppliesTheDefaultPipeline()
     {
-        await using ResilienceHarness harness = ResilienceHarness.Create(Settings.Empty());
+        await using ResilienceHarness harness = ResilienceHarness.Create(
+            Settings.Empty(),
+            configure: options => options.Retry.BaseDelay = TimeSpan.Zero);
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, harness.Origin.Count);
+        Assert.Equal(3, harness.Origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task Disabled_AddsNoPipeline_AndPassesRequestsStraightThrough()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Empty().Set("Enabled", "false"));
 
-        HttpResponseMessage response = await harness.GetAsync();
+        HttpResponseMessage response = await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(1, harness.Origin.Count);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
     /// <summary>
-    /// Connection settings are infrastructure, not policy. Turning the pipeline off during an incident must
-    /// not also silently revert the client to default connection behavior.
+    /// Turning the pipeline off during an incident must not also revert connection settings.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void Disabled_StillAppliesConnectionSettings()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -75,21 +78,14 @@ public class RegistrationTests
     }
 
     /// <summary>
-    /// The connection defaults are a shared package's opinion applied to every consumer that turns
-    /// <c>Connection:Enabled</c> on, so they are pinned rather than left to whatever the type initialiser says.
+    /// The connection defaults apply to every consumer that enables <c>Connection:Enabled</c>, so they are
+    /// pinned.
     /// </summary>
     /// <remarks>
-    /// <c>ConnectTimeout</c> covers TCP <i>and</i> the TLS handshake. At 2 seconds a cross-AZ or cross-region
-    /// connect on a loaded node can lose the race and be reported as a connect failure, which then retries --
-    /// amplifying load at exactly the wrong moment. 3 seconds keeps a clear margin below the 5-second attempt
-    /// budget that validation requires it to sit under.
-    /// <para>
-    /// <c>PooledConnectionIdleTimeout</c> was equal to <c>PooledConnectionLifetime</c>, which made it inert:
-    /// no connection could ever reach the idle bound before the age bound retired it. 1 minute is the runtime's
-    /// own default and gives it something to do.
-    /// </para>
+    /// <c>ConnectTimeout</c> (3 s) covers TCP and TLS and leaves a margin below the 5-second attempt budget.
+    /// <c>PooledConnectionIdleTimeout</c> (1 minute, the runtime default) is below the lifetime so it can fire.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ConnectionDefaults_AreTheOnesTheSchemaDocuments()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -107,7 +103,7 @@ public class RegistrationTests
             "an idle timeout at or above the connection lifetime can never fire.");
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ConnectionSettings_ReachTheHandler()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -130,11 +126,10 @@ public class RegistrationTests
     }
 
     /// <summary>
-    /// PooledConnectionLifetime already bounds connection age and DNS staleness. Leaving the factory's own
-    /// rotation on as well would cycle the pool twice as often, and would make the configured lifetime a
-    /// value that never actually takes effect.
+    /// PooledConnectionLifetime already bounds connection age; factory rotation on top would cycle the pool
+    /// twice as often.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ConnectionEnabled_DisablesFactoryHandlerRotation()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -143,7 +138,7 @@ public class RegistrationTests
         Assert.Equal(Timeout.InfiniteTimeSpan, HandlerLifetime(provider, "test"));
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void MaxConnectionsPerServer_DefaultsToTheRuntimeDefault()
     {
         using ServiceProvider provider = ResilienceHarness.BuildProvider(
@@ -153,7 +148,7 @@ public class RegistrationTests
         Assert.Equal(int.MaxValue, PrimaryHandler(provider, "test").MaxConnectionsPerServer);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PerClientSection_OverridesRootValues_AndInheritsTheRest()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -163,13 +158,13 @@ public class RegistrationTests
                 .ForClient("Orders", "Timeout:Total", "00:01:00"),
             sectionName: "Orders");
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // Overridden by the client section.
         Assert.Equal(5, harness.Origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ConfigureDelegate_IsAppliedLast()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -177,19 +172,19 @@ public class RegistrationTests
             configure: options =>
             {
                 options.Retry.MaxRetries = 1;
-                options.Retry.RetryableMethods = ["POST"];
+                options.Retry.RetryableMethods.Add("POST");
             });
 
-        await harness.SendAsync(HttpMethod.Post);
+        await harness.SendAsync(HttpMethod.Post, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, harness.Origin.Count);
     }
 
     /// <summary>
-    /// A client named after a schema property must not collide with it. Per-client sections live under their
-    /// own <c>Clients</c> child precisely so that names like "Retry" or "Timeout" are ordinary client names.
+    /// A client named after a schema property must not collide with it; client sections live under
+    /// <c>Clients</c>.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("Retry")]
     [InlineData("Timeout")]
     [InlineData("Hedging")]
@@ -202,12 +197,12 @@ public class RegistrationTests
                 .ForClient(clientName, "Retry:MaxRetries", "1"),
             sectionName: clientName);
 
-        await harness.GetAsync();
+        await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, harness.Origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RateLimiter_IsAPerClientSingleton_OwnedAndDisposedByTheContainer()
     {
         Settings settings = Settings.Enabled()
@@ -227,7 +222,7 @@ public class RegistrationTests
         Assert.Throws<ObjectDisposedException>(() => limiter.GetStatistics());
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void EachClientGetsItsOwnRateLimiter()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
@@ -239,8 +234,8 @@ public class RegistrationTests
 
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
-        services.AddHttpClient("sso").AddHttpResilience();
-        services.AddHttpClient("mis").AddHttpResilience();
+        services.AddHttpClient("sso").AddHttpResilienceHandler();
+        services.AddHttpClient("mis").AddHttpResilienceHandler();
 
         using ServiceProvider provider = services.BuildServiceProvider();
 
@@ -250,11 +245,10 @@ public class RegistrationTests
     }
 
     /// <summary>
-    /// Each client contributes one validator scoped to its own options name, plus one shared validator for
-    /// the root. What must never happen is several validators all validating the same options instance:
-    /// that reports every failure once per client and buries the real message.
+    /// Each client has one validator scoped to its options name, plus one for the root. Several validators on
+    /// one instance would repeat every failure once per client.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void EachOptionsInstance_IsValidatedByExactlyOneValidator()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
@@ -265,16 +259,17 @@ public class RegistrationTests
         services.AddHttpResilience(configuration);
         for (int i = 0; i < 5; i++)
         {
-            services.AddHttpClient($"client-{i}").AddHttpResilience();
+            services.AddHttpClient($"client-{i}").AddHttpResilienceHandler();
         }
 
         using ServiceProvider provider = services.BuildServiceProvider();
         IValidateOptions<HttpResilienceOptions>[] validators =
             [.. provider.GetServices<IValidateOptions<HttpResilienceOptions>>()];
 
-        // A deliberately invalid instance: exactly one validator should fail it, the rest should skip.
+        // A deliberately invalid instance: exactly one validator should fail it, the rest should skip. A value
+        // every pipeline reads, so the root judges it as well as each client.
         var invalid = new HttpResilienceOptions { Enabled = true };
-        invalid.Retry.MaxRetries = 0;
+        invalid.CircuitBreaker.FailureRatio = 0;
 
         foreach (string name in new[] { "", "client-0", "client-3" })
         {

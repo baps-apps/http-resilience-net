@@ -1,6 +1,5 @@
 using BenchmarkDotNet.Attributes;
 using HttpResilience.NET.Internal;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Benchmarks;
 
@@ -13,9 +12,8 @@ namespace HttpResilience.NET.Benchmarks;
 /// request purely to perform a lookup. The number to watch here is <c>Allocated</c>, and it should be zero.
 /// </remarks>
 [MemoryDiagnoser]
-// Only the job column is hidden. Error, StdDev and RatioSD stay: a committed table that reports a
-// ratio without its dispersion invites a reader to believe a 1.2x difference that is inside the noise,
-// and that is exactly what an earlier revision of these results did.
+// Only the job column is hidden. Error, StdDev and RatioSD stay so a ratio is never read without its
+// dispersion.
 [HideColumns("Job")]
 public class AuthorityMatchingBenchmarks
 {
@@ -31,11 +29,13 @@ public class AuthorityMatchingBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _selector = PipelineKeySelector.Create(new PipelineSelectionOptions
+        var selection = new HttpResiliencePipelineSelectionOptions { Mode = HttpResiliencePipelineSelectionMode.ByAuthority };
+        foreach (int i in Enumerable.Range(0, Authorities))
         {
-            Mode = PipelineSelectionMode.ByAuthority,
-            Authorities = [.. Enumerable.Range(0, Authorities).Select(i => $"https://host-{i}.bench")]
-        });
+            selection.Authorities.Add($"https://host-{i}.bench");
+        }
+
+        _selector = PipelineKeySelector.Create(selection);
 
         _allowListed = new HttpRequestMessage(HttpMethod.Get, $"https://host-{Authorities - 1}.bench/x");
         _unlisted = new HttpRequestMessage(HttpMethod.Get, "https://somewhere-else.bench/x");

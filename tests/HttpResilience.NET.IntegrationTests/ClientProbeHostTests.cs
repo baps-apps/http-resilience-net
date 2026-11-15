@@ -10,11 +10,8 @@ namespace HttpResilience.NET.IntegrationTests;
 /// <see cref="IHostedService"/> and calls it by hand.
 /// </summary>
 /// <remarks>
-/// The unit tests invoke the probe directly, which proves it creates the clients but not that anything
-/// invokes it. That assumption -- <c>IHost.StartAsync</c> runs registered hosted services before the process
-/// serves traffic, and surfaces an exception from one of them by failing the start -- is what the whole
-/// control rests on. It is the same gap <c>ARealHost_LogsTheDisabledClientWarning_WhileStarting</c> exists to
-/// close for the disabled-client notice.
+/// The unit tests invoke the probe directly; this checks that <c>IHost.StartAsync</c> runs it and fails the
+/// start on an exception. Same idea as <c>ARealHost_LogsTheDisabledClientWarning_WhileStarting</c>.
 /// </remarks>
 public class ClientProbeHostTests
 {
@@ -43,7 +40,7 @@ public class ClientProbeHostTests
 
                 services.AddHttpResilience(configuration);
 
-                IHttpClientBuilder builder = services.AddHttpClient("orders").AddHttpResilience();
+                IHttpClientBuilder builder = services.AddHttpClient("orders").AddHttpResilienceHandler();
                 if (unconfigurableHandler)
                 {
                     // Not a SocketsHttpHandler, so Connection:Enabled cannot be applied to it and the
@@ -60,16 +57,15 @@ public class ClientProbeHostTests
     /// starts and serves traffic with a client that throws on every request.
     /// </summary>
     /// <remarks>
-    /// Nothing here calls <c>ValidateHttpResilienceClientsOnStart</c>. That is the assertion: the probe is
-    /// the default, and a service gets this protection without knowing the method exists.
+    /// Nothing here asks for the probe. That is the assertion: it is the default.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ARealHost_FailsToStart_WhenAConfiguredClientCannotBeCreated()
     {
         using IHost host = BuildHost(unconfigurableHandler: true);
 
         InvalidOperationException exception =
-            await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync(TestContext.Current.CancellationToken));
 
         Assert.Contains("Connection:Enabled", exception.Message, StringComparison.Ordinal);
         Assert.Contains("orders", exception.Message, StringComparison.Ordinal);
@@ -80,16 +76,14 @@ public class ClientProbeHostTests
     /// healthy, and fails on the first request that reaches this client.
     /// </summary>
     /// <remarks>
-    /// This is the behavior a service opts back into, so it is worth one test that shows what it is opting
-    /// into rather than a sentence in a document. Production change that would make this fail: the opt-out
-    /// key not being read, which would make the probe unavoidable during an incident.
+    /// Fails if the opt-out key is not read.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TheOptOutKey_LeavesTheSameHostStartingAndFailingLater()
     {
         using IHost host = BuildHost(unconfigurableHandler: true, validateClientsOnStart: "false");
 
-        await host.StartAsync();
+        await host.StartAsync(TestContext.Current.CancellationToken);
         try
         {
             Assert.Throws<InvalidOperationException>(
@@ -97,20 +91,20 @@ public class ClientProbeHostTests
         }
         finally
         {
-            await host.StopAsync();
+            await host.StopAsync(TestContext.Current.CancellationToken);
         }
     }
 
     /// <summary>
     /// A healthy service must still start. A probe that fails a good deployment is worse than no probe.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ARealHost_StartsCleanly_WhenEveryClientCanBeCreated()
     {
         using IHost host = BuildHost(unconfigurableHandler: false);
 
-        await host.StartAsync();
-        await host.StopAsync();
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        await host.StopAsync(TestContext.Current.CancellationToken);
     }
 
     private sealed class StubHandler : HttpMessageHandler

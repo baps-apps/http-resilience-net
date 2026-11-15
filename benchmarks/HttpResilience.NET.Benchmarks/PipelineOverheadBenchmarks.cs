@@ -16,9 +16,8 @@ namespace HttpResilience.NET.Benchmarks;
 /// package's overhead, and it should be within noise.
 /// </remarks>
 [MemoryDiagnoser]
-// Only the job column is hidden. Error, StdDev and RatioSD stay: a committed table that reports a
-// ratio without its dispersion invites a reader to believe a 1.2x difference that is inside the noise,
-// and that is exactly what an earlier revision of these results did.
+// Only the job column is hidden. Error, StdDev and RatioSD stay so a ratio is never read without its
+// dispersion.
 [HideColumns("Job")]
 public class PipelineOverheadBenchmarks
 {
@@ -176,7 +175,7 @@ public class PipelineOverheadBenchmarks
         }
 
         services.AddHttpClient("bench")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => new NoOpOrigin());
 
         return services.BuildServiceProvider();

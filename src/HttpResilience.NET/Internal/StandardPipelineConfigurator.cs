@@ -1,6 +1,6 @@
 using System.Collections.Frozen;
+using System.Net.Http.Headers;
 using System.Threading.RateLimiting;
-using HttpResilience.NET.Options;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
@@ -12,18 +12,6 @@ namespace HttpResilience.NET.Internal;
 /// <summary>
 /// Maps <see cref="HttpResilienceOptions"/> onto Microsoft's standard resilience handler.
 /// </summary>
-/// <remarks>
-/// The handler owns the strategy ordering -- rate limiter, total timeout, retry, circuit breaker, attempt
-/// timeout -- and this type only supplies values and predicates. Nothing here composes a pipeline.
-/// <para>
-/// The values are read from <see cref="IOptionsMonitor{TOptions}"/> <i>inside</i> the delegate, which the
-/// platform invokes when it first builds the pipeline -- after every <c>Configure</c> and
-/// <c>PostConfigure</c>. So the options a consumer reads back are the same object the pipeline was built
-/// from, and "what you read is what is running" holds by construction rather than by a validator comparing a
-/// registration snapshot against the registered options. What a late change cannot reach is which handlers
-/// exist; see <see cref="StructuralDecisions"/>.
-/// </para>
-/// </remarks>
 internal static class StandardPipelineConfigurator
 {
     public static Action<HttpStandardResilienceOptions, IServiceProvider> Create(
@@ -35,99 +23,111 @@ internal static class StandardPipelineConfigurator
             HttpResilienceOptions options = serviceProvider
                 .GetRequiredService<IOptionsMonitor<HttpResilienceOptions>>().Get(optionsName);
 
-            ILogger? logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("HttpResilience");
+            // A disabled client's handler is removed from its chain; leave the platform defaults in place.
+            if (!options.Enabled)
+            {
+                return;
+            }
+
+            ILogger? logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger(HttpResilienceLogging.PipelineCategory);
             CircuitBreakerStateTracker? tracker = serviceProvider.GetService<CircuitBreakerStateTracker>();
 
-            // Resolved for its side effect: constructing it creates the meter and publishes the gauges, and
-            // this is the earliest point at which either has anything to report.
-            _ = serviceProvider.GetService<HttpResilienceMetrics>();
             Func<HttpRequestMessage?, string> trackingKey =
                 PipelineKeySelector.CreateForTracking(options, PipelineKind.Standard);
 
             resilience.TotalRequestTimeout.Timeout = options.Timeout.Total;
             resilience.AttemptTimeout.Timeout = options.Timeout.Attempt;
 
-            ConfigureRetry(resilience, options, clientName, logger);
+            TimeProvider timeProvider = serviceProvider.GetService<TimeProvider>() ?? TimeProvider.System;
+            ConfigureRetry(resilience, options, clientName, logger, timeProvider);
             CircuitBreakerCallbacks.Apply(
                 resilience.CircuitBreaker, options.CircuitBreaker, clientName, trackingKey, logger, tracker);
 
-            // The handler's limiter slot is never absent. Left alone it is a concurrency limiter of 1,000
-            // with no queue, which is a scaling cliff that appears in no configuration file and surfaces as
-            // a RateLimiterRejectedException naming a limiter the operator never enabled. Either the schema's
-            // backstop goes here, or -- when a rate limiter is configured -- the backstop moves to its own
-            // handler and this slot carries the rate limiter instead.
+            // The handler's limiter slot is never empty: it holds the rate limiter when one is configured,
+            // otherwise the concurrency backstop.
             if (options.RateLimiter.Enabled)
             {
                 RateLimiter limiter =
                     serviceProvider.GetRequiredKeyedService<RateLimiter>(new RateLimiterKey(clientName));
                 resilience.RateLimiter.RateLimiter = args => limiter.AcquireAsync(1, args.Context.CancellationToken);
 
-                // A configured rejection has to be at least as loud as the backstop's. Both are the same
-                // exception type on the same instrument, and this is the one an operator chose the number for.
                 if (logger is not null)
                 {
-                    string permitPath = $"{scope}:{options.RateLimiter.PermitKey}";
+                    string permitPath = $"{scope}:{options.RateLimiter.PermitKey()}";
+                    RejectionLogThrottle throttle = RejectionLogThrottle.Create(serviceProvider);
                     resilience.RateLimiter.OnRejected = _ =>
                     {
-                        HttpResilienceLogging.RateLimiterRejected(logger, clientName, permitPath);
+                        if (throttle.ShouldLog(out int suppressed))
+                        {
+                            HttpResilienceLogging.RateLimiterRejected(logger, clientName, suppressed, permitPath);
+                        }
+
                         return default;
                     };
                 }
             }
             else
             {
+                // Owned instances, one per pipeline, so the backstop can be reported without its bound
+                // changing from per authority to per client.
                 int backstop = options.ConcurrencyLimiter.Backstop;
-                resilience.RateLimiter.DefaultRateLimiterOptions.PermitLimit = backstop;
-                resilience.RateLimiter.DefaultRateLimiterOptions.QueueLimit = 0;
+                BackstopLimiters backstops = serviceProvider.GetRequiredKeyedService<BackstopLimiters>(
+                    new RateLimiterKey(clientName, LimiterKind.Backstop));
+                resilience.RateLimiter.RateLimiter = args =>
+                    backstops.For(trackingKey(args.Context.GetRequestMessage()))
+                        .AcquireAsync(1, args.Context.CancellationToken);
 
-                // With no rate limiter configured, every rejection from this slot is the backstop. Saying so
-                // is the difference between an operator seeing a RateLimiterRejectedException on a client
-                // that has no rate limiter and knowing which number to change.
                 if (logger is not null)
                 {
                     string backstopPath = $"{scope}:ConcurrencyLimiter:Backstop";
+                    RejectionLogThrottle throttle = RejectionLogThrottle.Create(serviceProvider);
                     resilience.RateLimiter.OnRejected = _ =>
                     {
-                        HttpResilienceLogging.ConcurrencyBackstopRejected(logger, clientName, backstop, backstopPath);
+                        if (throttle.ShouldLog(out int suppressed))
+                        {
+                            HttpResilienceLogging.ConcurrencyBackstopRejected(
+                                logger, clientName, backstop, suppressed, backstopPath);
+                        }
+
                         return default;
                     };
                 }
             }
+
+            // Last: anything that changes these values afterwards fails the client (PlatformOptionsGuard).
+            PlatformOptionsGuard.Record(resilience, scope);
         };
 
     private static void ConfigureRetry(
         HttpStandardResilienceOptions resilience,
         HttpResilienceOptions options,
         string clientName,
-        ILogger? logger)
+        ILogger? logger,
+        TimeProvider timeProvider)
     {
-        RetryOptions retry = options.Retry;
+        HttpResilienceRetryOptions retry = options.Retry;
 
-        // The underlying strategy requires at least one attempt, so retries are switched off through the
-        // predicate rather than by setting the count to zero, which it rejects.
-        resilience.Retry.MaxRetryAttempts = retry.Enabled ? retry.MaxRetries : 1;
-        resilience.Retry.Delay = retry.BaseDelay;
-        resilience.Retry.BackoffType = ToDelayBackoffType(retry.BackoffType);
-        resilience.Retry.UseJitter = retry.UseJitter;
-        resilience.Retry.ShouldRetryAfterHeader = retry.UseRetryAfterHeader;
-
+        // Polly requires at least one retry, so "disabled" is expressed through the predicate. Nothing else is
+        // written: a disabled schedule is not validated, and the platform's own values are never used.
         if (!retry.Enabled)
         {
+            resilience.Retry.MaxRetryAttempts = 1;
             resilience.Retry.ShouldHandle = static _ => new ValueTask<bool>(false);
             return;
         }
 
+        resilience.Retry.MaxRetryAttempts = retry.MaxRetries;
+        resilience.Retry.Delay = retry.BaseDelay;
+        resilience.Retry.BackoffType = ToDelayBackoffType(retry.BackoffType);
+        resilience.Retry.UseJitter = retry.UseJitter;
+        resilience.Retry.MaxDelay = retry.MaxDelay;
+        resilience.Retry.ShouldRetryAfterHeader = retry.UseRetryAfterHeader;
+
         if (retry.RetryableMethods is { Count: > 0 } allowList)
         {
-            // An explicit allow-list is the supported way to retry a non-idempotent method: the decision is
-            // named in configuration rather than inherited from a default.
             FrozenSet<string> allowed = HttpMethodPredicates.ToMethodSet(allowList);
             var inner = resilience.Retry.ShouldHandle;
 
-            // Not an async lambda. A method outside the allow-list is the common case on a client that opted
-            // one in, and `async` would box a state machine to return a value it already has. Returning
-            // inner(args) unchanged on the matching path also keeps the platform predicate's own
-            // synchronous completion synchronous.
             resilience.Retry.ShouldHandle = args =>
             {
                 HttpMethod? method = args.Context.GetRequestMessage()?.Method;
@@ -138,10 +138,8 @@ internal static class StandardPipelineConfigurator
         }
         else if (retry.DisableForUnsafeHttpMethods)
         {
-            // Not resilience.Retry.DisableForUnsafeHttpMethods(): the platform's helper is a deny-list of
-            // POST, PATCH, PUT, DELETE and CONNECT, so it retries any method it has never heard of --
-            // a WebDAV MOVE, a cache PURGE, any new HttpMethod("..."). This package's claim is about unsafe
-            // methods, not about five of them, so the predicate is the RFC 9110 safe set instead.
+            // An allow-list of the RFC 9110 safe methods, not the platform helper's deny-list, so unknown
+            // methods such as PURGE are never retried.
             var inner = resilience.Retry.ShouldHandle;
             resilience.Retry.ShouldHandle = args =>
                 HttpMethodPredicates.IsSafe(args.Context.GetRequestMessage()?.Method)
@@ -149,26 +147,79 @@ internal static class StandardPipelineConfigurator
                     : new ValueTask<bool>(false);
         }
 
+        if (retry.UseRetryAfterHeader)
+        {
+            CapRetryAfter(resilience.Retry, retry.MaxDelay, timeProvider);
+        }
+
         if (logger is not null)
         {
             resilience.Retry.OnRetry = args =>
             {
-                HttpResilienceLogging.RetryAttempt(
-                    logger,
-                    args.AttemptNumber + 1,
-                    clientName,
-                    args.RetryDelay.TotalMilliseconds,
-                    (int?)args.Outcome.Result?.StatusCode,
-                    args.Outcome.Exception?.GetType().Name);
+                if (logger.IsEnabled(LogLevel.Debug))
+                {
+                    int? statusCode = (int?)args.Outcome.Result?.StatusCode;
+                    string? exceptionType = args.Outcome.Exception?.GetType().Name;
+                    HttpResilienceLogging.RetryAttempt(
+                        logger,
+                        args.AttemptNumber + 1,
+                        clientName,
+                        args.RetryDelay.TotalMilliseconds,
+                        statusCode,
+                        exceptionType);
+                }
+
                 return default;
             };
         }
     }
 
-    internal static DelayBackoffType ToDelayBackoffType(RetryBackoffType value) => value switch
+    /// <summary>
+    /// Holds <c>Retry-After</c> to <c>Retry:MaxDelay</c>: a longer value ends the retries, so the caller gets the
+    /// origin's response at once instead of retrying sooner than the origin asked or waiting past the cap.
+    /// </summary>
+    /// <remarks>
+    /// The platform reads the header in its delay generator, which cannot decline a retry, so the decision is
+    /// made in the predicate. The generator is also cut to the cap, for an HTTP-date that moved past it in
+    /// between.
+    /// </remarks>
+    private static void CapRetryAfter(HttpRetryStrategyOptions strategy, TimeSpan maxDelay, TimeProvider timeProvider)
     {
-        RetryBackoffType.Constant => DelayBackoffType.Constant,
-        RetryBackoffType.Linear => DelayBackoffType.Linear,
+        var shouldHandle = strategy.ShouldHandle;
+        strategy.ShouldHandle = args =>
+            RetryAfter(args.Outcome.Result, timeProvider) > maxDelay
+                ? new ValueTask<bool>(false)
+                : shouldHandle(args);
+
+        if (strategy.DelayGenerator is { } generator)
+        {
+            strategy.DelayGenerator = async args =>
+            {
+                TimeSpan? delay = await generator(args).ConfigureAwait(false);
+                return delay > maxDelay ? maxDelay : delay;
+            };
+        }
+    }
+
+    /// <summary>
+    /// The wait a failed response's <c>Retry-After</c> asks for, or <see langword="null"/>. A success is not
+    /// read, so the header costs nothing on the common path.
+    /// </summary>
+    private static TimeSpan? RetryAfter(HttpResponseMessage? response, TimeProvider timeProvider)
+    {
+        if (response is null || (int)response.StatusCode < 400 ||
+            response.Headers.RetryAfter is not RetryConditionHeaderValue header)
+        {
+            return null;
+        }
+
+        return header.Delta ?? (header.Date is { } date ? date - timeProvider.GetUtcNow() : null);
+    }
+
+    internal static DelayBackoffType ToDelayBackoffType(HttpResilienceRetryBackoffType value) => value switch
+    {
+        HttpResilienceRetryBackoffType.Constant => DelayBackoffType.Constant,
+        HttpResilienceRetryBackoffType.Linear => DelayBackoffType.Linear,
         _ => DelayBackoffType.Exponential
     };
 }

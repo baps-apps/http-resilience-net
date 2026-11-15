@@ -14,9 +14,8 @@ namespace HttpResilience.NET.Benchmarks;
 /// has to cost a field read after the first call rather than a container lookup and a dictionary probe.
 /// </remarks>
 [MemoryDiagnoser]
-// Only the job column is hidden. Error, StdDev and RatioSD stay: a committed table that reports a
-// ratio without its dispersion invites a reader to believe a 1.2x difference that is inside the noise,
-// and that is exactly what an earlier revision of these results did.
+// Only the job column is hidden. Error, StdDev and RatioSD stay so a ratio is never read without its
+// dispersion.
 [HideColumns("Job")]
 public class ClientCreationBenchmarks
 {
@@ -76,7 +75,7 @@ public class ClientCreationBenchmarks
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         services.AddHttpClient("bench")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .AddHttpMessageHandler(() => new NoOpOrigin());
 
         return services.BuildServiceProvider();

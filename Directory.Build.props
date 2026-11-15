@@ -1,6 +1,7 @@
 <Project>
   <PropertyGroup>
-    <!-- Repository metadata for SourceLink (enables source debugging from GitHub). -->
+    <!-- Repository metadata for SourceLink. The SDK carries the GitHub provider itself (since .NET 8), so no
+         package reference is needed. -->
     <RepositoryUrl>https://github.com/baps-apps/http-resilience-net.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
@@ -10,11 +11,9 @@
     <!-- Enterprise build hardening -->
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
+    <!-- Maps source paths to /_/ for a reproducible build. Off in local builds, so the debugger finds local sources;
+         publish-package.ps1 passes -p:ContinuousIntegrationBuild=true. -->
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
-  <ItemGroup>
-    <!-- SourceLink GitHub provider so all projects can generate source link (avoids "source control information is not available" warning). -->
-    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
-  </ItemGroup>
 </Project>

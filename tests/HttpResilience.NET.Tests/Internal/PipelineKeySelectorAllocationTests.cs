@@ -1,5 +1,4 @@
 using HttpResilience.NET.Internal;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Tests.Internal;
 
@@ -10,14 +9,18 @@ namespace HttpResilience.NET.Tests.Internal;
 /// </summary>
 public class PipelineKeySelectorAllocationTests
 {
-    private static Func<HttpRequestMessage, string> Selector(params string[] authorities) =>
-        PipelineKeySelector.Create(new PipelineSelectionOptions
+    private static Func<HttpRequestMessage, string> Selector(params string[] authorities)
+    {
+        var selection = new HttpResiliencePipelineSelectionOptions { Mode = HttpResiliencePipelineSelectionMode.ByAuthority };
+        foreach (string authority in authorities)
         {
-            Mode = PipelineSelectionMode.ByAuthority,
-            Authorities = [.. authorities]
-        });
+            selection.Authorities.Add(authority);
+        }
 
-    [Theory]
+        return PipelineKeySelector.Create(selection);
+    }
+
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("https://orders.internal/x")]          // allow-listed
     [InlineData("https://unlisted.internal/x")]        // shared key
     [InlineData("https://orders.internal:8443/x")]     // right host, wrong port
@@ -51,7 +54,7 @@ public class PipelineKeySelectorAllocationTests
     /// marginal cost, which must still be nothing.
     /// </para>
     /// </remarks>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("https://orders.internal/x")]
     [InlineData("https://unlisted.internal/x")]
     [InlineData("https://orders.internal./x")]
@@ -91,7 +94,7 @@ public class PipelineKeySelectorAllocationTests
     /// An index over no authorities is a real state -- a client whose allow-list is absent -- and the
     /// span-based lookup the index builds must tolerate it rather than throwing at registration.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void AnEmptyAllowList_MatchesNothing_AndDoesNotThrow()
     {
         Func<HttpRequestMessage, string> selector = Selector();
@@ -101,7 +104,7 @@ public class PipelineKeySelectorAllocationTests
     }
 
     /// <summary>The allocation-free path must return the same keys the string-building one did.</summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void ReturnsTheAllowListedKey_Verbatim()
     {
         Func<HttpRequestMessage, string> selector = Selector("https://orders.internal", "https://billing.internal:8443");

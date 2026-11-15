@@ -12,17 +12,9 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// What the shared state does under real parallel traffic, rather than under one request at a time.
 /// </summary>
 /// <remarks>
-/// Every other behavioral test here drives one request, or a handful, in sequence. That is the right shape
-/// for a pipeline-ordering or safe-method assertion and it is the wrong shape for the four pieces of mutable
-/// state this package owns: the limiter instances, the circuit-breaker tracker, the metrics dictionaries and
-/// the per-authority pipeline keys. Those are reached by every request on every thread at once, and a race in
-/// one of them is a production defect no single-request test can see.
-/// <para>
-/// These are deterministic assertions -- a concurrency ceiling, a permit balance, a bounded key set -- not
-/// timing ones, so they do not flake and they do not sleep. What they cannot do is prove the absence of a
-/// race; they can only fail when one is common enough to hit at this width. That is worth having and is not
-/// worth confusing with a proof.
-/// </para>
+/// Covers the shared mutable state: limiter instances, breaker tracker, metrics dictionaries and
+/// per-authority pipeline keys. Assertions are deterministic (a concurrency ceiling, a permit balance, a
+/// bounded key set). They can catch a common race, not prove there is none.
 /// </remarks>
 public class SustainedLoadTests
 {
@@ -33,28 +25,21 @@ public class SustainedLoadTests
             .GetSection("HttpResilience");
 
     /// <summary>
-    /// The concurrency bound holds under 500-way parallelism, and every permit taken is given back.
+    /// The concurrency bound holds under 64-way parallelism, and every permit taken is given back.
     /// </summary>
     /// <remarks>
-    /// Two failures are in scope and neither is visible one request at a time. The first is the bound itself:
-    /// the limiter sits outside the retry loop so one permit covers a whole logical request, and a mistake
-    /// that re-acquired per attempt would still pass every sequential test while letting concurrency drift
-    /// above the cap under load. <see cref="RecordingHandler.MaxConcurrent"/> is measured at the origin, which
-    /// is the only place the real number is.
-    /// <para>
-    /// The second is a leak. A lease that is not disposed on some path -- a retry, a rejection, a cancelled
-    /// wait -- burns a permit permanently, and the symptom is a client that quietly stops being able to send
-    /// anything after hours of traffic. Reading the limiter's own statistics back through the gauge after the
-    /// load has drained turns that into an assertion: available permits must be the full configured limit
-    /// again and the queue must be empty. Retries are on and a quarter of the responses fail, so the retry
-    /// path is exercised rather than assumed.
-    /// </para>
+    /// Checks three things: the cap was actually reached, so the load really pressed against it; concurrency at
+    /// the origin (<see cref="RecordingHandler.MaxConcurrent"/>) never exceeds it, even with retries; and after
+    /// the load drains, all permits are back and the queue is empty, so no lease leaked on a retry. A quarter of
+    /// responses fail, so retries run. Parallelism is set explicitly: the default is the processor count, which
+    /// on a small CI agent is below the cap and cannot exceed it.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ParallelLoad_HoldsTheConcurrencyBound_AndReturnsEveryPermit()
     {
         const int Limit = 8;
         const int Requests = 500;
+        const int Parallelism = 64;
 
         var origin = new RecordingHandler(async (_, n, cancellationToken) =>
         {
@@ -65,8 +50,7 @@ public class SustainedLoadTests
 
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled()
-                // High enough that the breaker never opens: this test is about the limiters, and a breaker
-                // tripping would shorten the load rather than fail the assertion.
+                // High enough that the breaker never opens; this test is about the limiters.
                 .Set("CircuitBreaker:MinimumThroughput", "100000")
                 .Set("ConcurrencyLimiter:Enabled", "true")
                 .Set("ConcurrencyLimiter:Limit", "8")
@@ -80,6 +64,7 @@ public class SustainedLoadTests
         int completed = 0;
         await Parallel.ForEachAsync(
             Enumerable.Range(0, Requests),
+            new ParallelOptions { MaxDegreeOfParallelism = Parallelism },
             async (_, cancellationToken) =>
             {
                 using HttpResponseMessage response = await harness.Client.GetAsync(
@@ -91,9 +76,11 @@ public class SustainedLoadTests
         Assert.True(
             origin.MaxConcurrent <= Limit,
             $"concurrency bound of {Limit} was exceeded: {origin.MaxConcurrent} requests were in flight");
+        Assert.True(
+            origin.MaxConcurrent == Limit,
+            $"the load never reached the bound of {Limit} (peak {origin.MaxConcurrent}), so it proves nothing");
 
-        // Retries happened, so the permit accounting was exercised on the path that reuses one permit for
-        // several attempts rather than only on the straight-through one.
+        // Retries happened, so permit accounting was exercised on the retry path too.
         Assert.True(origin.Count > Requests, $"expected retries; origin saw only {origin.Count}");
 
         LimiterReading concurrency = ReadLimiter(harness.Services, "concurrency");
@@ -109,21 +96,12 @@ public class SustainedLoadTests
     /// authorities are asked for.
     /// </summary>
     /// <remarks>
-    /// The hedging handler mints an endpoint pipeline -- a circuit breaker, a limiter and a Polly metric
-    /// series -- per request authority, and never evicts one. That is why
-    /// <c>AddHedgedHttpResilience</c> requires <c>PipelineSelection:Authorities</c>: without a bound, a
-    /// destination that can be influenced by request data is a memory-exhaustion path and an unbounded
-    /// metric dimension in the same move.
-    /// <para>
-    /// The bound is <see cref="AuthorityAllowListHandler"/>, registered outermost so an unlisted authority is
-    /// refused before anything is allocated for it. This asserts the consequence at all three places it has
-    /// to hold: the request is refused, this package's breaker tracker gains no key for it, and Polly's own
-    /// <c>pipeline.instance</c> dimension -- which this package does not control and cannot filter -- takes
-    /// no value from it either. 200 distinct hosts, because one would not distinguish a bound from a
-    /// coincidence.
-    /// </para>
+    /// The hedging handler creates a breaker, limiter and metric series per request authority and never
+    /// evicts them. <see cref="AuthorityAllowListHandler"/> refuses unlisted authorities first. Asserted in
+    /// three places: the request is refused, the breaker tracker gains no key, and Polly's
+    /// <c>pipeline.instance</c> takes no value from it. 200 distinct hosts.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_KeepsEveryPerAuthorityDimension_BoundedByTheAllowList()
     {
         const string ClientName = "hedged-authority-bound";
@@ -157,21 +135,20 @@ public class SustainedLoadTests
 
         var origin = new RecordingHandler(HttpStatusCode.InternalServerError);
         services.AddHttpClient(ClientName)
-            .AddHedgedHttpResilience(clientName: string.Empty)
+            .AddHttpResilienceHedgingHandler()
             .ConfigurePrimaryHttpMessageHandler(() => origin);
 
         await using ServiceProvider provider = services.BuildServiceProvider();
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName);
 
-        // Enough failing traffic on each allowed authority to open its breaker, so the tracker is populated
-        // rather than trivially empty.
+        // Enough failing traffic per allowed authority to open its breaker, so the tracker is populated.
         foreach (string authority in (string[])["http://allowed-one.test", "http://allowed-two.test"])
         {
             for (int i = 0; i < 20; i++)
             {
                 try
                 {
-                    (await client.GetAsync($"{authority}/x")).Dispose();
+                    (await client.GetAsync($"{authority}/x", TestContext.Current.CancellationToken)).Dispose();
                 }
                 catch (Exception exception) when (exception is not HttpRequestException)
                 {
@@ -183,8 +160,8 @@ public class SustainedLoadTests
         int refused = 0;
         for (int i = 0; i < 200; i++)
         {
-            HttpRequestException failure = await Assert.ThrowsAsync<HttpRequestException>(
-                () => client.GetAsync($"http://not-listed-{i}.test/x"));
+            InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => client.GetAsync($"http://not-listed-{i}.test/x", TestContext.Current.CancellationToken));
 
             Assert.Contains("PipelineSelection:Authorities", failure.Message, StringComparison.Ordinal);
 
@@ -217,13 +194,8 @@ public class SustainedLoadTests
     /// Records the <c>pipeline.instance</c> values belonging to this test's own client.
     /// </summary>
     /// <remarks>
-    /// Polly's meter is a <b>static</b> instrument set named <c>Polly</c>, shared by every pipeline in the
-    /// process -- unlike this package's meter, which <c>IMeterFactory</c> scopes per container and which
-    /// <see cref="GaugeCollector"/> filters on. There is no container discriminator available here at all, so
-    /// an unfiltered listener collects the authorities of every other test running in the same assembly:
-    /// measured, this assertion saw <c>orders.internal</c> and an IDN host from two unrelated fixtures and
-    /// failed as an "unbounded dimension" that was nothing of the sort. The client name is unique to this
-    /// test and appears in <c>pipeline.name</c>, so that is the discriminator.
+    /// Polly's meter is static and process-wide, so other tests' values would appear. Filtered on
+    /// <c>pipeline.name</c>, which contains this test's unique client name.
     /// </remarks>
     private static void Collect(
         ReadOnlySpan<KeyValuePair<string, object?>> tags,
@@ -261,11 +233,7 @@ public class SustainedLoadTests
     /// Reads one limiter's statistics back through the gauges, which is the only public view of them.
     /// </summary>
     /// <remarks>
-    /// Via <see cref="GaugeCollector"/> rather than a listener of its own, because the package's meter name is
-    /// process-wide: an unscoped listener sees every other live container's gauges, so this assertion read
-    /// another test's limiter and failed with 0 available permits when the suite ran together and passed when
-    /// it ran alone. <c>IMeterFactory</c> stamps each meter with the factory that created it, which is per
-    /// container, and the collector already filters on it.
+    /// Uses <see cref="GaugeCollector"/>, which filters to this container's meter.
     /// </remarks>
     private static LimiterReading ReadLimiter(IServiceProvider services, string kind)
     {
@@ -276,11 +244,11 @@ public class SustainedLoadTests
 
         long Read(string instrument) => Assert.Single(
             collector.Collect(instrument),
-            measurement => (string?)measurement.Tag("http.resilience.limiter.kind") == kind)
+            measurement => (string?)measurement.Tag("http_resilience.limiter.kind") == kind)
             .Value;
 
         return new LimiterReading(
-            Read("http.resilience.limiter.available_permits"),
-            Read("http.resilience.limiter.queued_requests"));
+            Read("http_resilience.limiter.available_permits"),
+            Read("http_resilience.limiter.queued_requests"));
     }
 }

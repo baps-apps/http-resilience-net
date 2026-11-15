@@ -1,19 +1,10 @@
 using System.Collections.Frozen;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
 /// A deploy-time-fixed set of authorities, matched against a request without allocating.
 /// </summary>
-/// <remarks>
-/// The obvious implementation builds <c>scheme://host:port</c> from the request and probes a set with it.
-/// That puts a string allocation on the request path of every client using per-authority pipelines or a
-/// hedged client's allow-list, purely to perform a lookup -- in a package whose claim is that it costs
-/// nothing over the handler it configures. Indexing by host and comparing the scheme and port as they are
-/// removes the allocation, and returns the allow-list's own string so the pipeline key is a shared instance
-/// rather than a fresh one per request.
-/// </remarks>
 internal sealed class AuthorityIndex
 {
     /// <summary>
@@ -28,10 +19,10 @@ internal sealed class AuthorityIndex
     /// <summary>The number of distinct authorities, which bounds the number of pipelines that can exist.</summary>
     public int Count { get; private init; }
 
-    public static AuthorityIndex Create(PipelineSelectionOptions selection)
+    public static AuthorityIndex Create(HttpResiliencePipelineSelectionOptions selection)
     {
         List<Uri> parsed = [];
-        foreach (string authority in selection.Authorities ?? [])
+        foreach (string authority in selection.Authorities)
         {
             if (TryParse(authority, out Uri? uri))
             {
@@ -82,23 +73,12 @@ internal sealed class AuthorityIndex
 
     public bool Contains(Uri? uri) => TryGetKey(uri, out _);
 
+    /// <summary>Every pipeline key the index can return, one per distinct authority.</summary>
+    public IEnumerable<string> Keys => _byHost.Dictionary.Values.SelectMany(entries => entries.Select(entry => entry.Key));
+
     /// <summary>
     /// The form of a host that two spellings of the same authority agree on.
     /// </summary>
-    /// <remarks>
-    /// <see cref="Uri.Host"/> is not a normal form. It returns the Unicode label for an internationalized
-    /// host written in Unicode and the punycode label for the same host written in punycode, so an allow-list
-    /// written one way rejects a request written the other -- and it keeps the trailing dot of a
-    /// fully-qualified name, so <c>orders.internal.</c> and <c>orders.internal</c> are different hosts.
-    /// Both fail closed, which makes them an availability edge rather than a bypass, but an allow-list that
-    /// rejects a host that is on it is still wrong.
-    /// <para>
-    /// <see cref="Uri.IdnHost"/> is stable across both spellings and is cached on the <see cref="Uri"/> after
-    /// first access. The root label is removed by slicing rather than by <c>TrimEnd</c> so that nothing is
-    /// allocated on the request path; <see cref="_byHost"/> is a span alternate lookup for exactly that reason.
-    /// Pinned by <c>AuthorityNormalisationTests</c> and <c>PipelineKeySelectorAllocationTests</c>.
-    /// </para>
-    /// </remarks>
     private static ReadOnlySpan<char> NormalizeHost(Uri uri)
     {
         ReadOnlySpan<char> host = uri.IdnHost;

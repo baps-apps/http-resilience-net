@@ -1,6 +1,4 @@
 using System.Reflection;
-using HttpResilience.NET.Internal;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Tests.Behavior;
 
@@ -8,24 +6,9 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// Every configuration key a consumer can set appears in docs/CONFIGURATION.md.
 /// </summary>
 /// <remarks>
-/// That table is what a team adopting the package reads to find out what it can configure, and it is the
-/// only place the whole schema is listed. Four keys were missing from it -- <c>SegmentsPerWindow</c>,
-/// <c>TokenLimit</c>, <c>TokensPerPeriod</c> and <c>ReplenishmentPeriod</c> -- so <c>TokenBucket</c>, one of
-/// three advertised algorithms, had all three of its required keys documented nowhere but a
-/// <c>docs/RECIPES.md</c> example. A team selecting it found out from a startup validation failure.
-/// <para>
-/// The same shape as <c>scripts/check-benchmark-docs.py</c> and
-/// <c>TelemetryMeterTests.TheDocumentedInstrumentNames_AreTheOnesTheMeterPublishes</c>: this package's
-/// documentation makes specific claims, and the ones nothing compares against the code are the ones that
-/// drift. A property is added to the options graph in one commit and to the reference in another, or in
-/// none -- and <c>PublicAPI.Unshipped.txt</c> catches the API change while nothing catches the omission.
-/// </para>
-/// <para>
-/// Deliberately a containment check rather than a row check. The reference documents
-/// <c>Retry:MaxAttempts</c> inside the <c>MaxRetries</c> row, because it is a tombstone that fails startup
-/// rather than a key anyone should set, and demanding a row of its own would be demanding the wrong
-/// documentation. What this asserts is that no key is absent entirely.
-/// </para>
+/// That table is the only place the whole schema is listed. A containment check, not a row check:
+/// <c>Retry:MaxAttempts</c> is mentioned inside the <c>MaxRetries</c> row because it is a renamed key that
+/// fails startup, not a key to set.
 /// </remarks>
 public class ConfigurationReferenceTests
 {
@@ -34,18 +17,16 @@ public class ConfigurationReferenceTests
     private const string ReferencePath = "docs/CONFIGURATION.md";
 
     /// <summary>
-    /// The two root-only keys that are not properties on the options graph. Both are read from the raw
-    /// configuration section rather than bound, precisely because they are statements about the process and
-    /// binding them would make them look inheritable per client -- so reflection cannot find them and they
-    /// are named here instead.
+    /// The root-only startup switches, which live on their own options type rather than the per-client graph.
     /// </summary>
     private static readonly string[] _rawSectionKeys =
     [
-        UnusedClientSectionValidator.AllowUnusedKey,
-        ClientStartupProbe.EnabledKey
+        .. typeof(HttpResilienceStartupOptions)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Select(property => property.Name)
     ];
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void EveryConfigurableKey_AppearsInTheConfigurationReference()
     {
         string reference = ConfigurationReferenceSection();

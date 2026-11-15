@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Fails when a benchmark number quoted in the docs disagrees with the checked-in raw report.
+"""Fails when a benchmark number quoted in the docs disagrees with the raw reports.
 
-docs/benchmarks/README.md carries hand-written summary tables beside the raw BenchmarkDotNet reports they
-claim to summarise, and says the reports are checked in "so a claim can be re-derived rather than trusted".
-They drifted: every raw report said 1,032 B for the standard pipeline -- the parity claim that had already
-been retracted in prose on the same page -- while the summary said 1,336 B. Re-measured, the summary was
-right and the reports were stale. Nobody noticed, because nothing compared them.
+Compares the Allocated column of the summary tables in docs/benchmarks/README.md against the raw
+BenchmarkDotNet reports beside it. Only allocation is compared: means depend on the machine.
 
-Only the **Allocated** column is compared. Allocation is deterministic and machine-independent; means are
-neither, so a check on timings would fail on every machine but the one that generated the table and would be
-switched off within a week. Allocation is also the column that actually drifted.
+  check-benchmark-docs.py                  against the checked-in reports, exactly
+  check-benchmark-docs.py --against DIR    against a fresh run's results directory (BenchmarkDotNet's
+                                           --artifacts DIR, then DIR/results), so a regression shows
+
+Rows in VARIABLE depend on thread scheduling, so a fresh run may differ from the docs within their tolerance.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -23,11 +23,27 @@ SUMMARY = ROOT / "docs" / "benchmarks" / "README.md"
 
 # The '## ' heading a table sits under -> the raw report that table summarises.
 SECTIONS = {
-    "Pipeline overhead": "after-pipeline-overhead.md",
-    "Authority matching": "after-authority-matching.md",
-    "Client creation": "after-client-creation.md",
-    "Hedging": "after-hedging-overhead.md",
-    "Limiter contention": "after-limiter-contention.md",
+    "Pipeline overhead": "pipeline-overhead.md",
+    "Authority matching": "authority-matching.md",
+    "Client creation": "client-creation.md",
+    "Hedging": "hedging-overhead.md",
+    "Limiter contention": "limiter-contention.md",
+}
+
+# Benchmark class behind each raw report, for a fresh run's '<namespace>.<class>-report-github.md'.
+CLASSES = {
+    "pipeline-overhead.md": "PipelineOverheadBenchmarks",
+    "authority-matching.md": "AuthorityMatchingBenchmarks",
+    "client-creation.md": "ClientCreationBenchmarks",
+    "hedging-overhead.md": "HedgingOverheadBenchmarks",
+    "limiter-contention.md": "LimiterContentionBenchmarks",
+}
+
+# (section, scenario) -> relative tolerance against a fresh run. How much of a hedged attempt is built before
+# the first one completes depends on scheduling: four runs spanned 46.4-48.3 KB and 8.97-9.41 KB.
+VARIABLE = {
+    ("Hedging", "hedged GET (attempt is started)"): 0.10,
+    ("Hedging", "hedged POST (attempt is suppressed)"): 0.10,
 }
 
 BYTES = re.compile(r"^([\d,.]+)\s*(B|KB)$")
@@ -60,6 +76,16 @@ def allocation(value: str) -> str | None:
     return f"{match.group(1).replace(',', '')} {match.group(2)}" if match else None
 
 
+def to_bytes(value: str) -> float:
+    number, unit = value.split()
+    return float(number) * (1024 if unit == "KB" else 1)
+
+
+def within(quoted: str, measured: set[str], tolerance: float) -> bool:
+    expected = to_bytes(quoted)
+    return any(abs(to_bytes(m) - expected) <= expected * tolerance for m in measured)
+
+
 def report_allocations(path: Path) -> dict[str, set[str]]:
     """Allocated, per method name, from a BenchmarkDotNet github-markdown report."""
     allocations: dict[str, set[str]] = {}
@@ -89,8 +115,24 @@ def report_allocations(path: Path) -> dict[str, set[str]]:
     return allocations
 
 
+def report_path(report_name: str, fresh: Path | None) -> Path:
+    if fresh is None:
+        return SUMMARY.parent / report_name
+    matches = sorted(fresh.glob(f"*.{CLASSES[report_name]}-report-github.md"))
+    return matches[0] if matches else fresh / f"{CLASSES[report_name]}-report-github.md"
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--against", type=Path, metavar="DIR",
+                        help="a fresh run's BenchmarkDotNet results directory")
+    fresh: Path | None = parser.parse_args().against
+    if fresh is not None and not fresh.is_dir():
+        print(f"error: {fresh} is not a directory", file=sys.stderr)
+        return 2
+
     failures: list[str] = []
+    not_run: list[str] = []
     checked = 0
 
     section: str | None = None
@@ -120,9 +162,13 @@ def main() -> int:
             continue
 
         report_name = SECTIONS[section]
-        path = SUMMARY.parent / report_name
+        path = report_path(report_name, fresh)
         if not path.exists():
-            failures.append(f"{section}: {report_name} is missing")
+            # A fresh run may cover some benchmarks (--filter); a checked-in report must exist.
+            if fresh is None:
+                failures.append(f"{section}: {path.name} is missing")
+            elif section not in not_run:
+                not_run.append(section)
             continue
 
         if report_name not in cache:
@@ -140,31 +186,42 @@ def main() -> int:
             continue
 
         checked += 1
-        if quoted not in measured:
+        tolerance = VARIABLE.get((section, scenario)) if fresh is not None else None
+        agrees = within(quoted, measured, tolerance) if tolerance is not None else quoted in measured
+        if not agrees:
+            allowance = f" (tolerance {tolerance:.0%})" if tolerance is not None else ""
             failures.append(
                 f"{section} / {scenario}: README says {quoted}, "
-                f"{report_name} says {' / '.join(sorted(measured))}"
+                f"{path.name} says {' / '.join(sorted(measured))}{allowance}"
             )
 
-    if checked == 0:
+    if checked == 0 and fresh is not None:
+        failures.append(
+            f"no benchmark report in {fresh}: pass the run's results directory (--artifacts DIR, then DIR/results)"
+        )
+    elif checked == 0:
         failures.append(
             "no summary rows matched a raw report -- the tables were renamed or removed, and this "
             "check silently stopped checking anything"
         )
 
+    source = f"the run in {fresh}" if fresh is not None else "the checked-in reports"
     if failures:
-        print("Benchmark documentation disagrees with the checked-in reports:", file=sys.stderr)
+        print(f"Benchmark documentation disagrees with {source}:", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         print(
-            "\nRegenerate the reports and the tables together:\n"
+            "\nA fresh run that disagrees is a regression, or a change to explain and record. Regenerate the "
+            "reports and the tables together:\n"
             "  dotnet run --project benchmarks/HttpResilience.NET.Benchmarks -c Release -- "
             '--filter "*" --job medium --memory',
             file=sys.stderr,
         )
         return 1
 
-    print(f"Benchmark documentation agrees with the checked-in reports ({checked} allocation figures).")
+    print(f"Benchmark documentation agrees with {source} ({checked} allocation figures).")
+    if not_run:
+        print(f"Not in that run, so not compared: {', '.join(not_run)}.")
     return 0
 
 

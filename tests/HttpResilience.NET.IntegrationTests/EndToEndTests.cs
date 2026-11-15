@@ -2,7 +2,6 @@ using System.Net;
 using System.Text;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Hosting;
 
@@ -38,37 +37,34 @@ public class EndToEndTests
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
         services.AddHttpResilienceTelemetry();
-        services.AddHttpResilienceHealthChecks();
 
         IHttpClientBuilder builder = services.AddHttpClient("api");
-        _ = hedged ? builder.AddHedgedHttpResilience() : builder.AddHttpResilience();
+        _ = hedged ? builder.AddHttpResilienceHedgingHandler() : builder.AddHttpResilienceHandler();
         builder.ConfigurePrimaryHttpMessageHandler(server.CreateHandler);
 
         return services.BuildServiceProvider();
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task SuccessfulRequest_PassesThrough()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
         await using ServiceProvider provider = BuildProvider(server, []);
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
-        HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}ok");
+        HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}ok", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal(HealthStatus.Healthy,
-            (await provider.GetRequiredService<HealthCheckService>().CheckHealthAsync()).Status);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TransientFailures_AreRetriedAgainstARealServer()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
         await using ServiceProvider provider = BuildProvider(server, []);
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
-        HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}flaky");
+        HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}flaky", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
@@ -76,7 +72,11 @@ public class EndToEndTests
     /// <summary>
     /// The end-to-end version of the guarantee that matters most: a real POST, over real HTTP, arrives once.
     /// </summary>
-    [Fact]
+    /// <remarks>
+    /// Fails if POST is treated as a safe method: the 500 would be retried and the server would count three
+    /// deliveries.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PostToAFailingEndpoint_IsDeliveredOnce()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
@@ -84,12 +84,14 @@ public class EndToEndTests
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
         using var content = new StringContent("""{"amount":100}""", Encoding.UTF8, "application/json");
-        HttpResponseMessage response = await client.PostAsync($"{server.BaseAddress}orders", content);
+        using HttpResponseMessage response = await client.PostAsync($"{server.BaseAddress}orders", content, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Equal(1, server.OrderDeliveries);
+        Assert.Equal(["""{"amount":100}"""], server.OrderBodies);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ParallelRequests_AllSucceed()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
@@ -102,8 +104,13 @@ public class EndToEndTests
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
     }
 
-    [Fact]
-    public async Task ParallelRequests_UnderAConcurrencyCap_DoNotDeadlock()
+    /// <summary>
+    /// The concurrency cap holds over real HTTP: while the server holds every request, it sees exactly the
+    /// limit in flight and the rest wait in the limiter's queue; released, all of them complete.
+    /// </summary>
+    /// <remarks>Fails without the limiter: all 50 reach the server at once.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ParallelRequests_UnderAConcurrencyCap_AreHeldToTheCap_AndAllComplete()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
         await using ServiceProvider provider = BuildProvider(server, new Dictionary<string, string?>
@@ -113,15 +120,38 @@ public class EndToEndTests
             ["HttpResilience:ConcurrencyLimiter:QueueLimit"] = "100"
         });
         IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
+        CancellationToken token = TestContext.Current.CancellationToken;
 
-        HttpResponseMessage[] responses = await Task.WhenAll(
-            Enumerable.Range(0, 50).Select(_ => factory.CreateClient("api").GetAsync($"{server.BaseAddress}ok")));
+        Task<HttpResponseMessage>[] requests =
+            [.. Enumerable.Range(0, 50).Select(_ => factory.CreateClient("api").GetAsync($"{server.BaseAddress}held", token))];
 
+        try
+        {
+            // Every request is either held at the server or queued by the limiter, and stays there until released.
+            await Eventually.UntilAsync(
+                () => server.HeldInFlight + LimiterGauges.Queued(provider) == 50,
+                () => $"{server.HeldInFlight} held at the server and {LimiterGauges.Queued(provider)} queued, of 50");
+
+            Assert.Equal(4, server.MaxHeldInFlight);
+        }
+        finally
+        {
+            // Released on failure too, or the unanswered requests outlive the test.
+            server.ReleaseHeld();
+        }
+
+        HttpResponseMessage[] responses = await Task.WhenAll(requests);
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
+        Assert.Equal(4, server.MaxHeldInFlight);
     }
 
-    [Fact]
-    public async Task ParallelRequests_UnderARateLimit_DoNotDeadlock()
+    /// <summary>
+    /// The rate limiter holds requests beyond its permits in its queue instead of sending them, and every
+    /// queued request still completes once permits replenish.
+    /// </summary>
+    /// <remarks>Fails without the limiter: nothing is ever queued.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ParallelRequests_UnderARateLimit_AreQueued_AndAllComplete()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
         await using ServiceProvider provider = BuildProvider(server, new Dictionary<string, string?>
@@ -132,24 +162,42 @@ public class EndToEndTests
             ["HttpResilience:RateLimiter:QueueLimit"] = "100"
         });
         IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
+        CancellationToken token = TestContext.Current.CancellationToken;
 
-        HttpResponseMessage[] responses = await Task.WhenAll(
-            Enumerable.Range(0, 30).Select(_ => factory.CreateClient("api").GetAsync($"{server.BaseAddress}ok")));
+        Task<HttpResponseMessage>[] requests =
+            [.. Enumerable.Range(0, 30).Select(_ => factory.CreateClient("api").GetAsync($"{server.BaseAddress}ok", token))];
 
+        // 30 requests against 10 permits a second: at least 10 wait in the queue for a full window.
+        await Eventually.UntilAsync(
+            () => LimiterGauges.Queued(provider) > 0,
+            () => "the rate limiter to queue requests beyond its 10 permits");
+
+        HttpResponseMessage[] responses = await Task.WhenAll(requests);
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.OK, r.StatusCode));
     }
 
-    [Fact]
+    /// <summary>
+    /// A caller's cancellation reaches the server: the in-flight request is aborted there, not left running.
+    /// </summary>
+    /// <remarks>
+    /// Cancels only after the request has arrived, so the server side is what is asserted. Fails if the
+    /// pipeline swallows the caller's token, for example by sending each attempt with its own.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task CallerCancellation_PropagatesToTheServer()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
         await using ServiceProvider provider = BuildProvider(server, []);
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        Task<HttpResponseMessage> request = client.GetAsync($"{server.BaseAddress}slow", cts.Token);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => client.GetAsync($"{server.BaseAddress}slow", cts.Token));
+        await server.SlowArrived.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
+        await server.SlowAborted.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
     }
 
     /// <summary>
@@ -157,7 +205,7 @@ public class EndToEndTests
     /// endpoint must still deliver the request once. The stub-handler version of this test proves the
     /// pipeline; this one proves the body actually crossed a wire only once.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_DoesNotDuplicateASlowPost()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
@@ -171,14 +219,21 @@ public class EndToEndTests
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
         using var content = new StringContent("""{"amount":100}""", Encoding.UTF8, "application/json");
-        HttpResponseMessage response = await client.PostAsync($"{server.BaseAddress}slow-orders", content);
+        HttpResponseMessage response = await client.PostAsync($"{server.BaseAddress}slow-orders", content, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(1, server.SlowOrderDeliveries);
         Assert.Equal(["""{"amount":100}"""], server.SlowOrderBodies);
     }
 
-    [Fact]
+    /// <summary>
+    /// The unsafe-method guard must not stop hedging the requests hedging exists for: a slow GET.
+    /// </summary>
+    /// <remarks>
+    /// The first attempt stalls for 5 seconds; the hedge starts after 200 ms and answers at once. Fails if GET
+    /// is not hedged: the caller would wait for the stalled attempt and read "primary".
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task HedgedClient_StillRacesASlowGet()
     {
         await using TestServerFixture server = await TestServerFixture.StartAsync();
@@ -191,100 +246,22 @@ public class EndToEndTests
 
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
 
-        HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}ok");
+        using HttpResponseMessage response = await client.GetAsync($"{server.BaseAddress}slow-first", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-    }
-
-    /// <summary>
-    /// A retried request re-sends the same <see cref="HttpRequestMessage"/>, so its content has to be
-    /// replayable. A buffered content type is; a single-pass stream is not.
-    /// </summary>
-    /// <remarks>
-    /// This is a characterization test, and it is the only way to see the behavior at all: the unit harness
-    /// reads every request body itself, which buffers the content before the origin sees it, so a stream that
-    /// could only be read once looks identical to one that could. Against a real server the second attempt
-    /// shows what actually reaches the endpoint. It pins whatever the platform does today so a package
-    /// upgrade cannot change it unnoticed, and it is the evidence behind the documented rule that an opted-in
-    /// retry needs replayable content.
-    /// </remarks>
-    [Fact]
-    public async Task RetryingANonSeekableStreamBody_IsPinnedByWhatTheServerReceives()
-    {
-        await using TestServerFixture server = await TestServerFixture.StartAsync();
-        await using ServiceProvider provider = BuildProvider(server, new Dictionary<string, string?>
-        {
-            ["HttpResilience:Clients:api:Retry:RetryableMethods:0"] = "POST"
-        });
-
-        HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("api");
-
-        using var source = new NonSeekableStream("payload"u8.ToArray());
-        using var content = new StreamContent(source);
-        using var request = new HttpRequestMessage(
-            HttpMethod.Post, $"{server.BaseAddress}echo-orders")
-        { Content = content };
-
-        await client.SendAsync(request);
-
-        // Measured, not assumed: no exception, three attempts, and the two retries deliver nothing. A
-        // buffered content type would deliver "payload" three times. If a platform upgrade starts buffering
-        // request content for retries, this fails and the documented rule in RetryOptions.RetryableMethods
-        // and docs/RECIPES.md should be relaxed to match.
-        Assert.Equal(["payload", string.Empty, string.Empty], server.EchoedOrderBodies);
-    }
-
-    /// <summary>A stream that can only be read once, like a network or pipe stream.</summary>
-    private sealed class NonSeekableStream(byte[] data) : Stream
-    {
-        private readonly MemoryStream _inner = new(data);
-
-        public override bool CanRead => true;
-
-        public override bool CanSeek => false;
-
-        public override bool CanWrite => false;
-
-        public override long Length => throw new NotSupportedException();
-
-        public override long Position
-        {
-            get => _inner.Position;
-            set => throw new NotSupportedException();
-        }
-
-        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
-
-        public override void Flush() => _inner.Flush();
-
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-
-        public override void SetLength(long value) => throw new NotSupportedException();
-
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                _inner.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
+        Assert.Equal("hedge", await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+        Assert.True(server.SlowFirstArrivals >= 2, $"expected a hedged attempt; the server saw {server.SlowFirstArrivals}");
     }
 
     /// <summary>
     /// A real host emits the disabled-client warning while starting, before it serves anything.
     /// </summary>
     /// <remarks>
-    /// The unit tests invoke <c>IStartupValidator</c> by hand, which proves the notice fires when options are
-    /// materialized but not that a host materializes them. This runs an actual <c>IHost</c> and asserts the
-    /// warning is present the moment <c>StartAsync</c> returns, with no client ever created. Fails if the
-    /// notice goes back to hanging off client creation, and fails if the host stops running startup
-    /// validation -- which is the assumption the whole mechanism rests on.
+    /// The unit tests run the startup steps by hand. This runs an actual <c>IHost</c> and asserts the warning
+    /// is present the moment <c>StartAsync</c> returns. Fails if the host stops calling
+    /// <c>IHostedLifecycleService.StartingAsync</c>, which the startup report rests on.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ARealHost_LogsTheDisabledClientWarning_WhileStarting()
     {
         var sink = new ListSink();
@@ -306,26 +283,65 @@ public class EndToEndTests
                     .Build();
 
                 services.AddHttpResilience(configuration);
-                services.AddHttpClient("orders").AddHttpResilience();
+                services.AddHttpClient("orders").AddHttpResilienceHandler();
             })
             .Build();
 
-        Assert.Empty(sink.Matching("registered but disabled"));
+        Assert.Empty(sink.Matching("is disabled for client"));
 
-        await host.StartAsync();
+        await host.StartAsync(TestContext.Current.CancellationToken);
         try
         {
-            string[] warnings = sink.Matching("registered but disabled");
+            string[] warnings = sink.Matching("is disabled for client");
 
             Assert.Single(warnings);
             Assert.StartsWith("[Warning]", warnings[0], StringComparison.Ordinal);
-            Assert.Contains("HttpResilience:Clients:orders:Enabled", warnings[0], StringComparison.Ordinal);
+            Assert.Contains("'HttpResilience:Enabled'", warnings[0], StringComparison.Ordinal);
         }
         finally
         {
-            await host.StopAsync();
+            await host.StopAsync(TestContext.Current.CancellationToken);
             host.Dispose();
         }
+    }
+
+    /// <summary>
+    /// A real host validates options before the startup report runs: invalid configuration fails
+    /// <c>StartAsync</c> with no client notice logged first.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task ARealHost_WithInvalidConfiguration_FailsBeforeAnyNotice()
+    {
+        var sink = new ListSink();
+
+        using IHost host = Host.CreateDefaultBuilder()
+            .ConfigureLogging(logging =>
+            {
+                logging.ClearProviders();
+                logging.SetMinimumLevel(LogLevel.Trace);
+                logging.AddProvider(sink);
+            })
+            .ConfigureServices(services =>
+            {
+                IConfigurationRoot configuration = new ConfigurationBuilder()
+                    .AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["HttpResilience:Clients:orders:Retry:RetryableMethods:0"] = "POST",
+                        ["HttpResilience:Clients:orders:Retry:MaxRetries"] = "50"
+                    })
+                    .Build();
+
+                services.AddHttpResilience(configuration);
+                services.AddHttpClient("orders").AddHttpResilienceHandler();
+            })
+            .Build();
+
+        // The platform validates its own options at start too, and they read these, so the failure may arrive
+        // wrapped in an AggregateException.
+        Exception failure = await Assert.ThrowsAnyAsync<Exception>(() => host.StartAsync(TestContext.Current.CancellationToken));
+        Assert.Contains("Retry:MaxRetries", failure.Message, StringComparison.Ordinal);
+
+        Assert.Empty(sink.Matching("HttpResilience.NET.Configuration"));
     }
 
     private sealed class ListSink : ILoggerProvider

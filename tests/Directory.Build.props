@@ -2,6 +2,16 @@
   <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
   <PropertyGroup>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
-    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Every test has a Timeout (TestTimeouts.Default), and xUnit1051 stays on so every call that can take
+         TestContext.Current.CancellationToken does, letting the timeout stop the work as well as fail the test.
+         xUnit1069 is off: it asks each timed test to mention the token even when nothing in it can take one
+         (most synchronous tests), and the timeout fails a hung test either way. -->
+    <!-- SYSLIB0066: Extensions 11 obsoletes IStartupValidator for IAsyncStartupValidator, which 10.0.0 (the
+         minimum the tests also run on) does not have. Switch when the minimum reaches 11; found by the
+         platform-drift workflow. -->
+    <NoWarn>$(NoWarn);CS1591;xUnit1069;SYSLIB0066</NoWarn>
+    <!-- Run through VSTest so the documented dotnet test filter syntax keeps working. -->
+    <UseMicrosoftTestingPlatformRunner>false</UseMicrosoftTestingPlatformRunner>
+    <IsTestingPlatformApplication>false</IsTestingPlatformApplication>
   </PropertyGroup>
 </Project>

@@ -8,62 +8,54 @@ namespace HttpResilience.NET.Tests.Behavior;
 /// <c>Retry:MaxRetries</c> counts retries after the first attempt, and the key says so.
 /// </summary>
 /// <remarks>
-/// The key was called <c>MaxAttempts</c> and was assigned to Polly's <c>MaxRetryAttempts</c>, so
-/// <c>MaxAttempts: 2</c> sent three requests. Every document in the repository was internally consistent
-/// about that, and every operator doing amplification arithmetic from the key name alone was off by one --
-/// in the direction that under-counts load on a dependency that is already failing.
-/// <para>
-/// The old key is still bound, so that a configuration file carrying it fails startup rather than being
-/// ignored. Aliasing it instead would have preserved the behavior of anyone who read the name literally and
-/// got it wrong, which is the outcome the rename exists to prevent.
-/// </para>
+/// <c>MaxRetries: 2</c> sends three requests. The old key <c>MaxAttempts</c> is read from the raw section, so a file using
+/// it fails startup instead of being ignored or silently aliased.
 /// </remarks>
 public class RetryNamingTests
 {
     /// <summary>
-    /// The arithmetic the key name now states: two retries after the first attempt is three origin calls.
+    /// Two retries after the first attempt is three origin calls.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task MaxRetriesOfTwo_MakesThreeOriginCalls()
     {
         var origin = new RecordingHandler(HttpStatusCode.InternalServerError);
         await using ResilienceHarness harness = ResilienceHarness.Create(
             Settings.Enabled().Set("Retry:MaxRetries", "2"), origin);
 
-        (await harness.GetAsync()).Dispose();
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
 
         Assert.Equal(3, origin.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task MaxRetriesOfZeroIsRejected_BecauseRetryEnabledIsTheOffSwitch()
     {
         ServiceProvider_Throws(Settings.Enabled().Set("Retry:MaxRetries", "0"), out string message);
 
-        Assert.Contains("Retry.MaxRetries", message, StringComparison.Ordinal);
-        Assert.Contains("Retry.Enabled", message, StringComparison.Ordinal);
+        Assert.Contains("Retry:MaxRetries", message, StringComparison.Ordinal);
+        Assert.Contains("Retry:Enabled", message, StringComparison.Ordinal);
         await Task.CompletedTask;
     }
 
     /// <summary>
-    /// Production change that would make this fail: removing the tombstone property, which would let the old
-    /// key bind to nothing and leave the client silently on the default retry count.
+    /// Fails if <c>RenamedKeyRules</c> stops checking the raw section: the old key would bind to nothing and
+    /// the client would run on the default retry count.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheOldMaxAttemptsKey_FailsStartup_AndNamesItsReplacement()
     {
         ServiceProvider_Throws(
             Settings.Enabled().Set("Retry:MaxAttempts", "2"), out string message);
 
-        Assert.Contains("Retry.MaxAttempts", message, StringComparison.Ordinal);
+        Assert.Contains("Retry:MaxAttempts", message, StringComparison.Ordinal);
         Assert.Contains("MaxRetries", message, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// The old key must be refused on a client section too, not only at the root -- that is where a
-    /// per-client retry count is most likely to have been written.
+    /// The old key is refused in a client section too, where a per-client retry count is most likely.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheOldMaxAttemptsKeyOnAClientSection_FailsStartup()
     {
         ServiceProvider_Throws(
@@ -71,27 +63,25 @@ public class RetryNamingTests
             out string message,
             sectionName: "test");
 
-        Assert.Contains("Retry.MaxAttempts", message, StringComparison.Ordinal);
+        Assert.Contains("Retry:MaxAttempts", message, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// Refused even when retries are switched off: the value is unread either way, but the message an
-    /// operator needs is that the key was renamed, not silence.
+    /// Refused even when retries are off, so the operator learns the key was renamed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheOldMaxAttemptsKey_IsRefusedEvenWhenRetriesAreDisabled()
     {
         ServiceProvider_Throws(
             Settings.Enabled().Set("Retry:Enabled", "false").Set("Retry:MaxAttempts", "2"),
             out string message);
 
-        Assert.Contains("Retry.MaxAttempts", message, StringComparison.Ordinal);
+        Assert.Contains("Retry:MaxAttempts", message, StringComparison.Ordinal);
     }
 
     private static void ServiceProvider_Throws(Settings settings, out string message, string? sectionName = null)
     {
-        OptionsValidationException exception = Assert.Throws<OptionsValidationException>(
-            () => ResilienceHarness.BuildProvider(settings, sectionName: sectionName));
+        OptionsValidationException exception = StartupAssert.Fails(() => ResilienceHarness.BuildProvider(settings, sectionName: sectionName));
 
         message = string.Join(" ", exception.Failures);
     }

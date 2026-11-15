@@ -1,120 +1,185 @@
 # Configuration reference
 
-Every key the schema reads, its default, and why the default is what it is.
+The root section is `HttpResilience` (or the section passed to `AddHttpResilience(section)`; paths below are
+relative to it). A client reads `HttpResilience:Clients:{name}` bound on top of the root, so it states only
+what it changes. Lists replace the root's list; they are not merged.
 
-The root section is `HttpResilience`. Per-client overrides live at `HttpResilience:Clients:{name}` and are
-bound on top of the root, so a client states only what it changes.
+- Durations are `TimeSpan` strings (`"00:00:20"`).
+- Configuration is read once; changes need a restart.
+- Order of application: root section → root delegates (`AddHttpResilience(options => ...)`) → client section →
+  the client's own `configure` delegate → root kill switch.
 
-Two keys are **root only** and are read from the raw section rather than bound, because they are statements
-about the process rather than about a client: `AllowUnusedClientSections` and `ValidateClientsOnStart`.
-Binding them would make them look inheritable per client, which they are not.
-
-Three keys run the other way — they are ordinary per-client options that the **root** refuses: both
-`DisableForUnsafeHttpMethods` flags may not be `false` there, and root `Retry:RetryableMethods` may name only
-safe methods. Each is checked against the raw root section at registration as well as against the bound
-options, so no hosting model can skip it.
-
-All durations are `TimeSpan` strings (`"00:00:20"`). `Enabled` is opt-in and defaults to `false`.
-
-See [README.md](../README.md) for the concepts behind these keys and
-[ARCHITECTURE.md](ARCHITECTURE.md#validation) for how and when each rule runs.
+Three checks fail startup by default and have root-only opt-outs: an unknown key (`AllowUnknownKeys`, or a newer
+`SchemaVersion`, which makes it a warning), an unused client section (`AllowUnusedClientSections`) and a client
+whose handler chain cannot be built (`ValidateClientsOnStart`). A file shared by many services usually needs the
+first two: [RECIPES.md](RECIPES.md#one-configuration-file-shared-by-many-services).
 
 ## Keys
 
 | Section | Key | Default | Notes |
 | --- | --- | --- | --- |
-| | `Enabled` | `false` | Opt-in. Governs the resilience pipeline only; `Connection` applies independently. A client with it `false` logs one **Warning** at startup naming the key. |
-| | `AllowUnusedClientSections` | `false` | Root only. When `false`, a section under `Clients` that no registered client reads fails startup. Set it to `true` only when one configuration file is deliberately shared by services registering different clients. |
-| | `ValidateClientsOnStart` | `true` | Root only. Creates every client this package configured, once, at host start, so a client whose handler chain cannot be built fails the deployment rather than the first request that reaches it. Set it to `false` to defer that to first use. Setting it to `false` while also calling `ValidateHttpResilienceClientsOnStart()` fails startup, naming both. |
-| `Timeout` | `Total` | `00:00:20` | Bound for the attempts. Stops applying at response headers. |
-| | `Attempt` | `00:00:05` | One attempt, up to response headers. Must be strictly less than `Total`. |
-| | `Client` | `Total` + 30 s | `HttpClient.Timeout`. The outer backstop: queue wait plus attempts plus response-body transfer. Must be strictly greater than `Total`. The only place the schema can validate this bound, so setting `HttpClient.Timeout` through `ConfigureHttpClient` fails at client creation — including a deliberate 100 seconds. One shape escapes that guard: a typed client's constructor — see [README.md](../README.md#timeouts). |
-| `Retry` | `Enabled` | `true` | The supported way to switch retries off. |
-| | `MaxRetries` | `2` | Retries **after** the first attempt, so the default is three requests. 1–10. Not range-checked while `Enabled` is false. `Retry:MaxAttempts` is refused at startup rather than aliased to this key: it counts retries, not attempts, so a file using that name has arithmetic that is off by one. |
-| | `BaseDelay` | `00:00:00.500` | Scaled by `BackoffType`. **Tuned for same-cluster calls, and lower than the platform's 2 s.** With the default `Exponential` and `MaxRetries: 2` all three attempts land inside about 1.5 s before jitter, which is fine against a healthy in-cluster dependency and aggressive against one in a cold start, a GC pause or a rolling restart — in every replica at once. Raise it to `00:00:01` or more for anything crossing a region or a cold-start boundary, and check the retry-budget rule still passes. |
+| | `Enabled` | `true` | `false` in a client section turns that client off. `false` at the root is a kill switch: every client is off, whatever its section or code says. Turns off the pipeline and `Timeout:Client` (`HttpClient` keeps its 100 s default); `Connection` still applies. A disabled client logs startup **Warning event 6** naming the key, and its other values are not range-checked. |
+| | `AllowUnusedClientSections` | `false` | Root only; also settable in code (`services.Configure<HttpResilienceStartupOptions>(...)`, which wins over configuration). `false`: a `Clients` section no registered client reads fails startup. Set `true` when one file serves services that register different clients. Must be `true` or `false`. |
+| | `AllowUnknownKeys` | `false` | Root only; also settable in code. `false`: a key the schema does not have, at the root or in a client section, fails startup naming the key and the nearest real one (`Retry:Enable` → `Enabled`), unless `SchemaVersion` names a newer minor. `true` turns the check off entirely, typos included. Must be `true` or `false`. |
+| | `SchemaVersion` | (none) | Root only; configuration only. The package version the file was written for, as `major.minor` (`3`, `3.1`, `3.1.0` accepted). **Newer minor of this major**: unknown keys are a startup **Warning event 18** listing them, not a failure (a minor only adds optional keys), so a typo in that file is not caught either. **Same, older or absent**: unknown keys fail startup. **Newer major**: fails startup (a major may rename keys). Not a version: fails startup. |
+| | `ValidateClientsOnStart` | `true` | Root only; also settable in code. Creates every configured client at host start, so a broken handler chain fails the deployment, after a self-check that the resolved `Microsoft.Extensions.Http` still runs handler actions in the order this package relies on. `false` skips both and defers creation to first use (options are still validated at start). Must be `true` or `false`. |
+| `Timeout` | `Total` | `00:00:20` | All attempts and backoff, up to response headers. 10 ms–1 day. Limiter queue wait is **not** included. |
+| | `Attempt` | `00:00:05` | One attempt, up to response headers. 10 ms–1 day, less than `Total`. |
+| | `Client` | `Total` + 30 s | `HttpClient.Timeout`: queue wait, all attempts and the response body. Greater than `Total`, at most `int.MaxValue` ms. A different value assigned through `ConfigureHttpClient` fails client creation; one assigned in a typed client's constructor cannot be detected. |
+| `Retry` | `Enabled` | `true` | The switch to turn retries off (`MaxRetries` cannot be 0). While off, `MaxRetries`, `BaseDelay`, `MaxDelay` and `BackoffType` are neither checked nor applied; `RetryableMethods` and its rules still are. |
+| | `MaxRetries` | `2` | Retries **after** the first attempt: 2 means 3 requests. 1–10. `Retry:MaxAttempts` is not a key: it fails startup naming this one. |
+| | `BaseDelay` | `00:00:00.500` | Scaled by `BackoffType`. 0–1 minute. Suits same-cluster calls; use `00:00:01`+ across regions. |
 | | `BackoffType` | `Exponential` | `Constant`, `Linear` or `Exponential`. |
-| | `UseJitter` | `true` | Keep on: without it every replica retries on the same schedule. |
-| | `UseRetryAfterHeader` | `true` | Parsing delegated to the platform. The header **replaces** the computed delay, so the retry-budget validation below covers the configured schedule only: an origin naming a large `Retry-After` can spend the whole of `Timeout:Total` on one wait, holding its concurrency slot or permit meanwhile. Bounded by `Timeout:Total`, never unbounded — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md). |
-| | `DisableForUnsafeHttpMethods` | `true` | Retries only GET, HEAD, OPTIONS, TRACE. Anything else, standard or not, is left alone. **Cannot be set to `false` at the root** — per client only — and cannot be *stated at all* beside a `RetryableMethods` list in force, because the list replaces it. A client with it `false` logs one **Warning** at startup naming the key. |
-| | `RetryableMethods` | `null` | Explicit allow-list; replaces the flag above, and the only way to retry a non-standard method. Inheritable from the root, unlike the flag — but **the root may name only safe methods**; an unsafe entry there is refused and belongs per client. A client section **replaces** this list rather than adding to the root's, and an **empty list** returns that client to the default safe-method guard. Cannot be combined with a stated `DisableForUnsafeHttpMethods`, in either direction. Content must be re-playable. Naming any method other than GET/HEAD/OPTIONS/TRACE logs one **Warning** at startup. |
-| `CircuitBreaker` | `FailureRatio` | `0.1` | Proportion of failures in the sampling window. |
-| | `MinimumThroughput` | `100` | **Attempts**, not caller requests — the breaker is inside the retry loop, so one failing request contributes `1 + MaxRetries`. Per replica. Below this rate there is effectively no breaker. |
-| | `SamplingDuration` | `00:00:30` | Must be at least double `Timeout:Attempt`. |
-| | `BreakDuration` | `00:00:05` | |
-| `Connection` | `Enabled` | `false` | Applies even when the pipeline is disabled. |
-| | `MaxConnectionsPerServer` | unset | Unset means the runtime default (unlimited). |
-| | `PooledConnectionLifetime` | `00:02:00` | Bounds DNS staleness. Factory rotation is disabled when `Enabled`. |
-| | `PooledConnectionIdleTimeout` | `00:01:00` | Must be **strictly less than** `PooledConnectionLifetime`, or it can never fire. |
-| | `ConnectTimeout` | `00:00:03` | Covers TCP **and** the TLS handshake. Must be **strictly less than** `Timeout:Attempt`, or a slow connect can only ever be reported as an attempt timeout. Raise it with `Timeout:Attempt` for a distant dependency. |
-| | `EnableMultipleHttp2Connections` | `true` | **The runtime default is `false`.** This is the one place the schema changes a platform default rather than surfacing one. A single HTTP/2 connection caps the client at the server's `MAX_CONCURRENT_STREAMS`, which behind a load balancer is often 100 — a throughput cliff with no configuration key attached to it. Set it back to `false` if a downstream counts connections rather than streams. |
-| | `AllowAutoRedirect` | unset | `true` (the runtime default) for a standard client, `false` for a hedged one. The only setting that bounds where requests actually go — see [README.md](../README.md#a-hedged-client-does-not-follow-redirects). Applied even with `Connection:Enabled` false when it resolves to `false`. **Written onto a primary handler you supplied only when you state it here, or when it resolves to `false`.** Unstated-and-`true` is the pipeline kind talking, not a person, so it does not overwrite a handler hardened with `AllowAutoRedirect = false`. If the primary handler is neither a `SocketsHttpHandler` nor an `HttpClientHandler` there is nowhere to write it: that logs **Warning event 13** naming the client rather than failing, because the handler that reaches that branch in practice is a test stub, which follows no redirects. |
-| `RateLimiter` | `Enabled` | `false` | Process-local, and per client. Fleet rate is `replicas × clients × PermitLimit` — see [README.md](../README.md#rate-limiting-is-process-local). |
-| | `Algorithm` | `FixedWindow` | `FixedWindow`, `SlidingWindow`, `TokenBucket`. |
-| | `PermitLimit` | required | Required by `FixedWindow` and `SlidingWindow`. No default: it is a contract with a specific downstream. |
-| | `Window` | `00:00:01` | `FixedWindow` and `SlidingWindow`. |
-| | `SegmentsPerWindow` | `8` | `SlidingWindow` only. Higher is smoother and costs a little more memory. |
-| | `TokenLimit` | required | `TokenBucket` only — bucket capacity, so the largest burst an idle client may make. |
-| | `TokensPerPeriod` | required | `TokenBucket` only — tokens added each `ReplenishmentPeriod`, so the sustained rate as opposed to the burst. |
-| | `ReplenishmentPeriod` | `00:00:01` | `TokenBucket` only. |
-| | `QueueLimit` | `0` | Fails fast. Queued requests hold their content buffers in memory. Capped at 1,000. |
-| `ConcurrencyLimiter` | `Enabled` | `false` | The client's own cap, applied outside the handler. |
-| | `Limit` | required | How much of *your* capacity may wait on one dependency. Must be at most `Backstop`. |
-| | `QueueLimit` | `0` | Capped at 1,000. |
-| | `Backstop` | `1000` | The platform's own limiter slot, surfaced. No queue: above it, requests are rejected. With no rate limiter it sits *in* that slot, which is one limiter **per pipeline** — so a hedged client or one using `PipelineSelection:Mode = ByAuthority` gets this cap per authority, not per client. A rate limiter takes the slot, and the backstop is then re-added as its own handler outside it, which is **per client** even under `ByAuthority`. That extra handler is skipped in the one case where it would be redundant — the client also sets `ConcurrencyLimiter:Limit`, which validation holds at or below the backstop and which therefore bounds concurrency more tightly. **A concurrency bound is never absent**; in that one case it is the client's number rather than this one. |
-| `Hedging` | `Delay` | `00:00:02` | Only used by `AddHedgedHttpResilience`, which rejects `Retry:*` keys on the same client. |
-| | `MaxHedgedAttempts` | `1` | 1–10. Directly multiplies outbound load. |
-| | `DisableForUnsafeHttpMethods` | `true` | Covers the timer path as well as the outcome path. **Cannot be set to `false` at the root** — per client only. A hedged client with it `false` logs one **Warning** at startup. |
-| `PipelineSelection` | `Mode` | `None` | `None` or `ByAuthority`. Isolates circuit breakers, not limiters. |
-| | `Authorities` | `null` | Required for `ByAuthority`, and for every client registered with `AddHedgedHttpResilience`. A client section **replaces** this list rather than adding to the root's. A **root** list is inherited by every client and is inert — not an error — on a standard client under `Mode: None`; a client that states one itself under `Mode: None` fails at registration. |
+| | `UseJitter` | `true` | Keep on, so replicas do not retry in lockstep. |
+| | `MaxDelay` | `00:00:05` | The longest wait before a retry; a longer computed backoff is cut to it. At least `BaseDelay`, greater than 0, at most 1 day. |
+| | `UseRetryAfterHeader` | `true` | A `Retry-After` header **replaces** the computed delay when it is at most `MaxDelay`. A longer one **ends the retries**: the origin's 429/503 goes straight back to the caller instead of holding it (and its limiter slot). Raise `MaxDelay` (and `Timeout:Total`) for a dependency that asks for longer waits. |
+| | `DisableForUnsafeHttpMethods` | `true` | Retry only GET, HEAD, OPTIONS, TRACE (an allow-list). `false` retries every method. **Not allowed `false` at the root.** A client may not state it while a `RetryableMethods` list is in force (own or inherited). `false` logs startup **Warning event 10**. |
+| | `RetryableMethods` | empty | When non-empty, only these methods are retried (list `GET` too if you want it) and the flag above is ignored. Valid method tokens, upper-cased (`post` = `POST`); request methods must match exactly. **The root may list only safe methods.** An empty client list restores the safe-method guard. An unsafe entry logs startup **Warning event 10**. |
+| `CircuitBreaker` | `FailureRatio` | `0.5` | Failure share in the window that opens the circuit. Above 0, at most 1. High enough that a steady low error rate, which retries absorb, does not open it. |
+| | `MinimumThroughput` | `20` | **Attempts**, not requests, per replica, within `SamplingDuration`, before the ratio is evaluated. At least 2. With fewer attempts the breaker never opens; startup event 11 states the rate each client needs. |
+| | `SamplingDuration` | `00:00:30` | 500 ms–1 day, and at least 2 × `Timeout:Attempt`. |
+| | `BreakDuration` | `00:00:05` | How long the circuit stays open. 500 ms–1 day. |
+| `Connection` | `Enabled` | `false` | Configures the primary `SocketsHttpHandler` and turns off the factory's handler rotation. Applies even to a disabled client. A supplied `SocketsHttpHandler` is kept, and fails client creation if it sets one of the keys below to a value other than the resolved one. An `HttpClientHandler` with nothing set is replaced; one carrying any setting fails client creation. Any other type fails client creation. The keys below are validated only when this is `true`. |
+| | `MaxConnectionsPerServer` | unset | Unset keeps the runtime default (unlimited). At least 1. Requests over it queue in the pool, invisible to the pipeline. |
+| | `PooledConnectionLifetime` | `00:02:00` | Max connection age; bounds DNS staleness. Greater than 0. Always written. |
+| | `PooledConnectionIdleTimeout` | `00:01:00` | Greater than 0, less than `PooledConnectionLifetime`. Always written. |
+| | `ConnectTimeout` | `00:00:03` | TCP + TLS. Less than `Timeout:Attempt`, at most `int.MaxValue` ms. Always written. |
+| | `EnableMultipleHttp2Connections` | `true` | The runtime default is `false`: one HTTP/2 connection is capped by the server's stream limit (often 100). Always written. |
+| | `AllowAutoRedirect` | unset | Unset: standard clients follow redirects (runtime default), hedged clients do not. `false` (stated or resolved) is applied even with `Connection:Enabled` off; if the primary handler has no such setting, **Warning event 13**. Written onto your own handler only when stated or `false`. Recommended `false` at the root of shared configuration: a followed redirect re-sends custom headers (API keys) to the new host. A client that needs redirects states `true`. |
+| `RateLimiter` | `Enabled` | `false` | **Per process, per client: cannot enforce a cluster-wide quota.** Fleet rate is `replicas × clients × PermitLimit`. One permit covers a request and all its retries or hedges. |
+| | `Algorithm` | `FixedWindow` | `FixedWindow`, `SlidingWindow` or `TokenBucket`. |
+| | `PermitLimit` | required | `FixedWindow` / `SlidingWindow`: permits per `Window`. |
+| | `Window` | `00:00:01` | `FixedWindow` / `SlidingWindow`. Greater than zero. |
+| | `SegmentsPerWindow` | `8` | `SlidingWindow` only. At least 1. |
+| | `TokenLimit` | required | `TokenBucket` only: bucket size (largest burst). |
+| | `TokensPerPeriod` | required | `TokenBucket` only: tokens added per `ReplenishmentPeriod`. |
+| | `ReplenishmentPeriod` | `00:00:01` | `TokenBucket` only. Greater than zero. |
+| | `QueueLimit` | `0` | 0 fails fast. Max 1,000. Queued requests hold their content in memory and wait outside `Timeout:Total`. |
+| `ConcurrencyLimiter` | `Enabled` | `false` | The client's own in-flight cap, outside the platform handler: one slot per request including retries. Per client. |
+| | `Limit` | required | Max requests in flight. At most `Backstop`. |
+| | `QueueLimit` | `0` | 0 fails fast. Max 1,000. The wait is outside `Timeout:Total`. |
+| | `Backstop` | `1000` | Always-on concurrency limit, no queue, 1–10,000. Standard client: per pipeline (per authority under `ByAuthority`); with a rate limiter, one per client; omitted when the rate limiter **and** `ConcurrencyLimiter` are both enabled (`Limit` is the bound). Hedged client: per authority. Rejections log **Warning event 7**. |
+| `Hedging` | `Delay` | `00:00:02` | Hedged clients only. Wait before the next attempt. Zero or more; zero sends all attempts at once. Below 10 ms logs startup **Warning event 21**. |
+| | `MaxHedgedAttempts` | `1` | Extra attempts: 1 means up to 2 requests. 1–10. |
+| | `DisableForUnsafeHttpMethods` | `true` | Hedge only GET, HEAD, OPTIONS, TRACE, including hedges started by the delay timer. **Not allowed `false` at the root.** `false` logs startup **Warning event 10**. |
+| `PipelineSelection` | `Mode` | `None` | Standard clients: `None` (one pipeline) or `ByAuthority` (one per listed authority, so circuit breakers, and without a rate limiter the backstop, are isolated per host; rate and concurrency limiters stay per client). Hedged clients are always per authority. |
+| | `Authorities` | empty | `scheme://host[:port]`. Required for `ByAuthority` and for every hedged client. Unlisted hosts share one pipeline (standard) or are refused with `InvalidOperationException` (hedged; not `HttpRequestException`, so no retry policy repeats it). Hosts match on `Uri.IdnHost` ignoring a trailing dot; scheme and port must match exactly. A root list is ignored by standard clients in `Mode: None`. |
 
+## Cross-key rules
 
-## Cross-property rules
-
-The validator checks relationships, not just ranges. Each message names the path, the value, the expectation
-and the reason.
+Checked at startup; a violation fails with the key, value, expectation and reason.
 
 | Rule | Why |
 | --- | --- |
-| `Timeout:Attempt` < `Timeout:Total` | An attempt that may outlive the whole budget cannot be bounded by it. |
-| `Timeout:Client` > `Timeout:Total` | `Timeout:Client` is the outer backstop; equal or lower truncates the pipeline. |
-| `Connection:ConnectTimeout` < `Timeout:Attempt` | Otherwise a slow connect can only ever be reported as an attempt timeout. |
-| `Connection:PooledConnectionIdleTimeout` < `PooledConnectionLifetime` | Otherwise the idle timeout can never fire. |
-| `CircuitBreaker:SamplingDuration` >= 2 x `Timeout:Attempt` | A window shorter than two attempts cannot observe a failure rate. |
-| The retry schedule fits `Timeout:Total`, with 1.5x headroom when `UseJitter` is on | A schedule whose last retry is cut off is a schedule that does not do what it says. Headroom is a factor, not a bound: `Retry-After` replaces the computed delay entirely and can spend the whole budget on one wait. |
-| The hedging schedule fits `Timeout:Total` | `Hedging:Delay` x `MaxHedgedAttempts` has to leave room for an attempt, or the last hedged attempt can never start. |
-| `ConcurrencyLimiter:Limit` <= `ConcurrencyLimiter:Backstop` | The backstop is the outer bound; a limit above it is unreachable. |
-| `RateLimiter` required keys, per `Algorithm` | `FixedWindow` and `SlidingWindow` need `PermitLimit`; `TokenBucket` needs `TokenLimit` and `TokensPerPeriod`. There is no default for any of them, because each is a contract with a specific downstream. |
-| `PipelineSelection:Authorities` required for `Mode: ByAuthority` and for every hedged client | Both mint a pipeline per authority, so the set has to be fixed at deploy time. |
-| A hedged client states no `Retry:*` keys | The hedging pipeline has no retry strategy, so those keys would bind to nothing. |
+| `Timeout:Attempt` < `Timeout:Total` < `Timeout:Client` | Each must fit inside the next. |
+| `CircuitBreaker:SamplingDuration` ≥ 2 × `Timeout:Attempt` | A shorter window cannot observe a failure rate. |
+| Hedged: `Hedging:Delay` × `MaxHedgedAttempts` + `Timeout:Attempt` ≤ `Timeout:Total` | The last hedge must be able to finish. |
+| `ConcurrencyLimiter:Limit` ≤ `ConcurrencyLimiter:Backstop` | A higher limit is unreachable. |
+| With `Connection:Enabled`: `ConnectTimeout` < `Timeout:Attempt`, `PooledConnectionIdleTimeout` < `PooledConnectionLifetime` | Otherwise the smaller setting never takes effect. |
+| `Retry:DisableForUnsafeHttpMethods: false` never beside a non-empty `Retry:RetryableMethods` | The list replaces the flag. |
 
-Two rules judge the configuration *file* rather than a value and run once at startup against the root:
+Judged against the **client's own section** (root values are shared by both kinds of client):
 
-- **An unused `Clients:{name}` section fails startup.** Inert configuration reads exactly like configuration
-  in force. Escape hatch: `AllowUnusedClientSections`, root only, defaults to failing.
-- **A renamed key fails startup rather than binding to nothing.** `Retry:MaxAttempts` still binds, to a
-  tombstone, so a stale file is refused instead of silently ignored.
+| Rule | Why |
+| --- | --- |
+| No `Retry` keys on a hedged client; no `Hedging` keys on a standard client | That pipeline never reads them. |
+| No `PipelineSelection:Authorities` on a standard client in `Mode: None` | Per-host isolation would silently not happen. |
+| No `Retry:DisableForUnsafeHttpMethods` while a `RetryableMethods` list is in force | The list replaces the flag. |
 
-The binder ignores keys it does not recognize, so a misspelled *property* inside a section that is read is
-still silent: `Clients:Orders:Timeout:Totl` binds to nothing and says nothing. That gap is not closed. What
-is closed is the case where an entire client's configuration is inert.
+Root-only rules, applied to the root section **and** to `AddHttpResilience(options => ...)`:
 
-## Configuration reload
+- Neither `DisableForUnsafeHttpMethods` may be `false`.
+- `Retry:RetryableMethods` may name only GET, HEAD, OPTIONS and TRACE.
 
-Resilience configuration is read once at startup. Changing it requires a restart.
+Root `Retry` values are judged by each standard client, root `Hedging` values by each hedged client. A bad value
+fails every client that reads it, named under that client; with no client of that kind it is inert.
 
-This is deliberate. Rebuilding handler pipelines under load would mean disposing live strategies while
-requests are in flight. The options are registered with `Configure` rather than `Bind`, so no reload token
-exists and `IOptionsMonitor` can never report a value that arrived from a configuration reload and is not in
-effect.
+Not a failure: a retry schedule that can outlast `Timeout:Total` logs startup Warning event 14.
 
-Within a process, `IOptionsMonitor<HttpResilienceOptions>.Get(name)` reports what the pipeline runs, because
-the pipeline is built from that same options instance rather than from a copy of it — the rate limiter
-included, which is created from live options inside its keyed factory. So a consumer's `Configure` or
-`PostConfigure` reaches the pipeline exactly as it does for the platform's own options.
+Not detected: a misspelled key inside a section that is read (`Clients:Orders:Timeout:Totl`) is ignored by the
+binder.
 
-Two limits on that. A consumer who configures `HttpStandardResilienceOptions` directly is reaching past this
-schema to the platform's own extension point; it works, and keeping it consistent with this schema is the
-consumer's business. And a few options decide *which handlers exist*, which `IHttpClientFactory` fixes at
-registration — `Enabled`, `RateLimiter:Enabled`, `ConcurrencyLimiter:Enabled`, `PipelineSelection:Mode`,
-`Connection:Enabled` and the resolved `Connection:AllowAutoRedirect`. Changing one of those after
-registration fails startup rather than appearing to work.
+## Differences from `AddStandardResilienceHandler`
+
+This package configures the platform's own handlers with different defaults. A client moved from
+`AddStandardResilienceHandler()` or `AddStandardHedgingHandler()` with no `HttpResilience` section behaves as the
+right-hand column. `PlatformDefaultsComparisonTests` pins both columns, and the weekly platform-drift run executes
+it against the newest platform release.
+
+**Standard client** (`AddHttpResilienceHandler` vs `AddStandardResilienceHandler`):
+
+| What | Platform default | This package | Key |
+| --- | --- | --- | --- |
+| Total timeout | 30 s | **20 s** | `Timeout:Total` |
+| Attempt timeout | 10 s | **5 s** | `Timeout:Attempt` |
+| Retries after the first attempt | 3 (4 requests) | **2** (3 requests) | `Retry:MaxRetries` |
+| Base retry delay | 2 s | **500 ms** | `Retry:BaseDelay` |
+| Longest wait before a retry | no cap | **5 s** | `Retry:MaxDelay` |
+| `Retry-After` longer than that cap | waited for, whatever its length, until the total timeout ends the request | **ends the retries**: the 429 or 503 is returned at once | `Retry:MaxDelay`, `Retry:UseRetryAfterHeader` |
+| Methods retried | **every method**, POST included | GET, HEAD, OPTIONS, TRACE | `Retry:DisableForUnsafeHttpMethods`, `Retry:RetryableMethods` (per client only) |
+| `HttpClient.Timeout` | infinite | **`Timeout:Total` + 30 s** (50 s) | `Timeout:Client` |
+| Circuit breaker opens at | 10% failures of at least **100** attempts in 30 s (3.3 attempts/s per replica) | **50%** of at least **20** (0.67 attempts/s) | `CircuitBreaker:FailureRatio`, `CircuitBreaker:MinimumThroughput` |
+
+**Hedged client** (`AddHttpResilienceHedgingHandler` vs `AddStandardHedgingHandler`):
+
+| What | Platform default | This package | Key |
+| --- | --- | --- | --- |
+| Total timeout | 30 s | **20 s** | `Timeout:Total` |
+| Attempt timeout (per endpoint) | 10 s | **5 s** | `Timeout:Attempt` |
+| Methods hedged | **every method** | GET, HEAD, OPTIONS, TRACE, including hedges started by the delay timer | `Hedging:DisableForUnsafeHttpMethods` (per client only) |
+| Authorities | any; one pipeline per authority, never evicted | **listed only**; others refused with `InvalidOperationException` | `PipelineSelection:Authorities` (required) |
+| Redirects | followed (runtime default) | **not followed** | `Connection:AllowAutoRedirect` |
+| Circuit breaker (per endpoint) opens at | 10% failures of at least **100** attempts in 30 s | **50%** of at least **20** | `CircuitBreaker:FailureRatio`, `CircuitBreaker:MinimumThroughput` |
+
+The same on both: exponential backoff with jitter, `Retry-After` honoured within the cap, the breaker's 30 s
+window and 5 s break, a concurrency limit of 1,000 with no queue in the limiter slot
+(`ConcurrencyLimiter:Backstop`), hedging after 2 s with 1 extra attempt, and the factory's connection handling
+unless `Connection:Enabled`.
+
+Why the shorter budget: every retry the defaults allow fits inside `Timeout:Total` (3 × 5 s + 0.5 s + 1 s =
+16.5 s ≤ 20 s). The platform's schedule (4 × 10 s + 2 s + 4 s + 8 s = 54 s) cannot complete in its 30 s, so its
+later retries are cut off. Why the different breaker: the platform's needs 3.3 attempts per second in one
+replica before it can open, which most internal clients never reach; 20 attempts at 50% opens on a dependency
+that is down (about seven fully failing requests in 30 s) and not on a steady low error rate that retries absorb.
+The unsafe-method guards and the authority list are safety rules, not tuning.
+
+To keep the platform's timing, set the root values below. The safe-method guards cannot be switched off at the
+root; a client that relies on retrying a POST states that in its own section
+([Retrying a POST safely](RECIPES.md#retrying-a-post-safely)).
+
+```json
+{
+  "HttpResilience": {
+    "Timeout": { "Total": "00:00:30", "Attempt": "00:00:10" },
+    "Retry": { "MaxRetries": 3, "BaseDelay": "00:00:02", "MaxDelay": "00:00:30" },
+    "CircuitBreaker": { "FailureRatio": 0.1, "MinimumThroughput": 100 }
+  }
+}
+```
+
+- `MaxDelay` equal to `Total`: no wait can outlast `Total` anyway. One difference remains: a `Retry-After`
+  longer than 30 s returns the 429 or 503 at once, where the platform waits and then throws
+  `TimeoutRejectedException`.
+- Startup logs **Warning event 14** for these values, because the schedule is longer than `Total`. That reports
+  the platform's own behavior; it is not a fault.
+- `HttpClient.Timeout` stays finite (`Timeout:Client`, here 60 s). It cannot be infinite.
+
+## Reading and overriding values in code
+
+`IOptionsMonitor<HttpResilienceOptions>.Get("Orders")` returns exactly what the pipeline runs.
+`services.Configure<HttpResilienceOptions>("Orders", ...)` and `PostConfigure` reach the pipeline too,
+including `Enabled` and the limiter switches. A `Configure` registered **before** `AddHttpResilienceHandler`
+runs before binding, so configuration wins over it; `PostConfigure` always runs last. The clearest option is
+the registration's own parameter: `.AddHttpResilienceHandler(options => ...)`.
+
+Root values for every client go in `AddHttpResilience(options => ...)`, alone or after a section:
+`AddHttpResilience(configuration, options => ...)` for the default `HttpResilience` section, or
+`AddHttpResilience(configuration.GetSection("Platform:Http"), options => ...)` for another one.
+
+The platform options behind a client (`HttpStandardResilienceOptions` named `{client}-standard`, or
+`HttpStandardHedgingResilienceOptions` named `{client}` for a hedged client) hold its validated pipeline and are
+shared by every registration on the client. Code that changes them after this package writes them (`Configure`,
+`PostConfigure` or `ConfigureAll` of those types, `AddStandardResilienceHandler(configure)` on the client, or a
+second `AddStandardHedgingHandler`) fails client creation, and so host start, naming each changed property: it
+would replace validated values and could make a POST repeatable. Use `AddResilienceHandler` for anything the
+schema does not cover.

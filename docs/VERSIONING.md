@@ -1,69 +1,51 @@
 # Versioning
 
-HttpResilience.NET follows [Semantic Versioning](https://semver.org/).
+[Semantic Versioning](https://semver.org/).
 
 | Change | Version |
 | --- | --- |
-| Public API removal, rename, namespace move or signature change | MAJOR |
+| Public API removed, renamed, moved or re-signed | MAJOR |
 | Configuration key renamed or removed | MAJOR |
-| Default value change that alters runtime behavior | MAJOR |
-| A new validation rule that rejects previously accepted configuration | MAJOR |
-| Pipeline ordering or strategy semantics change | MAJOR |
+| **Default value change** that alters runtime behavior | MAJOR |
+| **New validation rule** that rejects previously accepted configuration | MAJOR |
+| Pipeline order or strategy semantics change | MAJOR |
 | Exception type change for an existing failure | MAJOR |
-| New optional configuration key with a backwards-compatible default | MINOR |
-| New extension method or overload | MINOR |
-| New telemetry dimension | MINOR |
+| Metric name or tag, log category or event ID renamed or removed | MAJOR |
+| Target framework change | MAJOR |
+| Major version bump of `Microsoft.Extensions.Http.Resilience` or Polly (their behavior is this package's) | MAJOR |
+| New optional key with a backward-compatible default | MINOR |
+| New extension method, overload or telemetry dimension | MINOR |
 | Bug fix with no behavior change for valid configuration | PATCH |
-| Documentation, tests, internal refactoring | PATCH |
+| Docs, tests, internal refactoring | PATCH |
 
-Two of these are easy to get wrong and are called out deliberately:
+A default change and a new validation rule are easy to miss: consumers inherit defaults without stating them,
+and a configuration that started yesterday must not fail today.
 
-- **A default change is MAJOR.** Consumers inherit defaults without stating them, so changing one changes behavior in every service that did not override it — with no diff anywhere to show it.
-- **A new validation rule is MAJOR.** It turns a configuration that started yesterday into one that fails to start today, which for an operator is indistinguishable from a breaking change.
+A renamed key fails startup with a message naming its replacement, so a file written for an earlier major
+cannot silently bind to nothing (`Retry:MaxAttempts` names `Retry:MaxRetries`).
+
+## Support
+
+The latest major gets every fix. The previous major gets **security fixes only, for six months** after the next
+major is published, released as patches of its last version (2.x until 2027-05-14, as 2.0.x). Nothing else is
+backported, and no older major is patched. [SECURITY.md](../SECURITY.md#supported-versions) holds the current
+dates.
 
 ## Enforcement
 
-**The public API is a build gate.** `Microsoft.CodeAnalysis.PublicApiAnalyzers` holds every public type and
-member in `src/HttpResilience.NET/PublicAPI.Shipped.txt` and `PublicAPI.Unshipped.txt`. Adding, removing or
-changing the signature of anything public fails the build until the corresponding line is edited, so the
-change is visible as a diff in review rather than at pack time. At release, move the contents of
-`PublicAPI.Unshipped.txt` into `PublicAPI.Shipped.txt` -- and that step is itself gated: on a tagged build CI
-runs `scripts/check-public-api-shipped.py`, which fails when anything is still listed as unshipped. Without
-it the move is a human step nothing checks, and skipping it once leaves every member "unshipped" for good.
-
-`EnablePackageValidation` is on as a second check. Its baseline follows one rule:
-**`PackageValidationBaselineVersion` names the last published version within the same major.** It stays unset
-for the first release of a major, because a major exists precisely to make intentional breaks, and validating
-one against the previous major would report every deliberate removal as a failure and train everyone to
-ignore the gate. From the first patch or minor after a major, the baseline is set and the check is real.
-Until then the API analyzer above is the gate.
-
-## Scheduled removals
-
-One public member exists only to fail:
-`HttpResilience.NET.Options.RetryOptions.MaxAttempts`. It is `[Obsolete]`, it is bound so that a stale
-configuration file is refused rather than silently ignored, and it is read in exactly one place --
-`HttpResilienceOptionsValidator.ValidateRenamedKeys`. Keeping it is what turns a file written for 1.x into a
-startup failure with a message instead of a client quietly running three attempts where its author meant two.
-
-**It is removed in 3.0**, which is the next opportunity, because removing a public member is MAJOR by the
-table above. By then a 1.x configuration file is old enough that failing to bind it is no worse than failing
-to recognise it. Nothing else in the public surface is scheduled for removal; when something is, it is listed
-here at the same time as it is deprecated, so "what breaks next major" is answerable from one place.
+- **Public API analyzer.** Every public member is recorded in `src/HttpResilience.NET/PublicAPI.Shipped.txt` /
+  `PublicAPI.Unshipped.txt`; an unrecorded change fails the build. At release, move Unshipped into Shipped (a
+  `*REMOVED*` line deletes its match from Shipped instead) and run `python3 scripts/check-public-api-shipped.py`.
+- **Package validation.** `EnablePackageValidation` is on, and `dotnet pack` compares the package against
+  `PackageValidationBaselineVersion`, the last published version, **including across a major** (3.0.0 is checked
+  against 2.0.0). The public API analyzer catches changes to source; package validation catches the binary
+  breaks a consumer compiled against the previous release would hit. A major's intended breaks are listed in
+  `src/HttpResilience.NET/CompatibilitySuppressions.xml`, regenerated with `-p:ApiCompatGenerateSuppressionFile=true`
+  and reviewed entry by entry against the CHANGELOG: an entry with no CHANGELOG line is an accidental break.
+  After publishing, the baseline moves to the new version and the file is emptied.
 
 ## Namespaces
 
-Registration extension methods live in `Microsoft.Extensions.DependencyInjection`, which is where the .NET
-convention puts extensions on `IServiceCollection` and `IHttpClientBuilder` -- so they appear in IntelliSense
-in any `Program.cs` without a package-specific `using`. The classes are prefixed (`HttpResilienceServiceCollectionExtensions`,
-not `ServiceCollectionExtensions`) because that namespace is shared: an unprefixed `ServiceCollectionExtensions`
-collides with the one almost every other package ships. Options and configuration types stay in
-`HttpResilience.NET.*`, which is theirs alone.
-
-## Target framework
-
-`net10.0`. A TFM change is MAJOR.
-
-## Dependencies
-
-The package depends only on first-party Microsoft packages and Polly. A major version bump of `Microsoft.Extensions.Http.Resilience` or Polly is treated as MAJOR here, because their behavior is this package's behavior.
+Registration extension methods live in `Microsoft.Extensions.DependencyInjection`, so they need no extra
+`using`; their classes are prefixed (`HttpResilienceServiceCollectionExtensions`) to avoid collisions. Every other
+public type is in `HttpResilience.NET`, with no sub-namespaces, and starts with `HttpResilience`.

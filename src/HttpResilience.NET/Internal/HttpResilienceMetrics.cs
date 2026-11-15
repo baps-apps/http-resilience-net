@@ -1,21 +1,16 @@
 using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
+using System.Reflection;
 using System.Threading.RateLimiting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.Metrics;
+using Microsoft.Extensions.Options;
 
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
 /// Which of the three limiters a gauge measurement belongs to.
 /// </summary>
-/// <remarks>
-/// One instrument with a bounded dimension rather than three instruments, because an operator's question is
-/// "how close is this client to shedding load", and the answer is whichever limiter is nearest its bound.
-/// <para>
-/// The values are the tag values, so renaming one is a telemetry break.
-/// </para>
-/// </remarks>
 internal enum LimiterKind
 {
     /// <summary>A configured rate limiter -- <c>RateLimiter:Enabled</c>.</summary>
@@ -32,126 +27,156 @@ internal enum LimiterKind
 /// Publishes the two pieces of state neither Polly nor <c>System.Net.Http</c> exposes: whether a circuit
 /// breaker is open right now, and how close each of a client's limiters is to shedding load.
 /// </summary>
-/// <remarks>
-/// Deliberately three instruments and no more. Polly already counts breaker transition <i>events</i>, and a
-/// counter answers "did it open" -- it cannot answer "is it open" after a scrape is missed or a collector
-/// restarts, which is the question an operator asks during an incident. Limiter statistics already exist on
-/// <see cref="RateLimiter.GetStatistics"/> and were simply never read.
-/// <para>
-/// Every instrument is an <c>ObservableGauge</c>, so the values are read once per collection and never on the
-/// request path. Every dimension is fixed at registration: the client name comes from the registration and
-/// the authority from the configured allow-list, so no tag value can originate from request data.
-/// </para>
-/// <para>
-/// The meter comes from <see cref="IMeterFactory"/> rather than <c>new Meter(...)</c>, which is the platform's
-/// answer to both halves of the ownership problem: the factory disposes the meter with the container, and it
-/// stamps the meter with a scope identifying which container published it. A meter constructed directly is
-/// never disposed -- an instance handed to <c>AddSingleton</c> is not disposed by the container either -- so a
-/// process that builds more than one provider would publish every generation of the gauges at once, with
-/// nothing in the measurement to say which was which.
-/// </para>
-/// <para>
-/// It is constructed when the first client's pipeline is built, which is as early as it can be useful: the
-/// tracker holds no breaker until one transitions, and a client's limiter does not exist until the container
-/// creates it, so an earlier meter would publish an empty series and nothing more.
-/// </para>
-/// </remarks>
 internal sealed class HttpResilienceMetrics
 {
     private static readonly string[] _kindNames = ["rate", "concurrency", "backstop"];
 
+    /// <summary>The breaker states, as the <c>http_resilience.circuit_breaker.state</c> attribute spells them.</summary>
+    private static readonly (CircuitState State, string Name)[] _states =
+        [(CircuitState.Closed, "closed"), (CircuitState.Open, "open"), (CircuitState.HalfOpen, "half_open")];
+
+    /// <summary>The package version, without the source-revision suffix, so exporters can tell versions apart.</summary>
+    internal static readonly string? PackageVersion = typeof(HttpResilienceMetrics).Assembly
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0];
+
     private readonly Meter _meter;
+    private int _published;
     private readonly CircuitBreakerStateTracker _tracker;
-    private readonly ConcurrentDictionary<(string Client, LimiterKind Kind), RateLimiter> _limiters = new();
+    private readonly HttpResilienceRegistration? _registration;
+    private readonly IOptionsMonitor<HttpResilienceOptions>? _options;
+    private CircuitKey[]? _knownBreakers;
+    private readonly ConcurrentDictionary<(string Client, LimiterKind Kind, string? Authority), RateLimiter> _limiters = new();
     private readonly ConcurrentDictionary<string, (string? Host, int? Port)> _authorities =
         new(StringComparer.Ordinal);
 
-    public HttpResilienceMetrics(IMeterFactory meterFactory, CircuitBreakerStateTracker tracker)
+    public HttpResilienceMetrics(
+        IMeterFactory meterFactory,
+        CircuitBreakerStateTracker tracker,
+        HttpResilienceRegistration? registration = null,
+        IOptionsMonitor<HttpResilienceOptions>? options = null)
     {
         _tracker = tracker;
-        _meter = meterFactory.Create(HttpResilienceTelemetryExtensions.MeterName);
+        _registration = registration;
+        _options = options;
+        _meter = meterFactory.Create(
+            new MeterOptions(HttpResilienceTelemetryExtensions.MeterName) { Version = PackageVersion });
+    }
 
+    /// <summary>
+    /// Publishes the three gauges, once; later calls do nothing. Called when the first handler chain is built,
+    /// so every breaker the clients can have is reported, closed, from the next collection.
+    /// </summary>
+    public void Publish()
+    {
+        if (Interlocked.Exchange(ref _published, 1) == 1)
+        {
+            return;
+        }
+
+        // OpenTelemetry's state-metric shape: one series per state, 1 for the state the breaker is in.
         _meter.CreateObservableGauge(
-            "http.resilience.circuit_breaker.state",
+            "http_resilience.circuit_breaker.state",
             ObserveCircuitStates,
-            unit: "{state}",
-            description: "Circuit breaker state: 0 closed, 1 open, 2 half-open.");
+            unit: "{breaker}",
+            description: "Circuit breakers in the state named by http_resilience.circuit_breaker.state " +
+                "(closed, open or half_open): 1 for a breaker's current state, 0 for the others.");
 
-        // One instrument per statistic rather than one per limiter kind. The kind is a tag, because the
-        // operator's question is "how close is this client to shedding load" and the answer is whichever of
-        // its limiters is nearest its bound -- which a single query over one instrument gives and three
-        // instruments do not. Named `limiter` rather than `rate_limiter`: the concurrency cap and the
-        // backstop report here too, and an instrument named for one of the three would be the kind of
-        // misleading name this package refuses everywhere else.
         _meter.CreateObservableGauge(
-            "http.resilience.limiter.available_permits",
+            "http_resilience.limiter.available_permits",
             () => ObserveLimiters(static statistics => statistics.CurrentAvailablePermits),
             unit: "{permit}",
             description: "Permits this limiter could grant right now. Tagged by limiter kind.");
 
         _meter.CreateObservableGauge(
-            "http.resilience.limiter.queued_requests",
+            "http_resilience.limiter.queued_requests",
             () => ObserveLimiters(static statistics => statistics.CurrentQueuedCount),
             unit: "{request}",
             description: "Requests currently waiting for a permit from this limiter. Tagged by limiter kind.");
     }
 
     /// <summary>
-    /// Registers a client's limiter for observation, at the point the container creates it.
+    /// Registers a client's limiter for observation, at the point it is created.
     /// </summary>
-    /// <remarks>
-    /// The limiter is a keyed singleton created on first resolve, so there is nothing to read before that.
-    /// Hooking its construction rather than resolving it here keeps this type free of the service provider,
-    /// which does not exist yet when it is built.
-    /// <para>
-    /// A client may report up to two limiters: a rate limiter and either a concurrency cap or the displaced
-    /// backstop. Both are limiters whose instance this package owns. The <i>undisplaced</i> backstop is not
-    /// here, because it lives inside the platform's own limiter slot where Polly constructs it -- one per
-    /// pipeline, which is what makes it per authority under <c>ByAuthority</c>. Supplying an instance for it
-    /// would turn that per-authority bound into a per-client one, so the gap is documented instead.
-    /// </para>
-    /// </remarks>
-    public void Track(string clientName, LimiterKind kind, RateLimiter limiter) =>
-        _limiters[(clientName, kind)] = limiter;
+    /// <param name="clientName">The client that owns the limiter.</param>
+    /// <param name="kind">Which of the client's limiters it is.</param>
+    /// <param name="limiter">The instance to read.</param>
+    /// <param name="authority">
+    /// The authority a per-authority limiter bounds, from the allow-list; <see langword="null"/> for a
+    /// per-client limiter.
+    /// </param>
+    public void Track(string clientName, LimiterKind kind, RateLimiter limiter, string? authority = null) =>
+        _limiters[(clientName, kind, authority)] = limiter;
 
     private IEnumerable<Measurement<int>> ObserveCircuitStates()
     {
-        foreach ((CircuitKey key, CircuitState state) in _tracker.Enumerate())
+        // Every breaker the clients can have, reported closed until it reports otherwise, so a breaker that never
+        // changed state still has a series. Any key the tracker holds beyond them is reported too.
+        CircuitKey[] known = _knownBreakers ??= KnownBreakers();
+        IEnumerable<CircuitKey> keys = known.Concat(_tracker.Enumerate().Select(pair => pair.Key)).Distinct();
+
+        foreach (CircuitKey key in keys)
         {
-            // server.address and server.port are the OpenTelemetry semantic-convention pair for a
-            // destination, and they are what System.Net.Http tags its own series with -- so emitting them
-            // here is what lets an operator join breaker state to request duration without splitting
-            // "scheme://host:port" in the query. They add no series: both are functionally determined by the
-            // authority already present, and the authority is kept because it is the pipeline key an
-            // operator sees in Polly's pipeline.instance and in this package's own messages.
-            //
-            // http.client.name has no semantic-convention equivalent -- there is no attribute for a named
-            // HttpClient -- so it stays as this package's own dimension.
+            CircuitState current = _tracker.GetState(key);
             (string? host, int? port) = _authorities.GetOrAdd(key.Authority, ParseAuthority);
 
-            yield return host is null
-                ? new Measurement<int>(
-                    (int)state,
-                    new KeyValuePair<string, object?>("http.client.name", key.Client),
-                    new KeyValuePair<string, object?>("http.resilience.authority", key.Authority))
-                : new Measurement<int>(
-                    (int)state,
-                    new KeyValuePair<string, object?>("http.client.name", key.Client),
-                    new KeyValuePair<string, object?>("http.resilience.authority", key.Authority),
-                    new KeyValuePair<string, object?>("server.address", host),
-                    new KeyValuePair<string, object?>("server.port", port));
+            foreach ((CircuitState state, string name) in _states)
+            {
+                int value = state == current ? 1 : 0;
+                yield return host is null
+                    ? new Measurement<int>(
+                        value,
+                        new KeyValuePair<string, object?>("http_resilience.client.name", key.Client),
+                        new KeyValuePair<string, object?>("http_resilience.authority", key.Authority),
+                        new KeyValuePair<string, object?>("http_resilience.circuit_breaker.state", name))
+                    : new Measurement<int>(
+                        value,
+                        new KeyValuePair<string, object?>("http_resilience.client.name", key.Client),
+                        new KeyValuePair<string, object?>("http_resilience.authority", key.Authority),
+                        new KeyValuePair<string, object?>("http_resilience.circuit_breaker.state", name),
+                        new KeyValuePair<string, object?>("server.address", host),
+                        new KeyValuePair<string, object?>("server.port", port));
+            }
         }
+    }
+
+    /// <summary>
+    /// The breakers of every enabled client this package registered, from its live options. Computed once:
+    /// clients and options are fixed for the life of the container. A client whose options fail validation has
+    /// no pipeline, so it is skipped rather than failing the collection.
+    /// </summary>
+    private CircuitKey[] KnownBreakers()
+    {
+        if (_registration is null || _options is null)
+        {
+            return [];
+        }
+
+        var keys = new List<CircuitKey>();
+        foreach (RegisteredClient client in _registration.RegisteredClients)
+        {
+            HttpResilienceOptions options;
+            try
+            {
+                options = _options.Get(client.Name);
+            }
+            catch (OptionsValidationException)
+            {
+                continue;
+            }
+
+            if (options.Enabled)
+            {
+                keys.AddRange(PipelineKeySelector.BreakerKeys(options, client.Kind)
+                    .Select(authority => new CircuitKey(client.Name, authority)));
+            }
+        }
+
+        return [.. keys];
     }
 
     /// <summary>
     /// Splits a pipeline key back into its host and port, or reports neither.
     /// </summary>
-    /// <remarks>
-    /// The shared key (<see cref="PipelineKeySelector.SharedKey"/>) names no destination, and neither does
-    /// any future key that is not an authority, so those series carry the two tags' absence rather than a
-    /// placeholder value -- an invented <c>server.address</c> would be worse than a missing one. Memoised
-    /// because the key set is bounded by configuration and this runs once per key per collection.
-    /// </remarks>
     private static (string? Host, int? Port) ParseAuthority(string authority) =>
         Uri.TryCreate(authority, UriKind.Absolute, out Uri? uri) && !string.IsNullOrEmpty(uri.Host)
             ? (uri.Host, uri.Port)
@@ -159,19 +184,40 @@ internal sealed class HttpResilienceMetrics
 
     private IEnumerable<Measurement<long>> ObserveLimiters(Func<RateLimiterStatistics, long> select)
     {
-        foreach (((string Client, LimiterKind Kind) key, RateLimiter limiter) in _limiters)
+        foreach (((string Client, LimiterKind Kind, string? Authority) key, RateLimiter limiter) in _limiters)
         {
-            if (TryReadStatistics(key, limiter) is { } statistics)
+            if (TryReadStatistics(key, limiter) is not { } statistics)
+            {
+                continue;
+            }
+
+            if (key.Authority is null)
             {
                 yield return new Measurement<long>(
                     select(statistics),
-                    new KeyValuePair<string, object?>("http.client.name", key.Client),
-                    new KeyValuePair<string, object?>("http.resilience.limiter.kind", KindName(key.Kind)));
+                    new KeyValuePair<string, object?>("http_resilience.client.name", key.Client),
+                    new KeyValuePair<string, object?>("http_resilience.limiter.kind", KindName(key.Kind)));
+                continue;
             }
+
+            // The breaker gauge's destination tags too, so the two join on server.address; none for "shared".
+            (string? host, int? port) = _authorities.GetOrAdd(key.Authority, ParseAuthority);
+            yield return host is null
+                ? new Measurement<long>(
+                    select(statistics),
+                    new KeyValuePair<string, object?>("http_resilience.client.name", key.Client),
+                    new KeyValuePair<string, object?>("http_resilience.limiter.kind", KindName(key.Kind)),
+                    new KeyValuePair<string, object?>("http_resilience.authority", key.Authority))
+                : new Measurement<long>(
+                    select(statistics),
+                    new KeyValuePair<string, object?>("http_resilience.client.name", key.Client),
+                    new KeyValuePair<string, object?>("http_resilience.limiter.kind", KindName(key.Kind)),
+                    new KeyValuePair<string, object?>("http_resilience.authority", key.Authority),
+                    new KeyValuePair<string, object?>("server.address", host),
+                    new KeyValuePair<string, object?>("server.port", port));
         }
     }
 
-    // Indexed by (int)LimiterKind to avoid the allocation and boxing of Enum.ToString on a collection path.
     private static string KindName(LimiterKind kind)
     {
         int index = (int)kind;
@@ -181,20 +227,7 @@ internal sealed class HttpResilienceMetrics
     /// <summary>
     /// Reads a limiter's statistics, treating a disposed limiter as one with nothing to report.
     /// </summary>
-    /// <remarks>
-    /// This type holds a strong reference to every limiter it publishes, and both are container singletons
-    /// disposed in reverse order of creation -- an order neither controls. The limiter is created after this
-    /// type (the pipeline configurator resolves the metrics first), so it is disposed first, and a collection
-    /// landing in that window called <c>GetStatistics()</c> on a disposed limiter and threw. An exception out
-    /// of an observable-instrument callback is not absorbed: it reaches whichever <c>MeterListener</c> is
-    /// collecting, which for a real deployment means an instrument failure logged by the OpenTelemetry reader
-    /// during shutdown -- the moment an operator is least able to tell a teardown artefact from a fault.
-    /// <para>
-    /// The entry is dropped as well as skipped, so a process that keeps scraping does not re-enter the
-    /// catch on every collection.
-    /// </para>
-    /// </remarks>
-    private RateLimiterStatistics? TryReadStatistics((string Client, LimiterKind Kind) key, RateLimiter limiter)
+    private RateLimiterStatistics? TryReadStatistics((string Client, LimiterKind Kind, string? Authority) key, RateLimiter limiter)
     {
         try
         {

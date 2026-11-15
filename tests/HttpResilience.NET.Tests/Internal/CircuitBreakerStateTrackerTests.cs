@@ -1,6 +1,5 @@
 using HttpResilience.NET.Internal;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace HttpResilience.NET.Tests.Internal;
 
@@ -10,7 +9,7 @@ namespace HttpResilience.NET.Tests.Internal;
 /// </summary>
 public class CircuitBreakerStateTrackerTests
 {
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ConcurrentReports_AreAllVisible_AndNoneAreLost()
     {
         var tracker = new CircuitBreakerStateTracker();
@@ -33,10 +32,10 @@ public class CircuitBreakerStateTrackerTests
     }
 
     /// <summary>
-    /// Enumeration runs while a health check is being answered, so it must not throw when a concurrent
+    /// Enumeration runs while the gauge is being collected, so it must not throw when a concurrent
     /// transition writes a new key.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task EnumerationDuringConcurrentWrites_DoesNotThrow()
     {
         var tracker = new CircuitBreakerStateTracker();
@@ -48,7 +47,7 @@ public class CircuitBreakerStateTrackerTests
             {
                 tracker.Report(new CircuitKey("client", $"https://h{i % 64}.test"), CircuitState.Open);
             }
-        });
+        }, TestContext.Current.CancellationToken);
 
         while (!stop.IsCancellationRequested)
         {
@@ -62,23 +61,15 @@ public class CircuitBreakerStateTrackerTests
     }
 
     /// <summary>
-    /// The two <i>readers</i> of this dictionary, driven concurrently with the writes: the metrics gauge and
-    /// the health check.
+    /// The gauge reads this dictionary concurrently with the writes.
     /// </summary>
     /// <remarks>
-    /// The two tests above cover the tracker itself. Neither covers its readers, and the gauge is the one with
-    /// state of its own -- <c>HttpResilienceMetrics</c> keeps an authority-to-host parse cache that it mutates
-    /// from inside the observation callback while enumerating the tracker. A collection lands whenever the
-    /// metrics backend scrapes, which is exactly when breakers are transitioning, and neither the gauge nor
-    /// the health check may throw out of that.
-    /// <para>
-    /// A gauge callback that throws is not a loud failure: <c>MeterListener.RecordObservableInstruments</c>
-    /// surfaces it to the collector, which for most exporters means the whole scrape is dropped -- so the
-    /// symptom is a dashboard that goes blank during an incident, which is when it is needed.
-    /// </para>
+    /// <c>HttpResilienceMetrics</c> mutates an authority-to-host cache inside the observation callback while
+    /// enumerating the tracker, and scrapes coincide with transitions. A throwing gauge callback typically drops
+    /// the whole scrape, so it must not throw.
     /// </remarks>
-    [Fact]
-    public async Task GaugeAndHealthCheck_AreReadableWhileTransitionsLand()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task TheGauge_IsReadableWhileTransitionsLand()
     {
         var services = new ServiceCollection();
         services.AddMetrics();
@@ -88,7 +79,6 @@ public class CircuitBreakerStateTrackerTests
 
         var tracker = provider.GetRequiredService<CircuitBreakerStateTracker>();
         _ = provider.GetRequiredService<HttpResilienceMetrics>();
-        var check = new HttpResilienceHealthCheck(tracker);
 
         using var stop = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
         using var collector = new GaugeCollector(provider);
@@ -101,13 +91,12 @@ public class CircuitBreakerStateTrackerTests
                 // New authorities keep arriving, so the gauge's parse cache is written during collection too.
                 tracker.Report(new CircuitKey("client", $"https://h{i}.test"), states[i % states.Length]);
             }
-        });
+        }, TestContext.Current.CancellationToken);
 
         int collections = 0;
         while (!stop.IsCancellationRequested)
         {
-            _ = collector.Collect("http.resilience.circuit_breaker.state");
-            _ = await check.CheckHealthAsync(new HealthCheckContext(), CancellationToken.None);
+            _ = collector.Collect("http_resilience.circuit_breaker.state");
             collections++;
         }
 

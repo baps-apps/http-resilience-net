@@ -1,5 +1,4 @@
 using System.Net;
-using HttpResilience.NET.Options;
 using HttpResilience.NET.Tests.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -8,27 +7,17 @@ using Microsoft.Extensions.Http.Resilience;
 namespace HttpResilience.NET.Tests.Internal;
 
 /// <summary>
-/// What this package allocates per request on top of the platform handler it configures, as a number a test
-/// can fail on rather than a claim in a document.
+/// What this package allocates per request on top of the platform handler it configures.
 /// </summary>
 /// <remarks>
-/// The documents said "identical allocation" for one revision longer than it was true. The fourth review made
-/// <see cref="HttpClient.Timeout"/> finite so that a trickled response body could not hold a connection open
-/// forever, and a finite timeout is what makes <see cref="HttpClient"/> build a
-/// <see cref="CancellationTokenSource"/> per request. That is a real cost, worth paying, and worth knowing
-/// about -- so it is pinned here, where changing it fails a test instead of quietly ageing a benchmark file.
-/// <para>
-/// Measured with <see cref="GC.GetAllocatedBytesForCurrentThread"/> rather than BenchmarkDotNet, so it runs in
-/// the ordinary test suite. The bound is deliberately loose: this is a regression guard against a new
-/// per-request allocation, not a micro-benchmark.
-/// </para>
+/// The finite <see cref="HttpClient.Timeout"/> makes <see cref="HttpClient"/> build one
+/// <see cref="CancellationTokenSource"/> per request; that cost is pinned here. Measured with
+/// <see cref="GC.GetAllocatedBytesForCurrentThread"/> so it runs in the ordinary suite. The bound is a guard
+/// against new per-request allocations, not a micro-benchmark.
 /// </remarks>
 /// <summary>
-/// Runs alone. <see cref="GC.GetAllocatedBytesForCurrentThread"/> is per thread, and an <c>await</c> resumes
-/// on a pool thread that a concurrently running test may also be using -- so in a parallel suite the counter
-/// picks up someone else's allocations. Measured in isolation the two numbers below are exact and repeatable
-/// (304 and 0, six runs out of six); measured alongside everything else they were flaky about one run in five.
-/// Serialising the collection is the fix, rather than widening the bounds until the flake hides.
+/// Runs alone: <see cref="GC.GetAllocatedBytesForCurrentThread"/> is per thread, and an <c>await</c> can
+/// resume on a pool thread another test is using.
 /// </summary>
 [CollectionDefinition(nameof(PipelineAllocationTests), DisableParallelization = true)]
 [Collection(nameof(PipelineAllocationTests))]
@@ -41,13 +30,8 @@ public class PipelineAllocationTests
     /// The headroom is one <c>CancellationTokenSource</c> and its registration, and no more.
     /// </summary>
     /// <remarks>
-    /// Release only, and skipped rather than widened in Debug. The ceiling is a statement about what ships:
-    /// Debug codegen adds display classes and unelided async state machines to the two arms unequally, which
-    /// measured 400 B against a 384 B ceiling -- a number that says nothing about the shipped assembly and
-    /// everything about the JIT's debug mode. Widening the ceiling to cover both would raise it past the
-    /// second object it exists to exclude, so the assertion is made where it means something and the CI
-    /// pipeline runs both configurations. The companion test below is a *difference between two
-    /// package-configured clients*, so Debug overhead cancels and it runs everywhere.
+    /// Release only: Debug codegen adds display classes and async state machines unequally to the two arms.
+    /// The companion test below compares two package-configured clients, so Debug overhead cancels.
     /// </remarks>
     [ReleaseOnlyFact]
     public async Task StandardPipeline_CostsOneCancellationTokenSourceOverThePlatformHandler()
@@ -57,18 +41,16 @@ public class PipelineAllocationTests
 
         long overhead = (package - platform) / Iterations;
 
-        // Exactly 304 B -- one CancellationTokenSource, its timer and its registration -- agreeing with the
-        // BenchmarkDotNet delta (1,336 B against the platform handler's 1,032 B) to the byte. The ceiling
-        // leaves headroom for that one object and nothing like a second.
+        // Exactly 304 B (one CancellationTokenSource, its timer and registration), matching the
+        // BenchmarkDotNet delta. The ceiling leaves room for that one object only.
         Assert.InRange(overhead, 0, 384);
     }
 
     /// <summary>
-    /// Per-authority selection is the one piece of per-request work this package does that is entirely its
-    /// own, and <c>AuthorityIndex</c> exists so that it costs nothing. Pinned separately from the
-    /// allocation-free unit test on the selector, because a caller could still allocate around it.
+    /// Per-authority selection is this package's own per-request work, and must allocate nothing. Pinned
+    /// separately from the selector's unit test because a caller could still allocate around it.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task PerAuthoritySelection_AddsNoAllocationOverASinglePipeline()
     {
         long single = await MeasureAsync(WithHttpResilience);
@@ -81,6 +63,51 @@ public class PipelineAllocationTests
         long overhead = (perAuthority - single) / Iterations;
 
         Assert.InRange(overhead, -64, 64);
+    }
+
+    /// <summary>
+    /// <c>CreateClient</c> runs every <c>ConfigureHttpClient</c> action on each call, and a typed client is often
+    /// created per request, so this package must add nothing to it beyond applying <c>Timeout:Client</c>.
+    /// </summary>
+    /// <remarks>
+    /// Fails if per-call state comes back into the client actions, such as snapshotting
+    /// <see cref="HttpClient.Timeout"/> per handler group (171 B per call when it was there). Covers a disabled
+    /// client too, whose handler groups are all inactive. Synchronous, so the per-thread counter is exact.
+    /// </remarks>
+    [ReleaseOnlyFact]
+    public async Task CreateClient_AllocatesNothingOverTheBareFactory()
+    {
+        long bare = await MeasureCreateClientAsync(static _ => { });
+        long enabled = await MeasureCreateClientAsync(services => WithHttpResilience(services));
+        long disabled = await MeasureCreateClientAsync(services =>
+            WithHttpResilience(services, static settings => settings.Set("Enabled", "false")));
+
+        Assert.InRange((enabled - bare) / Iterations, 0, 8);
+        Assert.InRange((disabled - bare) / Iterations, 0, 8);
+    }
+
+    private static async Task<long> MeasureCreateClientAsync(Action<IServiceCollection> register)
+    {
+        var services = new ServiceCollection();
+        register(services);
+        services.AddHttpClient("bench");
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
+
+        // Builds the handler chain and every options instance before measuring.
+        for (int i = 0; i < 20; i++)
+        {
+            factory.CreateClient("bench").Dispose();
+        }
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < Iterations; i++)
+        {
+            factory.CreateClient("bench").Dispose();
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
     private static void MicrosoftOnly(IServiceCollection services) =>
@@ -102,7 +129,7 @@ public class PipelineAllocationTests
             .Build();
 
         services.AddHttpResilience(configuration);
-        services.AddHttpClient("bench").AddHttpResilience(string.Empty);
+        services.AddHttpClient("bench").AddHttpResilienceHandler();
     }
 
     private static async Task<long> MeasureAsync(Action<IServiceCollection> register)

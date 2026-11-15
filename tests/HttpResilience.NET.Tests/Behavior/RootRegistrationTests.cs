@@ -5,15 +5,12 @@ using Microsoft.Extensions.DependencyInjection;
 namespace HttpResilience.NET.Tests.Behavior;
 
 /// <summary>
-/// The root registration holds the ledger of clients that already have a pipeline, so calling it twice used
-/// to disarm the guard that stops two pipelines nesting on one client.
+/// The root registration holds the ledger of clients that already have a pipeline, so it must be idempotent
+/// rather than replace that ledger.
 /// </summary>
 /// <remarks>
-/// A shared registration extension calling <c>AddHttpResilience(configuration)</c> and an application calling
-/// it again is the ordinary shape for a platform package, and every other Microsoft registration extension is
-/// idempotent, so nothing about the second call looks dangerous at the call site. The measured consequence was
-/// nine origin calls for one logical GET: two nested pipelines of three attempts each, with nothing thrown and
-/// nothing logged.
+/// A shared extension and the application both calling <c>AddHttpResilience(configuration)</c> is normal.
+/// Replacing the ledger would let a client nest two pipelines: nine origin calls for one GET.
 /// </remarks>
 public class RootRegistrationTests
 {
@@ -23,7 +20,7 @@ public class RootRegistrationTests
     /// <summary>
     /// Fails if the root registration replaces the client ledger instead of keeping it.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RepeatedRootRegistration_KeepsTheDuplicateClientGuardArmed()
     {
         var services = new ServiceCollection();
@@ -31,14 +28,14 @@ public class RootRegistrationTests
 
         var origin = new RecordingHandler();
         services.AddHttpClient("orders")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => origin);
 
         // The shared platform extension adds it again, after the client is already configured.
         services.AddHttpResilience(Configuration(Settings.Enabled()));
 
         InvalidOperationException exception = Assert.Throws<InvalidOperationException>(
-            () => services.AddHttpClient("orders").AddHttpResilience());
+            () => services.AddHttpClient("orders").AddHttpResilienceHandler());
 
         Assert.Contains("already configured", exception.Message, StringComparison.Ordinal);
 
@@ -46,7 +43,7 @@ public class RootRegistrationTests
         await using ServiceProvider provider = services.BuildServiceProvider();
         await provider.GetRequiredService<IHttpClientFactory>()
             .CreateClient("orders")
-            .GetAsync("http://origin.test/x");
+            .GetAsync("http://origin.test/x", TestContext.Current.CancellationToken);
 
         Assert.Equal(3, origin.Count);
     }
@@ -55,11 +52,9 @@ public class RootRegistrationTests
     /// Fails if a second root registration silently changes which section later clients read.
     /// </summary>
     /// <remarks>
-    /// Clients registered before the second call were configured from the first section and clients after it
-    /// from the second, so the two disagreed with nothing to show it. Refusing is the only outcome that cannot
-    /// mislead.
+    /// Clients on either side of the second call would read different sections.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void RootRegistrationWithASecondSection_FailsAndNamesBothPaths()
     {
         IConfigurationRoot configuration = Configuration(Settings.Enabled());
@@ -78,7 +73,7 @@ public class RootRegistrationTests
     /// The idempotent path must not stop working: repeating the call with the same section is what a shared
     /// registration extension does, and it has to leave a usable container behind.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task RepeatedRootRegistration_WithTheSameSection_StillConfiguresClients()
     {
         IConfigurationRoot configuration = Configuration(Settings.Enabled());
@@ -89,13 +84,56 @@ public class RootRegistrationTests
 
         var origin = new RecordingHandler();
         services.AddHttpClient("orders")
-            .AddHttpResilience()
+            .AddHttpResilienceHandler()
             .ConfigurePrimaryHttpMessageHandler(() => origin);
 
         await using ServiceProvider provider = services.BuildServiceProvider();
         await provider.GetRequiredService<IHttpClientFactory>()
             .CreateClient("orders")
-            .GetAsync("http://origin.test/x");
+            .GetAsync("http://origin.test/x", TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, origin.Count);
+    }
+
+    /// <summary>
+    /// The same path from a <i>different</i> configuration is a different section. The first call's values would win
+    /// silently, so a repeat whose values differ fails when client options are built, naming a differing key.
+    /// </summary>
+    /// <remarks>Fails if the repeat is compared by path alone.</remarks>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task RepeatedRootRegistration_FromADifferentConfiguration_WithDifferentValues_Fails()
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+        services.AddHttpResilience(Configuration(Settings.Enabled().Set("Retry:MaxRetries", "5")));
+        services.AddHttpClient("orders").AddHttpResilienceHandler()
+            .ConfigurePrimaryHttpMessageHandler(() => new RecordingHandler());
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+
+        InvalidOperationException exception = Assert.Throws<InvalidOperationException>(
+            () => provider.GetRequiredService<IHttpClientFactory>().CreateClient("orders"));
+
+        Assert.Contains("'HttpResilience'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("HttpResilience:Retry:MaxRetries", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A different configuration object with the same values changes nothing, so it is accepted.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task RepeatedRootRegistration_FromADifferentConfiguration_WithTheSameValues_IsAccepted()
+    {
+        var services = new ServiceCollection();
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+        services.AddHttpResilience(Configuration(Settings.Enabled()));
+        var origin = new RecordingHandler();
+        services.AddHttpClient("orders").AddHttpResilienceHandler().ConfigurePrimaryHttpMessageHandler(() => origin);
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        await provider.GetRequiredService<IHttpClientFactory>()
+            .CreateClient("orders")
+            .GetAsync("http://origin.test/x", TestContext.Current.CancellationToken);
 
         Assert.Equal(3, origin.Count);
     }

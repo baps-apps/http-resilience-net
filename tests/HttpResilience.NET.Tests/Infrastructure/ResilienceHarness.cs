@@ -1,7 +1,7 @@
 using System.Net;
-using HttpResilience.NET.Options;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace HttpResilience.NET.Tests.Infrastructure;
 
@@ -9,12 +9,14 @@ namespace HttpResilience.NET.Tests.Infrastructure;
 /// Records every request that reaches the primary handler.
 /// </summary>
 /// <remarks>
-/// Behavioural assertions here are about how many times the origin was called and with what, which is exactly
-/// what distinguishes a correctly ordered pipeline from an inverted one. A stub handler gives an exact count
-/// with no timing dependency, so it is preferred over a test server for everything but real HTTP semantics.
+/// Origin call count is what distinguishes a correctly ordered pipeline from an inverted one. Prefer this over
+/// a test server except where real HTTP semantics matter.
 /// </remarks>
 internal sealed class RecordingHandler : HttpMessageHandler
 {
+    private static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(10);
+
+    private readonly SemaphoreSlim _arrived = new(0);
     private readonly Func<HttpRequestMessage, int, CancellationToken, Task<HttpResponseMessage>> _respond;
     private readonly Lock _gate = new();
     private int _count;
@@ -31,6 +33,26 @@ internal sealed class RecordingHandler : HttpMessageHandler
 
     /// <summary>Number of requests that reached the origin.</summary>
     public int Count => Volatile.Read(ref _count);
+
+    /// <summary>
+    /// Completes once at least <paramref name="count"/> requests have reached the origin. Fails after ten
+    /// seconds rather than hanging the run.
+    /// </summary>
+    public async Task WaitForCountAsync(int count)
+    {
+        using var timeout = new CancellationTokenSource(WaitLimit);
+        while (Count < count)
+        {
+            try
+            {
+                await _arrived.WaitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Assert.Fail($"Expected {count} requests at the origin within {WaitLimit}, saw {Count}.");
+            }
+        }
+    }
 
     /// <summary>Highest number of requests observed in flight at the same time.</summary>
     public int MaxConcurrent => Volatile.Read(ref _maxConcurrent);
@@ -52,6 +74,8 @@ internal sealed class RecordingHandler : HttpMessageHandler
             Methods.Add(request.Method.Method);
         }
 
+        _arrived.Release();
+
         try
         {
             if (request.Content is not null)
@@ -70,6 +94,13 @@ internal sealed class RecordingHandler : HttpMessageHandler
             Interlocked.Decrement(ref _concurrent);
         }
     }
+
+    /// <summary>
+    /// The synchronous path <c>HttpClient.Send</c> takes. The base implementation throws
+    /// <see cref="NotSupportedException"/>, which would let a test expecting a refusal pass for the wrong reason.
+    /// </summary>
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        SendAsync(request, cancellationToken).GetAwaiter().GetResult();
 }
 
 /// <summary>
@@ -99,11 +130,13 @@ internal sealed class ResilienceHarness : IAsyncDisposable
         string? sectionName = null,
         bool hedged = false,
         Action<HttpResilienceOptions>? configure = null,
-        Action<HttpResilienceOptions>? postConfigure = null)
+        Action<HttpResilienceOptions>? postConfigure = null,
+        TimeProvider? timeProvider = null,
+        ListLoggerProvider? logs = null)
     {
         origin ??= new RecordingHandler();
-        ServiceProvider provider =
-            BuildProvider(settings, origin, clientName, sectionName, hedged, configure, postConfigure);
+        ServiceProvider provider = BuildProvider(
+            settings, origin, clientName, sectionName, hedged, configure, postConfigure, timeProvider, logs);
         HttpClient client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(clientName);
         return new ResilienceHarness(provider, client, origin);
     }
@@ -116,28 +149,52 @@ internal sealed class ResilienceHarness : IAsyncDisposable
         string? sectionName = null,
         bool hedged = false,
         Action<HttpResilienceOptions>? configure = null,
-        Action<HttpResilienceOptions>? postConfigure = null)
+        Action<HttpResilienceOptions>? postConfigure = null,
+        TimeProvider? timeProvider = null,
+        ListLoggerProvider? logs = null)
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(settings.Build())
             .Build();
 
         var services = new ServiceCollection();
+        if (timeProvider is not null)
+        {
+            // Polly's timers (timeouts, hedging delay, retry backoff) read the container's TimeProvider.
+            services.AddSingleton(timeProvider);
+        }
+
+        if (logs is not null)
+        {
+            services.AddLogging(logging =>
+            {
+                logging.SetMinimumLevel(LogLevel.Trace);
+                logging.AddProvider(logs);
+            });
+        }
+
         services.AddHttpResilience(configuration);
-        services.AddHttpResilienceHealthChecks();
 
         IHttpClientBuilder builder = services.AddHttpClient(clientName);
-        _ = hedged
-            ? builder.AddHedgedHttpResilience(sectionName, configure)
-            : builder.AddHttpResilience(sectionName, configure);
+        // Every argument is required where it appears, so a wrapper picks the overload for what it has.
+        _ = (sectionName, configure, hedged) switch
+        {
+            (null, null, false) => builder.AddHttpResilienceHandler(),
+            (null, null, true) => builder.AddHttpResilienceHedgingHandler(),
+            ({ } section, null, false) => builder.AddHttpResilienceHandler(section),
+            ({ } section, null, true) => builder.AddHttpResilienceHedgingHandler(section),
+            (null, { } adjust, false) => builder.AddHttpResilienceHandler(adjust),
+            (null, { } adjust, true) => builder.AddHttpResilienceHedgingHandler(adjust),
+            ({ } section, { } adjust, false) => builder.AddHttpResilienceHandler(section, adjust),
+            ({ } section, { } adjust, true) => builder.AddHttpResilienceHedgingHandler(section, adjust)
+        };
 
         if (origin is not null)
         {
             builder.ConfigurePrimaryHttpMessageHandler(() => origin);
         }
 
-        // Registered after the client on purpose: this is the stage that used to be refused outright, and
-        // is now the one that has to reach the pipeline.
+        // Registered after the client, so it runs last.
         if (postConfigure is not null)
         {
             services.PostConfigure(clientName, postConfigure);
@@ -147,7 +204,10 @@ internal sealed class ResilienceHarness : IAsyncDisposable
     }
 
     public Task<HttpResponseMessage> SendAsync(HttpMethod method, string url = "http://origin.test/x", HttpContent? content = null, CancellationToken cancellationToken = default) =>
-        Client.SendAsync(new HttpRequestMessage(method, url) { Content = content }, cancellationToken);
+        Client.SendAsync(
+            new HttpRequestMessage(method, url) { Content = content },
+            // The test's token by default, so a test's timeout also cancels the request it abandoned.
+            cancellationToken == default ? TestContext.Current.CancellationToken : cancellationToken);
 
     public Task<HttpResponseMessage> GetAsync(string url = "http://origin.test/x", CancellationToken cancellationToken = default) =>
         SendAsync(HttpMethod.Get, url, cancellationToken: cancellationToken);
@@ -181,9 +241,7 @@ internal sealed class Settings
     /// the authorities a hedged client may call have to be listed.
     /// </summary>
     /// <remarks>
-    /// Root-level only. This carried a <c>Clients:Search</c> section as well until
-    /// <c>UnusedClientSectionValidator</c> pointed out that no test registers a client called Search -- the
-    /// harness names its client 'test' -- so those keys had never been read by anything.
+    /// Root-level only: the harness client is named 'test', so a client section would be unused.
     /// </remarks>
     public static Settings Hedged() => Enabled()
         .Set("PipelineSelection:Authorities:0", "http://origin.test");

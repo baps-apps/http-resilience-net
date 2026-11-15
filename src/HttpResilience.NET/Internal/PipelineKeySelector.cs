@@ -1,15 +1,10 @@
 using System.Globalization;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Internal;
 
 /// <summary>
 /// Maps a request to the key of the resilience pipeline that should handle it.
 /// </summary>
-/// <remarks>
-/// The set of keys is fixed by configuration, so no amount of request traffic can create additional
-/// pipelines. Anything outside the configured allow-list shares <see cref="SharedKey"/>.
-/// </remarks>
 internal static class PipelineKeySelector
 {
     /// <summary>The key shared by every authority that is not individually allow-listed.</summary>
@@ -19,7 +14,7 @@ internal static class PipelineKeySelector
     /// Builds the selector delegate for <c>SelectPipelineBy</c>. Returns a bounded set of keys, and
     /// allocates nothing per request.
     /// </summary>
-    public static Func<HttpRequestMessage, string> Create(PipelineSelectionOptions selection)
+    public static Func<HttpRequestMessage, string> Create(HttpResiliencePipelineSelectionOptions selection)
     {
         AuthorityIndex index = AuthorityIndex.Create(selection);
         if (index.Count == 0)
@@ -50,25 +45,10 @@ internal static class PipelineKeySelector
     /// <summary>
     /// Builds the key function used to label circuit breaker state, for the pipeline this client actually uses.
     /// </summary>
-    /// <remarks>
-    /// The key must identify one live circuit breaker, because the tracker is a dictionary and a coarser key
-    /// lets the last transition to fire overwrite the others -- one host recovering would mask another still
-    /// open. How many breakers exist differs by pipeline:
-    /// <list type="bullet">
-    /// <item><description>
-    /// The standard handler runs one breaker per pipeline, so the key is per authority only under
-    /// <see cref="PipelineSelectionMode.ByAuthority"/> and shared otherwise.
-    /// </description></item>
-    /// <item><description>
-    /// The hedging handler keeps a breaker per endpoint whatever the selection mode, so the key is always per
-    /// authority. The allow-list <c>AddHedgedHttpResilience</c> requires is what keeps that set bounded.
-    /// </description></item>
-    /// </list>
-    /// </remarks>
     public static Func<HttpRequestMessage?, string> CreateForTracking(HttpResilienceOptions options, PipelineKind kind)
     {
         bool perAuthority = kind is PipelineKind.Hedging ||
-            options.PipelineSelection.Mode is PipelineSelectionMode.ByAuthority;
+            options.PipelineSelection.Mode is HttpResiliencePipelineSelectionMode.ByAuthority;
 
         if (!perAuthority)
         {
@@ -77,6 +57,25 @@ internal static class PipelineKeySelector
 
         Func<HttpRequestMessage, string> selector = Create(options.PipelineSelection);
         return request => request is null ? SharedKey : selector(request);
+    }
+
+    /// <summary>
+    /// Every circuit breaker key a client can have: one per listed authority for a hedged client, plus the
+    /// shared one for a standard <c>ByAuthority</c> client (unlisted authorities share it), or just the shared
+    /// one. Bounded by the allow-list, like the pipelines themselves.
+    /// </summary>
+    public static IEnumerable<string> BreakerKeys(HttpResilienceOptions options, PipelineKind kind)
+    {
+        bool perAuthority = kind is PipelineKind.Hedging ||
+            options.PipelineSelection.Mode is HttpResiliencePipelineSelectionMode.ByAuthority;
+
+        if (!perAuthority)
+        {
+            return [SharedKey];
+        }
+
+        IEnumerable<string> listed = AuthorityIndex.Create(options.PipelineSelection).Keys;
+        return kind is PipelineKind.Hedging ? listed : listed.Append(SharedKey);
     }
 
     public static string BuildAuthority(string scheme, string host, int port, bool isDefaultPort) =>

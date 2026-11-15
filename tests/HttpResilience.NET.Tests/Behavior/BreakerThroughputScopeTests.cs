@@ -26,7 +26,7 @@ public class BreakerThroughputScopeTests
     /// Fails if the breaker ever moves outside the retry loop, which would make one logical request one
     /// observation and leave the circuit closed.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task MinimumThroughput_CountsAttempts_NotLogicalRequests()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -37,17 +37,17 @@ public class BreakerThroughputScopeTests
                 .Set("CircuitBreaker:SamplingDuration", "00:00:30"));
 
         // One caller request. Three attempts reach the origin, and all three fail.
-        (await harness.GetAsync()).Dispose();
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
 
         Assert.Equal(3, harness.Origin.Count);
-        Assert.NotEmpty(HealthState.NotClosed(harness.Services));
+        Assert.NotEmpty(BreakerState.NotClosed(harness.Services));
     }
 
     /// <summary>
     /// The control: the same single request with retries off is one observation, which is below the same
     /// threshold, so the circuit stays closed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task OneAttempt_DoesNotReachAThreeAttemptThreshold()
     {
         await using ResilienceHarness harness = ResilienceHarness.Create(
@@ -57,9 +57,9 @@ public class BreakerThroughputScopeTests
                 .Set("CircuitBreaker:FailureRatio", "0.1")
                 .Set("CircuitBreaker:SamplingDuration", "00:00:30"));
 
-        (await harness.GetAsync()).Dispose();
+        (await harness.GetAsync(cancellationToken: TestContext.Current.CancellationToken)).Dispose();
 
         Assert.Equal(1, harness.Origin.Count);
-        Assert.Empty(HealthState.NotClosed(harness.Services));
+        Assert.Empty(BreakerState.NotClosed(harness.Services));
     }
 }

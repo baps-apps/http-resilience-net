@@ -1,33 +1,23 @@
+using HttpResilience.NET.Internal;
 using HttpResilience.NET.Tests.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace HttpResilience.NET.Tests.Behavior;
 
 /// <summary>
-/// The client startup probe creates every client this package configured, once, at host start, so that a
-/// failure only reachable through handler construction fails the deployment instead of the first request
-/// that happens to use that client.
+/// The client startup probe creates every client this package configured, once, at host start, so a failure
+/// reachable only through handler construction fails the deployment instead of a later request.
 /// </summary>
 /// <remarks>
-/// The failure it is for: <c>Connection:Enabled</c> on a client whose primary handler is not a
-/// <c>SocketsHttpHandler</c>. That is a DI fact, not an options fact, so <c>ValidateOnStart</c> cannot see it
-/// -- the handler chain is not built until <c>CreateClient</c>. A client used on a rare code path therefore
-/// threw hours after the deploy.
-/// <para>
-/// <b>On by default.</b> It was opt-in until the fourth review, on the reasoning that eagerly constructing
-/// every handler chain has a cost and is wrong for a process that registers clients it may never use. That
-/// reasoning is weak for a client which has explicitly opted into a resilience pipeline -- registering one
-/// is the statement of intent to use it -- and it left a control that a fleet of fifty services reaches only
-/// by each of them remembering a checklist item. Opting out is a configuration key, so it stays available
-/// during an incident without a redeploy.
-/// </para>
+/// Example: <c>Connection:Enabled</c> on a client whose primary handler is not a <c>SocketsHttpHandler</c>. That
+/// is a DI fact, so <c>ValidateOnStart</c> cannot see it. On by default; opting out is a configuration key.
 /// </remarks>
 public class ClientStartupProbeTests
 {
     private static ServiceProvider Build(
-        bool explicitCall = false,
         string? validateClientsOnStart = null,
         Action<IHttpClientBuilder>? afterRegistration = null)
     {
@@ -47,12 +37,8 @@ public class ClientStartupProbeTests
 
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
-        if (explicitCall)
-        {
-            services.ValidateHttpResilienceClientsOnStart();
-        }
 
-        IHttpClientBuilder builder = services.AddHttpClient("test").AddHttpResilience();
+        IHttpClientBuilder builder = services.AddHttpClient("test").AddHttpResilienceHandler();
         afterRegistration?.Invoke(builder);
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -73,12 +59,9 @@ public class ClientStartupProbeTests
     /// The probe is registered by <c>AddHttpResilience</c> itself, with nothing else asked for.
     /// </summary>
     /// <remarks>
-    /// Production change that would make this fail: removing the registration from
-    /// <c>AddHttpResilience</c> and returning it to <c>ValidateHttpResilienceClientsOnStart</c> alone. The
-    /// container would then start cleanly and the failure would wait for traffic, which is the state this
-    /// change exists to end.
+    /// Fails if the registration is removed from <c>AddHttpResilience</c>.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TheProbeRuns_WithoutBeingAskedFor()
     {
         await using ServiceProvider provider = Build(afterRegistration: UnconfigurableHandler());
@@ -95,10 +78,10 @@ public class ClientStartupProbeTests
     /// The opt-out key turns it off, and the failure goes back to waiting for the first request.
     /// </summary>
     /// <remarks>
-    /// Root-only and read from the raw section, like <c>AllowUnusedClientSections</c>: it is a statement
-    /// about the process, and binding it per client would make it look inheritable when it is not.
+    /// Root-only and read from the raw section, like <c>AllowUnusedClientSections</c>, because it applies to
+    /// the process, not a client.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task TheOptOutKey_TurnsTheProbeOff()
     {
         await using ServiceProvider provider = Build(
@@ -115,48 +98,25 @@ public class ClientStartupProbeTests
     /// A value that is neither true nor false fails, rather than being read as one of them.
     /// </summary>
     /// <remarks>
-    /// The same rule <c>AllowUnusedClientSections</c> follows, for the same reason: an operator who wrote
-    /// "yes" would otherwise see the probe run anyway, on a key they believed they had turned off.
+    /// Same rule as <c>AllowUnusedClientSections</c>: "yes" must not be read as a value.
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task AMalformedOptOutValue_FailsAtStart()
     {
         await using ServiceProvider provider = Build(validateClientsOnStart: "yes");
 
-        InvalidOperationException exception =
-            await Assert.ThrowsAsync<InvalidOperationException>(() => StartAsync(provider));
+        // A validation failure, raised the moment the switch is read.
+        OptionsValidationException exception =
+            await Assert.ThrowsAsync<OptionsValidationException>(() => StartAsync(provider));
 
         Assert.Contains("ValidateClientsOnStart", exception.Message, StringComparison.Ordinal);
         Assert.Contains("yes", exception.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// The opt-out key set to false while the code also calls
-    /// <c>ValidateHttpResilienceClientsOnStart</c> fails, naming both.
+    /// A container whose clients are all constructible must start.
     /// </summary>
-    /// <remarks>
-    /// Two written statements about the same thing, one of which is not in force -- the class of silent
-    /// contradiction this package fails startup for everywhere else. The direction that matters is this one:
-    /// the operator reaching for the key during an incident is the person who most needs to be told that a
-    /// line of code is overriding them.
-    /// </remarks>
-    [Fact]
-    public async Task TheOptOutKey_ContradictingAnExplicitCall_FailsAtStart()
-    {
-        await using ServiceProvider provider = Build(explicitCall: true, validateClientsOnStart: "false");
-
-        InvalidOperationException exception =
-            await Assert.ThrowsAsync<InvalidOperationException>(() => StartAsync(provider));
-
-        Assert.Contains("ValidateClientsOnStart", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("ValidateHttpResilienceClientsOnStart", exception.Message, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// A container whose clients are all constructible must start, and the probe must not be the thing that
-    /// makes a healthy service fail to boot.
-    /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task AWellFormedContainer_StartsCleanly()
     {
         await using ServiceProvider provider = Build();
@@ -165,15 +125,10 @@ public class ClientStartupProbeTests
     }
 
     /// <summary>
-    /// The now-redundant explicit call still works and still creates every client exactly once.
+    /// A shared library and the application may both call <c>AddHttpResilience</c>; there is still one probe.
     /// </summary>
-    /// <remarks>
-    /// It stays in the public surface because removing it would break every consumer that followed the
-    /// production checklist. Calling it twice -- a shared platform extension and the application -- must
-    /// not register a second probe either.
-    /// </remarks>
-    [Fact]
-    public async Task TheExplicitCallIsStillSupported_AndIdempotent()
+    [Fact(Timeout = TestTimeouts.Default)]
+    public async Task RegisteringTheRootTwice_RegistersOneProbe()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(Settings.Enabled().Build())
@@ -181,44 +136,35 @@ public class ClientStartupProbeTests
 
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
-        services.ValidateHttpResilienceClientsOnStart();
-        services.ValidateHttpResilienceClientsOnStart();
-        services.AddHttpClient("test").AddHttpResilience();
+        services.AddHttpResilience(configuration);
+        services.AddHttpClient("test").AddHttpResilienceHandler();
 
         await using ServiceProvider provider = services.BuildServiceProvider(validateScopes: true);
 
-        Assert.Single(provider.GetServices<IHostedService>());
+        Assert.Single(provider.GetServices<IHostedService>().OfType<ClientStartupProbe>());
         await StartAsync(provider);
     }
 
     /// <summary>
     /// Registering the schema and never calling the opt-in registers exactly one probe, not two.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public void TheDefaultRegistration_AddsExactlyOneProbe()
     {
         using ServiceProvider provider = Build();
 
-        Assert.Single(provider.GetServices<IHostedService>());
+        Assert.Single(provider.GetServices<IHostedService>().OfType<ClientStartupProbe>());
     }
 
     /// <summary>
     /// Registering the schema and no HTTP clients at all must still start.
     /// </summary>
     /// <remarks>
-    /// A regression introduced by making the probe the default and caught here rather than in a service.
-    /// While the probe was opt-in it was only ever registered by someone who had clients; registered
-    /// unconditionally it is activated unconditionally, and <see cref="IHttpClientFactory"/> is not in the
-    /// container until something calls <c>AddHttpClient</c>. A shared platform extension calling
-    /// <c>AddHttpResilience</c> in a service with no outbound clients would have failed to start with
-    /// "Unable to resolve service for type 'System.Net.Http.IHttpClientFactory'" -- a message naming neither
-    /// this package nor anything the operator could act on.
-    /// <para>
-    /// Production change that would make this fail: removing the <c>AddHttpClient()</c> core registration
+    /// <see cref="IHttpClientFactory"/> is not in the container until something calls <c>AddHttpClient</c>,
+    /// so the probe must not require it. Fails if the <c>AddHttpClient()</c> core registration is removed
     /// from <c>AddHttpResilience</c>.
-    /// </para>
     /// </remarks>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task AContainerWithNoHttpClientsAtAll_StillStarts()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
@@ -234,11 +180,10 @@ public class ClientStartupProbeTests
     }
 
     /// <summary>
-    /// Only the clients this package configured. Creating an unrelated client would make the probe an
-    /// opinion about someone else's registration, and could fail a deployment over a handler this package
-    /// never touched.
+    /// Only the clients this package configured; an unrelated client's handler is not this package's
+    /// concern.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = TestTimeouts.Default)]
     public async Task ClientsThisPackageDidNotConfigure_AreNotCreated()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
@@ -247,7 +192,7 @@ public class ClientStartupProbeTests
 
         var services = new ServiceCollection();
         services.AddHttpResilience(configuration);
-        services.AddHttpClient("test").AddHttpResilience();
+        services.AddHttpClient("test").AddHttpResilienceHandler();
 
         // Not registered with this package, and deliberately unconstructible.
         services.AddHttpClient("someone-elses")

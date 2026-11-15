@@ -1,10 +1,10 @@
 using System.Diagnostics.Metrics;
 using System.Net;
 using System.Text;
-using HttpResilience.NET.Options;
+using HttpResilience.NET;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -12,33 +12,27 @@ using Microsoft.Extensions.Options;
 // Configuration and services
 // ---------------------------------------------------------------------------
 
-IConfigurationRoot configuration = new ConfigurationBuilder()
-    .AddJsonFile("appsettings.json", optional: false)
-    .AddEnvironmentVariables()
-    .Build();
+// The generic host, as in any real service (WebApplication.CreateBuilder works the same way). It reads
+// appsettings.json and environment variables, and its start runs what a bare ServiceProvider never would:
+// options validation, the startup client check and the startup notices. The content root is the output
+// folder so `dotnet run --project` finds appsettings.json from any working directory.
+HostApplicationBuilder builder = Host.CreateApplicationBuilder(
+    new HostApplicationBuilderSettings { Args = args, ContentRootPath = AppContext.BaseDirectory });
 
-var services = new ServiceCollection();
+builder.Logging.ClearProviders().AddSimpleConsole(options => options.TimestampFormat = "HH:mm:ss ");
 
-services.AddLogging(builder => builder.AddSimpleConsole(options => options.TimestampFormat = "HH:mm:ss "));
+IServiceCollection services = builder.Services;
 
-// One call registers the schema, validates it at startup, and makes the root section available to every
-// client registered below.
-services.AddHttpResilience(configuration);
-
-// That call also registers a hosted service which creates every client this package configured, once, at
-// host start -- so in a real application the primary-handler mismatch demonstrated by the 'Broken' client at
-// the end of this file fails the deployment rather than the first request that happens to reach it. Nothing
-// runs it here, because this sample builds a raw ServiceProvider rather than an IHost, which is what lets
-// the demonstration below show the failure rather than prevent it. Set
-// HttpResilience:ValidateClientsOnStart to false to opt a real service out of it.
+// One call registers the schema, validates it at host start, and makes the root section available to every
+// client registered below. It also registers the startup client check (creates every client once, so a
+// wiring mistake fails the deployment, not the first request; HttpResilience:ValidateClientsOnStart: false
+// opts out) and the startup notices, logged under HttpResilience.NET.Configuration.
+services.AddHttpResilience(builder.Configuration);
 
 // error.type on Polly's metrics. Register the meter itself with
 // metrics.AddMeter(HttpResilienceTelemetryExtensions.PollyMeterName) and .MeterName in a real app --
 // this call adds the error.type tag and registers no meter. See README.md, "Telemetry".
 services.AddHttpResilienceTelemetry();
-
-// Circuit breaker state as a dependency health check. Never wire this to a liveness or readiness probe.
-services.AddHttpResilienceHealthChecks();
 
 // A stub origin stands in for real dependencies so the sample runs offline. It is added as the innermost
 // delegating handler rather than as the primary handler: Connection:Enabled is on, and a client whose
@@ -48,41 +42,42 @@ services.AddSingleton<StubOrigin>();
 
 // Root defaults only.
 services.AddHttpClient("Default")
-    .AddHttpResilience()
+    .AddHttpResilienceHandler()
     .AddHttpMessageHandler(sp => new StubOriginHandler(sp.GetRequiredService<StubOrigin>()));
 
 // Overrides from HttpResilience:Clients:Orders -- the section name defaults to the client name, so it is
 // written once. Everything the section does not state is inherited from the root.
 services.AddHttpClient("Orders")
-    .AddHttpResilience()
+    .AddHttpResilienceHandler()
     .AddHttpMessageHandler(sp => new StubOriginHandler(sp.GetRequiredService<StubOrigin>()));
 
 // Retries POST. The decision is visible in configuration and reviewable in a diff, and the endpoint is
 // expected to deduplicate on an idempotency key.
 services.AddHttpClient("Payments")
-    .AddHttpResilience()
+    .AddHttpResilienceHandler()
     .AddHttpMessageHandler(sp => new StubOriginHandler(sp.GetRequiredService<StubOrigin>()));
 
 // Hedging is selected in code, never by a configuration value, because it multiplies outbound traffic. The
 // authorities it may call are listed in configuration, because the hedging handler keeps a breaker, a limiter
 // and a metric series per authority for the life of the process.
 services.AddHttpClient("Search")
-    .AddHedgedHttpResilience()
+    .AddHttpResilienceHedgingHandler()
     .AddHttpMessageHandler(sp => new StubOriginHandler(sp.GetRequiredService<StubOrigin>()));
 
 // One client, several hosts, isolated circuit breakers, bounded by an authority allow-list.
 services.AddHttpClient("Partner")
-    .AddHttpResilience()
+    .AddHttpResilienceHandler()
     .AddHttpMessageHandler(sp => new StubOriginHandler(sp.GetRequiredService<StubOrigin>()));
 
-await using ServiceProvider provider = services.BuildServiceProvider();
+using IHost host = builder.Build();
 
-// This is what the host does on startup: misconfiguration fails here, before any traffic is served.
-foreach (IStartupValidator validator in provider.GetServices<IStartupValidator>())
-{
-    validator.Validate();
-}
+// Misconfiguration fails here, before any traffic is served. A successful start logs, per client, the
+// startup notices: event 15 (effective settings), 11 (how much failure the breaker needs to open), 10 for
+// 'Payments' (POST may be sent twice), and 6 or 14 when a client is disabled or its retries outlast
+// Timeout:Total. A web application gets the same from app.Run().
+await host.StartAsync();
 
+IServiceProvider provider = host.Services;
 ILogger logger = provider.GetRequiredService<ILoggerFactory>().CreateLogger("Sample");
 IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
 StubOrigin origin = provider.GetRequiredService<StubOrigin>();
@@ -144,7 +139,7 @@ using (var meterListener = new MeterListener())
     meterListener.InstrumentPublished = (instrument, listener) =>
     {
         if (instrument.Meter.Name == HttpResilienceTelemetryExtensions.MeterName &&
-            instrument.Name == "http.resilience.limiter.available_permits")
+            instrument.Name == "http_resilience.limiter.available_permits")
         {
             listener.EnableMeasurementEvents(instrument);
         }
@@ -152,15 +147,14 @@ using (var meterListener = new MeterListener())
     meterListener.SetMeasurementEventCallback<long>((_, measurement, tags, _) =>
     {
         // One instrument reports every limiter a client owns, so the kind has to be matched as well as the
-        // client: this client has a rate limiter and, because that limiter took the platform's slot, a
-        // concurrency backstop in a handler of its own.
+        // client: this hedged client also reports its per-authority concurrency backstop, kind "backstop".
         bool isThisClient = false;
         bool isRateLimiter = false;
 
         foreach (KeyValuePair<string, object?> tag in tags)
         {
-            isThisClient |= tag.Key == "http.client.name" && (string?)tag.Value == "Search";
-            isRateLimiter |= tag.Key == "http.resilience.limiter.kind" && (string?)tag.Value == "rate";
+            isThisClient |= tag.Key == "http_resilience.client.name" && (string?)tag.Value == "Search";
+            isRateLimiter |= tag.Key == "http_resilience.limiter.kind" && (string?)tag.Value == "rate";
         }
 
         if (isThisClient && isRateLimiter)
@@ -173,48 +167,46 @@ using (var meterListener = new MeterListener())
 }
 
 logger.LogInformation(
-    "Search limiter has {Available} permit(s) available, read from http.resilience.limiter.available_permits (kind=rate). This is a process-local, per-client budget: the fleet-wide rate is replicas x clients x this number.",
+    "Search limiter has {Available} permit(s) available, read from http_resilience.limiter.available_permits (kind=rate). This is a process-local, per-client budget: the fleet-wide rate is replicas x clients x this number.",
     availablePermits);
 
 // ---------------------------------------------------------------------------
-// 6. Dependency health
-// ---------------------------------------------------------------------------
-
-HealthReport report = await provider.GetRequiredService<HealthCheckService>().CheckHealthAsync();
-logger.LogInformation("Dependency health: {Status}. Degraded here would mean a downstream is unhealthy, not this process.", report.Status);
-
-// ---------------------------------------------------------------------------
-// 7. Connection settings are owned, not merely requested
+// 6. Connection settings are owned, not merely requested
 // ---------------------------------------------------------------------------
 // Enabling Connection:Enabled disables IHttpClientFactory handler rotation, because
 // PooledConnectionLifetime is supposed to bound connection age instead. A primary handler that cannot
 // carry that setting would leave nothing recycling the pool or re-resolving DNS for the life of the
-// process. That is refused rather than accepted quietly:
+// process. That is refused rather than accepted quietly, and because the startup client check creates every
+// client, it is refused when the host starts: a second host with that mistake never starts.
 
-var broken = new ServiceCollection();
-broken.AddHttpResilience(configuration);
-broken.AddHttpClient("Broken")
-    .AddHttpResilience("Default")
+HostApplicationBuilder brokenBuilder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSettings());
+brokenBuilder.Configuration.AddInMemoryCollection(
+    new Dictionary<string, string?> { ["HttpResilience:Connection:Enabled"] = "true" });
+brokenBuilder.Services.AddHttpResilience(brokenBuilder.Configuration);
+brokenBuilder.Services.AddHttpClient("Broken")
+    .AddHttpResilienceHandler()
     .ConfigurePrimaryHttpMessageHandler(() => new StubPrimaryHandler());
 
-await using ServiceProvider brokenProvider = broken.BuildServiceProvider();
+using IHost brokenHost = brokenBuilder.Build();
 try
 {
-    _ = brokenProvider.GetRequiredService<IHttpClientFactory>().CreateClient("Broken");
-    logger.LogError("Expected the primary-handler guard to fire.");
+    await brokenHost.StartAsync();
+    logger.LogError("Expected the primary-handler guard to stop the host from starting.");
 }
 catch (InvalidOperationException expected)
 {
-    logger.LogInformation("Primary-handler guard: {Message}", expected.Message);
+    logger.LogInformation("Host start refused by the primary-handler guard: {Message}", expected.Message);
 }
 
 // The settings the guard protects, read back from the options the pipeline was built from:
-ConnectionOptions connection = provider
+HttpResilienceConnectionOptions connection = provider
     .GetRequiredService<IOptionsMonitor<HttpResilienceOptions>>().Get("Default").Connection;
 logger.LogInformation(
     "Default connection settings: PooledConnectionLifetime={Lifetime}, ConnectTimeout={ConnectTimeout}. " +
     "Factory handler rotation is disabled, so the lifetime is what bounds DNS staleness.",
     connection.PooledConnectionLifetime, connection.ConnectTimeout);
+
+await host.StopAsync();
 
 /// <summary>
 /// Stands in for a real dependency so the sample runs with no network access.

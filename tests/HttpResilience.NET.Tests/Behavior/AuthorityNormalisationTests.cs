@@ -33,7 +33,7 @@ public class AuthorityNormalisationTests
     /// Fails if authority matching goes back to <see cref="Uri.Host"/>: the request is rejected by the
     /// allow-list its own host is on.
     /// </remarks>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("https://xn--mnchen-3ya.example", "https://münchen.example/x")]
     [InlineData("https://münchen.example", "https://xn--mnchen-3ya.example/x")]
     [InlineData("https://münchen.example", "https://münchen.example/x")]
@@ -42,7 +42,7 @@ public class AuthorityNormalisationTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             HedgedTo(configured), new RecordingHandler(HttpStatusCode.OK), hedged: true);
 
-        HttpResponseMessage response = await harness.GetAsync(requested);
+        HttpResponseMessage response = await harness.GetAsync(requested, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(1, harness.Origin.Count);
@@ -51,7 +51,7 @@ public class AuthorityNormalisationTests
     /// <summary>
     /// A fully-qualified name with its root label spelled out is the same authority as one without.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("http://orders.internal", "http://orders.internal./x")]
     [InlineData("http://orders.internal.", "http://orders.internal/x")]
     public async Task AFullyQualifiedHost_MatchesWithOrWithoutItsTrailingDot(string configured, string requested)
@@ -59,7 +59,7 @@ public class AuthorityNormalisationTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             HedgedTo(configured), new RecordingHandler(HttpStatusCode.OK), hedged: true);
 
-        HttpResponseMessage response = await harness.GetAsync(requested);
+        HttpResponseMessage response = await harness.GetAsync(requested, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(1, harness.Origin.Count);
@@ -69,7 +69,7 @@ public class AuthorityNormalisationTests
     /// Normalisation must not become a prefix match: a different host, a different scheme and a different
     /// port are each still outside the list.
     /// </summary>
-    [Theory]
+    [Theory(Timeout = TestTimeouts.Default)]
     [InlineData("http://other.internal/x")]
     [InlineData("https://orders.internal/x")]
     [InlineData("http://orders.internal:8443/x")]
@@ -78,7 +78,7 @@ public class AuthorityNormalisationTests
         await using ResilienceHarness harness = ResilienceHarness.Create(
             HedgedTo("http://orders.internal"), new RecordingHandler(HttpStatusCode.OK), hedged: true);
 
-        await Assert.ThrowsAsync<HttpRequestException>(() => harness.GetAsync(requested));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.GetAsync(requested, TestContext.Current.CancellationToken));
         Assert.Equal(0, harness.Origin.Count);
     }
 }

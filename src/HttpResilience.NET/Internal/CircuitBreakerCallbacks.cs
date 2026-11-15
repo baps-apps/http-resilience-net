@@ -1,4 +1,3 @@
-using HttpResilience.NET.Options;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using Polly;
@@ -12,7 +11,7 @@ internal static class CircuitBreakerCallbacks
 {
     public static void Apply(
         HttpCircuitBreakerStrategyOptions strategy,
-        CircuitBreakerOptions options,
+        HttpResilienceCircuitBreakerOptions options,
         string clientName,
         Func<HttpRequestMessage?, string> trackingKey,
         ILogger? logger,
@@ -23,9 +22,6 @@ internal static class CircuitBreakerCallbacks
         strategy.SamplingDuration = options.SamplingDuration;
         strategy.BreakDuration = options.BreakDuration;
 
-        // The breaker is labelled with the key of the pipeline it belongs to, read from the resilience
-        // context. Per-authority pipelines therefore report as distinct breakers instead of overwriting one
-        // another under a shared client name, and the set of labels stays bounded by configuration.
         strategy.OnOpened = args =>
         {
             string authority = Authority(args.Context, trackingKey);

@@ -1,5 +1,4 @@
 using System.Threading.RateLimiting;
-using HttpResilience.NET.Options;
 
 namespace HttpResilience.NET.Internal;
 
@@ -8,16 +7,16 @@ namespace HttpResilience.NET.Internal;
 /// </summary>
 internal static class RateLimiterFactory
 {
-    public static RateLimiter Create(RateLimiterOptions options) => options.Algorithm switch
+    public static RateLimiter Create(HttpResilienceRateLimiterOptions options) => options.Algorithm switch
     {
-        RateLimitAlgorithm.SlidingWindow => new SlidingWindowRateLimiter(new SlidingWindowRateLimiterOptions
+        HttpResilienceRateLimitAlgorithm.SlidingWindow => new SlidingWindowRateLimiter(new SlidingWindowRateLimiterOptions
         {
             PermitLimit = options.PermitLimit!.Value,
             Window = options.Window,
             SegmentsPerWindow = options.SegmentsPerWindow,
             QueueLimit = options.QueueLimit
         }),
-        RateLimitAlgorithm.TokenBucket => new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+        HttpResilienceRateLimitAlgorithm.TokenBucket => new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
         {
             TokenLimit = options.TokenLimit!.Value,
             TokensPerPeriod = options.TokensPerPeriod!.Value,
