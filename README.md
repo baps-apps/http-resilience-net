@@ -18,7 +18,7 @@ connection pooling are Microsoft's and Polly's; this package supplies validated 
 ## Install
 
 ```bash
-dotnet add package HttpResilience.NET --version 3.0.0
+dotnet add package HttpResilience.NET --version 3.1.0
 ```
 
 Published to the internal `baps-apps` GitHub Packages feed only ([Distribution](#distribution-and-license)).
@@ -221,6 +221,14 @@ CancellationToken (caller)     always wins; never a circuit-breaker failure
   `ConfigureHttpClient` fails client creation. **A typed client that sets `client.Timeout` in its constructor
   cannot be detected** and silently truncates the pipeline: search your constructors.
 - A retry schedule longer than `Timeout:Total` is allowed (a cap is valid) and logs a startup Warning (event 14).
+
+## Handling failures
+
+`HttpResilienceFailure.Classify(exception)` names why a request failed (`Timeout`, `CircuitOpen`,
+`LimiterRejected`, `RequestFailed`, `Canceled` or `None`), reading the whole inner-exception chain, so callers
+map failures to their own responses without referencing Polly. `HttpResilienceFailure.TryGetRetryAfter` gives a
+rejecting rate limiter's wait for a `Retry-After` header. See
+[Handling failures](https://github.com/baps-apps/http-resilience-net/blob/main/docs/RECIPES.md#handling-failures).
 
 ## Connection settings
 

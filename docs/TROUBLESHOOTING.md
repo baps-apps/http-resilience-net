@@ -209,6 +209,7 @@ Event 8. A permit covers a request and all its retries, so the budget really ran
 
 With an inner `TimeoutException`: `Timeout:Client` fired (queue wait or body). Without: the caller cancelled.
 Pipeline timeouts are `TimeoutRejectedException`.
+`HttpResilienceFailure.Classify` tells them apart ([Handling failures](RECIPES.md#handling-failures)).
 
 ### `HttpClient.Timeout` set in code fails client creation
 

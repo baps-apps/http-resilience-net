@@ -268,3 +268,48 @@ Use `Timeout:Client`; it must be greater than `Timeout:Total`:
 `.ConfigureHttpClient(c => c.Timeout = ...)` with a different value fails client creation. A typed client's
 constructor that sets `Timeout` is not detected and can truncate the pipeline. Other `ConfigureHttpClient`
 settings (headers, base address) are untouched.
+
+## Handling failures
+
+`HttpResilienceFailure.Classify` reads the cause from the exception, so callers never reference Polly's
+exception types. It reads the whole inner-exception chain, so translate failures where they are thrown and
+wrap them freely.
+
+| Type | Thrown as | Sent? | Suggested response |
+| --- | --- | --- | --- |
+| `Timeout` | `TimeoutRejectedException` (`Timeout:Attempt`, `Timeout:Total`); `TaskCanceledException` with an inner `TimeoutException` (`Timeout:Client`, connect timeout) | Maybe | 504 |
+| `CircuitOpen` | `BrokenCircuitException` | No | 503 |
+| `LimiterRejected` | `RateLimiterRejectedException` (rate limiter, concurrency limiter, backstop) | No | 503, with `Retry-After` when `TryGetRetryAfter` gives one |
+| `RequestFailed` | `HttpRequestException` (connection or protocol error, or `EnsureSuccessStatusCode` on the final response) | Yes | 502 |
+| `Canceled` | `OperationCanceledException` from the caller's token | Maybe | None: the caller left |
+| `None` | Anything else, such as `InvalidOperationException` for a hedged client's unlisted authority | No | 500: a bug or a configuration error |
+
+The pipeline returns a final 5xx or 429 response rather than throwing. Check the status, or call
+`EnsureSuccessStatusCode()`, which makes it `RequestFailed`.
+
+```csharp
+public sealed class OrdersUnavailableException(HttpResilienceFailureType failureType, Exception inner)
+    : Exception("The Orders service failed.", inner)
+{
+    public HttpResilienceFailureType FailureType { get; } = failureType;
+}
+
+public async Task<Order> GetAsync(int id, CancellationToken cancellationToken)
+{
+    try
+    {
+        using HttpResponseMessage response = await _client.GetAsync($"orders/{id}", cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return (await response.Content.ReadFromJsonAsync<Order>(cancellationToken))!;
+    }
+    catch (Exception ex) when (HttpResilienceFailure.Classify(ex) is not
+        (HttpResilienceFailureType.None or HttpResilienceFailureType.Canceled))
+    {
+        throw new OrdersUnavailableException(HttpResilienceFailure.Classify(ex), ex);
+    }
+}
+```
+
+Map `FailureType` to the status in one place (an ASP.NET Core `IExceptionHandler`), and set `Retry-After` from
+`TryGetRetryAfter(ex, out TimeSpan wait)`. Only window and token-bucket rate limiters supply a wait;
+concurrency limiters and an open circuit do not.

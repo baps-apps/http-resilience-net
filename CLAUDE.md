@@ -363,6 +363,7 @@ ConcurrencyLimiter (optional) → [ConcurrencyBackstop, only with a rate limiter
 | `Internal/HttpResilienceLogging.cs` / `RejectionLogThrottle.cs` | Every log event; rejection throttling |
 | `Internal/ClientStartupReport.cs` + `*Notice.cs` | Startup notices 6, 10, 11, 14, 15, 21 |
 | `Internal/ClientStartupProbe.cs` / `PlatformSelfCheck.cs` | Creates every client at host start, after checking the platform's action order |
+| `Failures/HttpResilienceFailure.cs` | Failure kind from an exception chain; a new exception the pipeline can throw needs a kind and a real-pipeline case in `FailureClassificationTests` |
 
 ## Testing
 

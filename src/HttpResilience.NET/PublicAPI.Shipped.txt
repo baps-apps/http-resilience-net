@@ -36,6 +36,14 @@ HttpResilience.NET.HttpResilienceConnectionOptions.PooledConnectionIdleTimeout.g
 HttpResilience.NET.HttpResilienceConnectionOptions.PooledConnectionIdleTimeout.set -> void
 HttpResilience.NET.HttpResilienceConnectionOptions.PooledConnectionLifetime.get -> System.TimeSpan
 HttpResilience.NET.HttpResilienceConnectionOptions.PooledConnectionLifetime.set -> void
+HttpResilience.NET.HttpResilienceFailure
+HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.Canceled = 1 -> HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.CircuitOpen = 3 -> HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.LimiterRejected = 4 -> HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.None = 0 -> HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.RequestFailed = 5 -> HttpResilience.NET.HttpResilienceFailureType
+HttpResilience.NET.HttpResilienceFailureType.Timeout = 2 -> HttpResilience.NET.HttpResilienceFailureType
 HttpResilience.NET.HttpResilienceHedgingOptions
 HttpResilience.NET.HttpResilienceHedgingOptions.Delay.get -> System.TimeSpan
 HttpResilience.NET.HttpResilienceHedgingOptions.Delay.set -> void
@@ -134,6 +142,8 @@ const HttpResilience.NET.HttpResilienceConfigurationKeys.ClientsSection = "Clien
 const HttpResilience.NET.HttpResilienceConfigurationKeys.RootSection = "HttpResilience" -> string!
 const Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions.MeterName = "HttpResilience.NET" -> string!
 const Microsoft.Extensions.DependencyInjection.HttpResilienceTelemetryExtensions.PollyMeterName = "Polly" -> string!
+static HttpResilience.NET.HttpResilienceFailure.Classify(System.Exception! exception) -> HttpResilience.NET.HttpResilienceFailureType
+static HttpResilience.NET.HttpResilienceFailure.TryGetRetryAfter(System.Exception! exception, out System.TimeSpan retryAfter) -> bool
 static Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions.AddHttpResilienceHandler(this Microsoft.Extensions.DependencyInjection.IHttpClientBuilder! builder) -> Microsoft.Extensions.DependencyInjection.IHttpClientBuilder!
 static Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions.AddHttpResilienceHandler(this Microsoft.Extensions.DependencyInjection.IHttpClientBuilder! builder, System.Action<HttpResilience.NET.HttpResilienceOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.IHttpClientBuilder!
 static Microsoft.Extensions.DependencyInjection.HttpResilienceHttpClientBuilderExtensions.AddHttpResilienceHandler(this Microsoft.Extensions.DependencyInjection.IHttpClientBuilder! builder, string! sectionName) -> Microsoft.Extensions.DependencyInjection.IHttpClientBuilder!

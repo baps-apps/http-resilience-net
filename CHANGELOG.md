@@ -5,6 +5,19 @@ All notable changes to **HttpResilience.NET** are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/). See [docs/VERSIONING.md](docs/VERSIONING.md)
 for what counts as MAJOR, MINOR and PATCH here.
 
+## [3.1.0] - 2026-11-16
+
+### Added
+
+- **`HttpResilienceFailure.Classify(exception)`** names why an outbound request failed
+  (`HttpResilienceFailureType`: `Canceled`, `Timeout`, `CircuitOpen`, `LimiterRejected`, `RequestFailed`,
+  or `None` for anything else), so a consumer maps failures to its own responses without referencing Polly's
+  exception types or walking the inner-exception chain. It tells `Timeout:Client` (a `TaskCanceledException`
+  with an inner `TimeoutException`) apart from the caller's cancellation, and keeps the cause of a failure
+  wrapped in the consumer's own exception. **`HttpResilienceFailure.TryGetRetryAfter(exception, out wait)`**
+  returns a rejecting rate limiter's wait, for a `Retry-After` header. Recipe:
+  [Handling failures](docs/RECIPES.md#handling-failures).
+
 ## [3.0.0] - 2026-11-14
 
 ### Breaking
